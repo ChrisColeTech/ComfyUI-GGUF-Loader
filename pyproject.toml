@@ -1,14 +1,14 @@
 [project]
-name = "comfyui-gguf"
-description = "GGUF Quantization support for native ComfyUI models."
-version = "2.0.0" # 2.0.0 = GitHub main, 1.X.X = ComfyUI Registry
-license = { file = "LICENSE" }
-dependencies = ["gguf>=0.13.0", "sentencepiece", "protobuf"]
+name = "comfyui-gguf-loader"
+description = "🚀 A simple and mordern Turbo GGUF Loader."
+version = "1.0.0"
+license = {file = "LICENSE"}
 
 [project.urls]
-Repository = "https://github.com/city96/ComfyUI-GGUF"
+Repository = "https://github.com/ChrisColeTech/ComfyUI-GGUF-Loader"
+#  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
-PublisherId = "city96"
-DisplayName = "ComfyUI-GGUF"
-Icon = ""
+PublisherId = "chriscoletech"
+DisplayName = "ComfyUI-GGUF-Loader"
+Icon = "⚡"
