@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-gguf-loader"
-description = "🚀 A simple and mordern Turbo GGUF Loader."
-version = "1.0.0"
+description = "🚀 CCTech GGUF loaders for ComfyUI — UNET / CLIP (dual–quadruple) with quantized weights."
+version = "1.0.1"
 license = {file = "LICENSE"}
 
 [project.urls]

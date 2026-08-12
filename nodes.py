@@ -152,8 +152,8 @@ class UnetLoaderGGUF:
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
-    CATEGORY = "bootleg"
-    TITLE = "Unet Loader (GGUF)"
+    CATEGORY = "🤖 CCTech/GGUF"
+    TITLE = "UNET Loader (GGUF) ⚡"
 
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
         ops = GGMLOps()
@@ -203,7 +203,7 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
                 "patch_on_device": ("BOOLEAN", {"default": False}),
             }
         }
-    TITLE = "Unet Loader (GGUF/Advanced)"
+    TITLE = "UNET Loader (GGUF/Advanced) ⚡"
 
 class CLIPLoaderGGUF:
     @classmethod
@@ -218,8 +218,8 @@ class CLIPLoaderGGUF:
 
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
-    CATEGORY = "bootleg"
-    TITLE = "CLIPLoader (GGUF)"
+    CATEGORY = "🤖 CCTech/GGUF"
+    TITLE = "CLIP Loader (GGUF) ⚡"
 
     @classmethod
     def get_filename_list(s):
@@ -271,7 +271,7 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
             }
         }
 
-    TITLE = "DualCLIPLoader (GGUF)"
+    TITLE = "Dual CLIP Loader (GGUF) ⚡"
 
     def load_clip(self, clip_name1, clip_name2, type):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
@@ -292,7 +292,7 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
             }
         }
 
-    TITLE = "TripleCLIPLoader (GGUF)"
+    TITLE = "Triple CLIP Loader (GGUF) ⚡"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
@@ -315,7 +315,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
         }
     }
 
-    TITLE = "QuadrupleCLIPLoader (GGUF)"
+    TITLE = "Quadruple CLIP Loader (GGUF) ⚡"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
@@ -326,12 +326,22 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
 
+# Stable class keys (workflow-safe). Display titles come from each node's TITLE.
 NODE_CLASS_MAPPINGS = {
     "UnetLoaderGGUF": UnetLoaderGGUF,
+    "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
     "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,
     "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF,
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF,
-    "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "UnetLoaderGGUF": UnetLoaderGGUF.TITLE,
+    "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced.TITLE,
+    "CLIPLoaderGGUF": CLIPLoaderGGUF.TITLE,
+    "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF.TITLE,
+    "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF.TITLE,
+    "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF.TITLE,
 }
 

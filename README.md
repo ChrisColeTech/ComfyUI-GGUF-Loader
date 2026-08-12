@@ -31,7 +31,7 @@ On MacOS sequoia, torch 2.4.1 seems to be required, as 2.6.X nightly versions ca
 
 ## Usage
 
-Simply use the GGUF Unet loader found under the `bootleg` category. Place the .gguf model files in your `ComfyUI/models/unet` folder.
+Simply use the GGUF UNET loader found under the `🤖 CCTech/GGUF` category. Place the `.gguf` model files in your `ComfyUI/models/unet` (or `diffusion_models`) folder.
 
 LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
 
