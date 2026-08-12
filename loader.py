@@ -9,18 +9,30 @@ import os
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
+# Image / DiT / UNet GGUF architecture allowlist.
+# Keep in sync with the arch tags we write when quantizing custom models under
+# D:\models\image-models (and image-models-dev). Unknown tags raise at load.
 IMG_ARCH_LIST = {
+    # Upstream / common
     "flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos",
-    "ltxv",
-    # MiniMax-H3 / LTX-2-family DiT GGUFs (general.architecture = "ltx2")
-    "ltx2",
-    "hyvid", "wan", "lumina2", "qwen_image",
+    "ltxv", "hyvid", "wan", "lumina2", "qwen_image",
+    # Custom DiT tags used by our quant pipelines
+    "ltx2",        # MiniMax-H3 DiT (and LTX-2-family DiTs tagged ltx2)
+    "zimage",      # Z-Image turbo DiT
+    "ideogram4",   # Ideogram-4 DiT
+    "flux2",       # Flux2 conversion scripts (alias; some files also use "flux")
+    "flux1",       # Flux1 VAE / older flux tags seen in the wild
+    "krea2",       # Krea-2 (some builds; files may also use qwen_image)
+    "diffusion_model",  # generic fallback used by agnostic convert scripts
 }
 TXT_ARCH_LIST = {
     "t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl",
     "gemma3",
     # LTX-2.5 unified multimodal TE (Gemma4UnifiedForConditionalGeneration)
     "gemma4", "gemma4_unified",
+    # Other TE GGUFs under image-models
+    "mistral3",  # Ministral-3 (Flux2 TE)
+    "clip",      # CLIP TE (and some mmproj files tagged arch=clip)
 }
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 

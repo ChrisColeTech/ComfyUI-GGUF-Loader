@@ -136,6 +136,73 @@ class ModelLTX2(ModelTemplate):
         "scale_shift_table",
     ]
 
+class ModelZImage(ModelTemplate):
+    """Z-Image turbo DiT (general.architecture = zimage)."""
+    arch = "zimage"
+    keys_detect = [
+        (
+            "all_x_embedder.2-1.weight",
+            "all_final_layer.2-1.adaLN_modulation.1.weight",
+            "cap_embedder.1.weight",
+        ),
+        (
+            "layers.0.adaLN_modulation.0.weight",
+            "all_x_embedder.2-1.weight",
+            "cap_embedder.1.weight",
+        ),
+    ]
+    keys_hiprec = [
+        "adaLN_modulation",  # nn.parameter / modulation tables
+    ]
+
+class ModelIdeogram4(ModelTemplate):
+    """Ideogram-4 DiT (general.architecture = ideogram4)."""
+    arch = "ideogram4"
+    keys_detect = [
+        (
+            "embed_image_indicator.weight",
+            "adaln_proj.weight",
+            "final_layer.adaln_modulation.weight",
+        ),
+        (
+            "embed_image_indicator.weight",
+            "input_proj.weight",
+            "layers.0.adaln_modulation.weight",
+        ),
+    ]
+    keys_hiprec = [
+        "adaln_modulation",
+        "adaln_proj",
+    ]
+
+class ModelQwenImage(ModelTemplate):
+    """Qwen-Image / Qwen-Image-Edit / Krea-2 DiTs tagged qwen_image."""
+    arch = "qwen_image"
+    keys_detect = [
+        # Diffusers-style Qwen-Image-Edit
+        (
+            "img_in.weight",
+            "txt_in.weight",
+            "transformer_blocks.0.img_mod.1.weight",
+        ),
+        (
+            "img_in.weight",
+            "norm_out.linear.weight",
+            "proj_out.weight",
+            "transformer_blocks.0.attn.to_q.weight",
+        ),
+        # Krea-2 (custom key layout, still tagged qwen_image)
+        (
+            "blocks.0.attn.qknorm.qnorm.scale",
+            "blocks.0.mod.lin",
+            "txtfusion.projector.weight",
+        ),
+    ]
+    keys_hiprec = [
+        "mod.lin",
+        "modulation.lin",
+    ]
+
 class ModelSDXL(ModelTemplate):
     arch = "sdxl"
     shape_fix = True
@@ -165,8 +232,11 @@ class ModelLumina2(ModelTemplate):
         ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight")
     ]
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
-             ModelLTXV, ModelLTX2, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2]
+arch_list = [
+    ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
+    ModelLTXV, ModelLTX2, ModelZImage, ModelIdeogram4, ModelQwenImage,
+    ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
+]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
