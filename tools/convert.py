@@ -116,6 +116,26 @@ class ModelLTXV(ModelTemplate):
         "scale_shift_table" # nn.parameter, can't load from BF16 base quant
     ]
 
+class ModelLTX2(ModelTemplate):
+    """MiniMax-H3 DiT (and related LTX-2-family GGUFs tagged arch=ltx2)."""
+    arch = "ltx2"
+    keys_detect = [
+        (
+            "adaln_t_table",
+            "blocks.0.adaln_proj.linear.weight",
+            "audio_patch_proj.weight",
+        ),
+        (
+            "adaln_t_table",
+            "blocks.0.adaln_proj.linear.weight",
+            "patch_proj.weight",
+        ),
+    ]
+    keys_hiprec = [
+        "adaln_t_table",  # nn.parameter, keep high precision
+        "scale_shift_table",
+    ]
+
 class ModelSDXL(ModelTemplate):
     arch = "sdxl"
     shape_fix = True
@@ -145,8 +165,8 @@ class ModelLumina2(ModelTemplate):
         ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight")
     ]
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2]
+arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
+             ModelLTXV, ModelLTX2, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2]
 
 def is_model_arch(model, state_dict):
     # check if model is correct

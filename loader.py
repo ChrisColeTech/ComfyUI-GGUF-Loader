@@ -9,8 +9,19 @@ import os
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+IMG_ARCH_LIST = {
+    "flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos",
+    "ltxv",
+    # MiniMax-H3 / LTX-2-family DiT GGUFs (general.architecture = "ltx2")
+    "ltx2",
+    "hyvid", "wan", "lumina2", "qwen_image",
+}
+TXT_ARCH_LIST = {
+    "t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl",
+    "gemma3",
+    # LTX-2.5 unified multimodal TE (Gemma4UnifiedForConditionalGeneration)
+    "gemma4", "gemma4_unified",
+}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
