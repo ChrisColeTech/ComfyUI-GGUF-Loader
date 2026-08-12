@@ -89,6 +89,14 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     mmap_released = False
     named_modules_to_munmap = {}
 
+    # PR #469: partial load/unload must also force weight patching so quantized
+    # mmap tensors are not left half-applied.
+    def partially_unload(self, *args, force_patch_weights=False, **kwargs):
+        return super().partially_unload(*args, force_patch_weights=True, **kwargs)
+
+    def partially_load(self, *args, force_patch_weights=False, **kwargs):
+        return super().partially_load(*args, force_patch_weights=True, **kwargs)
+
     def load(self, *args, force_patch_weights=False, **kwargs):
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())

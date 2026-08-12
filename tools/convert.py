@@ -156,7 +156,7 @@ class ModelZImage(ModelTemplate):
     ]
 
 class ModelIdeogram4(ModelTemplate):
-    """Ideogram-4 DiT (general.architecture = ideogram4)."""
+    """Ideogram-4 DiT (general.architecture = ideogram4). PRs #455 / #460."""
     arch = "ideogram4"
     keys_detect = [
         (
@@ -168,6 +168,12 @@ class ModelIdeogram4(ModelTemplate):
             "embed_image_indicator.weight",
             "input_proj.weight",
             "layers.0.adaln_modulation.weight",
+        ),
+        # upstream PR #455 key set
+        (
+            "embed_image_indicator.weight",
+            "input_proj.weight",
+            "layers.0.attention.qkv.weight",
         ),
     ]
     keys_hiprec = [

@@ -26,12 +26,13 @@ IMG_ARCH_LIST = {
     "diffusion_model",  # generic fallback used by agnostic convert scripts
 }
 TXT_ARCH_LIST = {
-    "t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl",
+    "t5", "t5encoder", "llama",
+    "qwen2", "qwen2vl", "qwen3", "qwen35", "qwen3vl",
     "gemma3",
     # LTX-2.5 unified multimodal TE (Gemma4UnifiedForConditionalGeneration)
     "gemma4", "gemma4_unified",
-    # Other TE GGUFs under image-models
-    "mistral3",  # Ministral-3 (Flux2 TE)
+    # Other TE GGUFs under image-models / open PRs
+    "mistral3",  # Ministral-3 (Flux2 TE) — PR #440 / #436
     "clip",      # CLIP TE (and some mmproj files tagged arch=clip)
 }
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
@@ -110,6 +111,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             if not tensor_name.startswith(handle_prefix):
                 continue
             sd_key = tensor_name[prefix_len:]
+        # PR #470: some Flux-compat GGUFs (e.g. LongCat bfl_format) name QK-norm
+        # params ".scale" instead of comfy RMSNorm's ".weight" → silent NaNs.
+        if sd_key.endswith(".query_norm.scale") or sd_key.endswith(".key_norm.scale"):
+            sd_key = sd_key[:-len(".scale")] + ".weight"
         tensors.append((sd_key, tensor))
 
     # detect and verify architecture
@@ -149,12 +154,18 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
 
         shape = get_orig_shape(reader, tensor_name)
         if shape is None:
-            shape = torch.Size(tuple(int(v) for v in reversed(tensor.shape)))
+            raw_shape = tensor.shape if tensor.shape is not None else torch_tensor.shape
+            shape = torch.Size(tuple(int(v) for v in reversed(raw_shape)))
             # Workaround for stable-diffusion.cpp SDXL detection.
             if compat == "sd.cpp" and arch_str == "sdxl":
                 if any([tensor_name.endswith(x) for x in (".proj_in.weight", ".proj_out.weight")]):
                     while len(shape) > 2 and shape[-1] == 1:
                         shape = shape[:-1]
+
+        # PR #392: lumina2 / NextDiT (Z-Image) pad tokens may be stored 1D.
+        if arch_str in {"lumina2", "zimage"} and sd_key in ("x_pad_token", "cap_pad_token"):
+            if len(shape) == 1:
+                shape = torch.Size((1, shape[0]))
 
         # add to state dict
         if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
@@ -163,6 +174,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
 
         # 1D tensors shouldn't be quantized, this is a fix for BF16
         if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+            state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
+        # PR #467: GGMLLayer only intercepts weight/bias, so bare nn.Parameters
+        # (e.g. LTX-2 learnable_registers) must already be real float tensors.
+        elif not sd_key.endswith((".weight", ".bias")) and is_quantized(state_dict[sd_key]):
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
@@ -242,6 +257,30 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+# Qwen3-VL deepstack mmproj (PR #473 MiniMax-H3 / Qwen3VL TE)
+CLIP_VISION_QWEN3_MAP = {
+    "v.blk": "model.visual.blocks",
+    ".fc": ".linear_fc",
+    "ck.8.": "st.0.",
+    "ck.16.": "st.1.",
+    "ck.24.": "st.2.",
+    "ck.5.": "st.0.",
+    "ck.11.": "st.1.",
+    "ck.17.": "st.2.",
+    "attn_out": "attn.proj",
+    "ln1": "norm1",
+    "ln2": "norm2",
+    "attn_qkv": "attn.qkv",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "mm.0": "model.visual.merger.linear_fc1",
+    "mm.2": "model.visual.merger.linear_fc2",
+    "v.post_ln": "model.visual.merger.norm",
+    "v.patch_embd": "model.visual.patch_embed.proj",
+    "v.position_embd.weight": "visual.pos_embed.weight",
+    "v.deepstast.": "model.visual.deepstack_merger_list.",
+}
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -313,10 +352,10 @@ def gguf_mmproj_loader(path):
             target.append(fname)
 
     if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
+        logging.warning(f"Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}'); vision path will not work.")
         return {}
     if len(target) > 1:
-        logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
+        logging.info(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
     target = os.path.join(root, target[0])
@@ -328,7 +367,11 @@ def gguf_mmproj_loader(path):
         w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
-    # run main replacement
+    # Qwen3-VL deepstack mmproj (MiniMax-H3 TE path) — PR #473
+    if any("deepstack" in key or "deepstast" in key for key in vsd):
+        return sd_map_replace(vsd, CLIP_VISION_QWEN3_MAP)
+
+    # Qwen2-VL / default clip-vision mmproj
     vsd = sd_map_replace(vsd, CLIP_VISION_SD_MAP)
 
     # handle split Q/K/V
@@ -416,7 +459,8 @@ def gguf_tekken_tokenizer_loader(path, temb_shape):
 
     model_str = get_field(reader, "tokenizer.ggml.model", str)
     if model_str == "gpt2":
-        if temb_shape == (131072, 5120): # probably Mistral
+        # PR #440: Ministral-3 3B uses (131072, 3072); larger Mistral uses 5120
+        if temb_shape in {(131072, 5120), (131072, 3072)}:
             data = {
                 "config": {"num_vocab_tokens": 150000, "default_vocab_size": 131072},
                 "vocab": [],
@@ -502,26 +546,26 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
+    elif arch in {"llama", "qwen2", "qwen2vl", "qwen3", "qwen35", "qwen3vl", "gemma3", "gemma4", "gemma4_unified", "mistral3"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
-            if arch == "llama" and sd[temb_key].shape == (131072, 5120):
+            if arch in {"llama", "mistral3"} and sd[temb_key].shape in {(131072, 5120), (131072, 3072)}:
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
-            elif arch == "gemma3":
+            elif arch in {"gemma3", "gemma4", "gemma4_unified"}:
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
-        if arch == "gemma3":
+        if arch in {"gemma3", "gemma4", "gemma4_unified"}:
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
-        if arch == "llama":
-            sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl":
+        if arch in {"llama", "mistral3", "qwen2"}:
+            sd = llama_permute(sd, 32, 8) # L3 / Mistral / qwen2-compat
+        if arch in {"qwen2vl", "qwen3vl"}:
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
     else:

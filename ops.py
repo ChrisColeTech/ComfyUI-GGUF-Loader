@@ -8,6 +8,11 @@ import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
+try:
+    import comfy.weight_adapter as wadapter
+except (ImportError, ModuleNotFoundError):
+    wadapter = None
+
 def chained_hasattr(obj, chained_attr):
     probe = obj
     for attr in chained_attr.split('.'):
@@ -89,6 +94,23 @@ class GGMLTensor(torch.Tensor):
         if not hasattr(self, "tensor_shape"):
             self.tensor_shape = self.size()
         return self.tensor_shape
+
+    @property
+    def dtype(self):
+        # PR #456: quantized weights are packed uint8; models that do
+        # `x.to(weight.dtype)` (Ideogram-4 / MPS path) would corrupt activations.
+        # Report a float compute dtype for quantized tensors.
+        tt = getattr(self, "tensor_type", None)
+        if tt not in (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16):
+            return getattr(self, "compute_dtype", None) or torch.bfloat16
+        return torch.Tensor.dtype.__get__(self)
+
+    def dequantize(self, dtype=None):
+        # PR #468: let Comfy core's generic cast path dequantize GGMLTensor
+        # the same way GGMLLayer.get_weight already does.
+        dt = dtype if dtype is not None else torch.float32
+        w = dequantize_tensor(self, dt, None)
+        return torch.Tensor(w)
 
 class GGMLLayer(torch.nn.Module):
     """
@@ -270,12 +292,34 @@ class GGMLOps(comfy.ops.manual_cast):
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
 
-def move_patch_to_device(item, device):
-    if isinstance(item, torch.Tensor):
-        return item.to(device, non_blocking=True)
-    elif isinstance(item, tuple):
-        return tuple(move_patch_to_device(x, device) for x in item)
-    elif isinstance(item, list):
-        return [move_patch_to_device(x, device) for x in item]
-    else:
+def move_patch_to_device(item, device, *, dtype=None):
+    # PR #461: handle WeightAdapters + optional dtype cast when moving patches
+    if device is None:
         return item
+    if isinstance(item, torch.Tensor):
+        cast = getattr(comfy.model_management, "cast_to_device", None)
+        if cast is not None:
+            return cast(item, device, dtype, copy=True)
+        return item.to(device, non_blocking=True)
+    if isinstance(item, (tuple, list)):
+        return item.__class__(
+            move_patch_to_device(seqitem, device, dtype=dtype) for seqitem in item
+        )
+    if (
+        wadapter is not None
+        and isinstance(item, wadapter.WeightAdapterBase)
+        and hasattr(item, "loaded_keys")
+        and isinstance(getattr(item, "weights", None), (tuple, list))
+    ):
+        cast = getattr(comfy.model_management, "cast_to_device", None)
+        def _move_w(wi):
+            if not isinstance(wi, torch.Tensor):
+                return wi
+            if cast is not None:
+                return cast(wi, device, dtype, copy=True)
+            return wi.to(device, non_blocking=True)
+        return item.__class__(
+            item.loaded_keys,
+            item.weights.__class__(_move_w(wi) for wi in item.weights),
+        )
+    return item
