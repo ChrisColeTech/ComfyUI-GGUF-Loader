@@ -376,9 +376,10 @@ def handle_tensors(writer, state_dict, model_arch):
                 # very small tensors
                 data_qtype = gguf.GGMLQuantizationType.F32
 
-            elif any(x in key for x in model_arch.keys_hiprec):
-                # tensors that require max precision
-                data_qtype = gguf.GGMLQuantizationType.F32
+        if any(x in key for x in model_arch.keys_hiprec):
+            # tensors that require max precision, whatever the source dtype was.
+            # An fp16 source is exactly the case that needs the buffer widened.
+            data_qtype = gguf.GGMLQuantizationType.F32
 
         if (model_arch.shape_fix                        # NEVER reshape for models such as flux
             and n_dims > 1                              # Skip one-dimensional tensors

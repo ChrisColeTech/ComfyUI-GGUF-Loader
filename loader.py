@@ -177,7 +177,9 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
         # PR #467: GGMLLayer only intercepts weight/bias, so bare nn.Parameters
         # (e.g. LTX-2 learnable_registers) must already be real float tensors.
-        elif not sd_key.endswith((".weight", ".bias")) and is_quantized(state_dict[sd_key]):
+        # Buffers stored as F16 (e.g. MiniMax-H3 adaln_t_table) need the same treatment:
+        # nothing casts them at the use site and they meet float32 math there.
+        elif not sd_key.endswith((".weight", ".bias")) and state_dict[sd_key].dtype != torch.float32:
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
