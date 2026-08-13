@@ -76,9 +76,9 @@ MiniMax-H3 decodes video and audio through two separate VAEs, so every workflow 
 
 Loads a small text encoder and projects it into a large one's space in a single node — for MiniMax-H3, a Qwen3-VL-4B or -8B standing in for the 32B the model expects, which takes the text encoder from 15.7 GB to about 5.
 
-The projection is **ported into this pack** (`clipproj.py`) from [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) by nicolab28, MIT, with the licence travelling alongside it as [LICENSE-ClipProj](LICENSE-ClipProj). No dependency on that pack: install it or don't, this node works either way. Verified against the original on a real prompt through the learned 8B matrix — identical conditioning, to the bit.
+The projection lives in `clipproj.py`, so there is no dependency on another node pack.[^clipproj] What you do need is a **matrix**, in `ComfyUI/models/clip_projections/`: `mmh3-4b-*` goes with a 4B and `mmh3-8b-*` with an 8B, and they are not interchangeable. The `<control:...>` entries are not projections but deliberate baselines — zero ignores your prompt entirely, identity copies the raw dimensions with no learning — and they run on any encoder. Run them first to see that the matrix is doing the work.
 
-What you do still need is a **matrix**, from [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3), in `ComfyUI/models/clip_projections/`. `mmh3-4b-*` goes with a 4B and `mmh3-8b-*` with an 8B; they are not interchangeable. The `<control:...>` entries are not projections but deliberate baselines — zero ignores your prompt entirely, identity copies the raw dimensions with no learning — and they run on any encoder. Run them first to see that the matrix is doing the work.
+[^clipproj]: Ported from [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) by nicolab28 (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)), and checked against it: identical conditioning to the bit. The matrices are theirs as well — [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3).
 
 Differences from the upstream node:
 
@@ -88,10 +88,8 @@ Differences from the upstream node:
 
 ## Credits
 
-This is a fork. The GGUF loader, the quantization tooling, the custom ops and effectively everything that makes this work are **[city96](https://github.com/city96)**'s — see [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), Apache-2.0. Most of what is merged here on top of it comes from open pull requests on that repository, written by their respective authors and listed in [PR_BACKPORT.md](PR_BACKPORT.md). Bugs in this fork are ours, not theirs — report them here rather than upstream.
+Fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (Apache-2.0) — the loader, the quantization tooling and the custom ops are theirs; the backported PRs are their authors', listed in [PR_BACKPORT.md](PR_BACKPORT.md). Report bugs in this fork here, not upstream.
 
-`clipproj.py` is ported from **[nicolab28](https://github.com/nicolab28)**'s [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj), MIT — the projection method, the reconstruction formula, the MiniMax-H3 tokenisation and the attention-sink substitution are all theirs, and their licence travels with the file as [LICENSE-ClipProj](LICENSE-ClipProj). The projection matrices are theirs too and are not bundled: [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3).
+`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
-The GGUF format itself comes from [llama.cpp](https://github.com/ggerganov/llama.cpp).
-
-Model weights belong to their authors and are covered by their own licences — MiniMax-H3 in particular ships under a custom licence rather than an open one. Read it before any use.
+Model weights stay under their own licences — MiniMax-H3's is a custom one, worth reading before any use.
