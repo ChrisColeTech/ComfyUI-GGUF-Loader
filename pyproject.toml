@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-gguf-loader"
-description = "🚀 CCTech GGUF loaders for ComfyUI — UNET / CLIP (dual–quadruple) with quantized weights."
+description = "🚀 CCTech GGUF loaders for ComfyUI — UNET / CLIP (dual–quadruple) with quantized weights, plus dual VAE and ClipProj text encoder loaders."
 version = "1.0.1"
 license = {file = "LICENSE"}
 
