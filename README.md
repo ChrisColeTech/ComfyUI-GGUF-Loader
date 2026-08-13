@@ -66,7 +66,7 @@ All of them live under `🤖 CCTech/GGUF`.
 | **CLIP Loader (GGUF)** | single text encoder, `.gguf` or `safetensors` |
 | **Dual / Triple / Quadruple CLIP Loader (GGUF)** | the same for models taking several encoders |
 | **Dual VAE Loader (video + audio)** | two VAEs from one node, with the outputs named for their streams |
-| **Text Encoder + ClipProj Loader** | loads a small encoder and projects it into a large one's space |
+| **Text Encoder + ClipProj Loader** | loads a small encoder, GGUF included, and projects it into a large one's space |
 
 ### Dual VAE Loader
 
@@ -74,19 +74,23 @@ MiniMax-H3 decodes video and audio through two separate VAEs, so every workflow 
 
 ### Text Encoder + ClipProj Loader
 
-Loads a small text encoder and projects it into the large one's space in a single node — for MiniMax-H3, a Qwen3-VL-4B or -8B standing in for the 32B, which is the whole point of [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj).
+Loads a small text encoder and projects it into a large one's space in a single node — for MiniMax-H3, a Qwen3-VL-4B or -8B standing in for the 32B the model expects, which takes the text encoder from 15.7 GB to about 5.
 
-That pack is **required** for this node and is not bundled: install it, and put the projection matrices in `ComfyUI/models/clip_projections/`. Without it the projection dropdown shows a marker and running the node tells you where to get it.
+The projection is **ported into this pack** (`clipproj.py`) from [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) by nicolab28, MIT, with the licence travelling alongside it as [LICENSE-ClipProj](LICENSE-ClipProj). No dependency on that pack: install it or don't, this node works either way. Verified against the original on a real prompt through the learned 8B matrix — identical conditioning, to the bit.
 
-What this node adds over ClipProj's own all-in-one loader is the GGUF path. It routes by extension: `.gguf` files go through this pack's loader, everything else through ComfyUI's stock one — deliberately not through the GGUF path, which refuses scaled-fp8 checkpoints, and `qwen3vl_*_fp8_scaled` is the encoder most people have.
+What you do still need is a **matrix**, from [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3), in `ComfyUI/models/clip_projections/`. `mmh3-4b-*` goes with a 4B and `mmh3-8b-*` with an 8B; they are not interchangeable. The `<control:...>` entries are not projections but deliberate baselines — zero ignores your prompt entirely, identity copies the raw dimensions with no learning — and they run on any encoder. Run them first to see that the matrix is doing the work.
 
-It has no `device` or `mode` widget. Those exist in ClipProj's loader for multi-GPU pinning, which its own README calls actively harmful on a single card: a pinned encoder holds 4–9 GB away from the diffusion model at every sampling step. This node uses ComfyUI's normal paging. If you do want an encoder pinned to a chosen card, use `ClipProj Device Loader` → `ClipProj Apply` instead.
+Differences from the upstream node:
+
+- **It reads GGUF.** Routing is by extension: `.gguf` through this pack's loader, everything else through ComfyUI's stock one — deliberately not through the GGUF path, which refuses scaled-fp8 checkpoints, and `qwen3vl_*_fp8_scaled` is the encoder most people have.
+- **`type` defaults to `auto`** and is checked against the file even when set by hand. Detection reads headers only, so a 10 GB encoder costs nothing to identify — and an mmproj file, which is the vision projector alone with no text model in it, is refused before the load instead of surfacing later as a missing-attribute error.
+- **No `device` or `mode` widget.** Those exist upstream for multi-GPU pinning, which its own README calls actively harmful on a single card: a pinned encoder holds 4–9 GB away from the diffusion model at every sampling step. This node uses ComfyUI's normal paging. If you do want an encoder pinned to a chosen card, install the upstream pack and use its `ClipProj Device Loader` → `ClipProj Apply`.
 
 ## Credits
 
 This is a fork. The GGUF loader, the quantization tooling, the custom ops and effectively everything that makes this work are **[city96](https://github.com/city96)**'s — see [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), Apache-2.0. Most of what is merged here on top of it comes from open pull requests on that repository, written by their respective authors and listed in [PR_BACKPORT.md](PR_BACKPORT.md). Bugs in this fork are ours, not theirs — report them here rather than upstream.
 
-The projection method behind the ClipProj node, and the node pack it needs, are **[nicolab28](https://github.com/nicolab28)**'s: [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj), MIT.
+`clipproj.py` is ported from **[nicolab28](https://github.com/nicolab28)**'s [ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj), MIT — the projection method, the reconstruction formula, the MiniMax-H3 tokenisation and the attention-sink substitution are all theirs, and their licence travels with the file as [LICENSE-ClipProj](LICENSE-ClipProj). The projection matrices are theirs too and are not bundled: [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3).
 
 The GGUF format itself comes from [llama.cpp](https://github.com/ggerganov/llama.cpp).
 

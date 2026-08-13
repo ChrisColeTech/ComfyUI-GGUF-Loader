@@ -7,18 +7,12 @@ DualVAELoader     H3 decodes video and audio through two separate VAEs, so every
                   workflow needs two VAELoader nodes side by side. This is that
                   pair in one node, with the outputs named for their role.
 
-ClipProjLoader    "load a text encoder and project it" in a single node, with
-                  the GGUF path wired in. ComfyUI-ClipProj's own all-in-one
-                  loader goes through comfy.sd.load_clip, which cannot read a
-                  .gguf; this one routes .gguf files through the GGUF loader and
-                  everything else through the stock path, then applies the
-                  projection to whichever came back.
-
-The ClipProj node is optional: it needs the ComfyUI-ClipProj pack installed and
-degrades to an explicit error, not an import failure, when it is absent.
+ClipProjLoader    load a text encoder and project it into a larger one's space,
+                  in a single node, reading GGUF as well as safetensors. The
+                  projection itself is in clipproj.py, ported from
+                  ComfyUI-ClipProj (MIT, nicolab28).
 """
 
-import sys
 import logging
 
 import nodes
@@ -26,46 +20,19 @@ import comfy.sd
 import folder_paths
 
 from .nodes import CLIPLoaderGGUF
+from . import clipproj
 
-# Shown in the projection combo when the ClipProj pack is not installed. Picking
-# it raises with the URL rather than failing on a missing attribute.
-CLIPPROJ_MISSING = "<ComfyUI-ClipProj not installed>"
+# The projection folder has to exist before INPUT_TYPES first reads it, or the
+# combo comes up with the controls alone on a fresh install.
+clipproj.register_folder()
 
-CLIPPROJ_URL = "https://github.com/nicolab28/ComfyUI-ClipProj"
+# The only families this projects from. ClipProj's tokenisation is MiniMax-H3's
+# and its tap reads a Qwen3-VL hidden state, so offering the full CLIPType list
+# would only invite picking one that cannot work.
+QWEN3VL_TYPES = ("krea2", "boogu", "minimax")
 
-_CLIPPROJ = {}
-
-
-def clipproj_module():
-    """Return ComfyUI-ClipProj's node module, or None when it is not installed.
-
-    Resolved through sys.modules rather than by importing a path, so the pack is
-    found whatever folder name it was cloned under and, more importantly, so we
-    share its module state: the projection cache and the pinning registry are
-    module-level, and a second copy loaded from file would quietly hold its own.
-    """
-    mod = _CLIPPROJ.get("mod")
-    if mod is not None:
-        return mod
-    for name, m in list(sys.modules.items()):
-        if m is None or not name.endswith("clipproj_nodes"):
-            continue
-        if hasattr(m, "_wrap") and hasattr(m, "list_projections"):
-            _CLIPPROJ["mod"] = m
-            return m
-    return None
-
-
-def list_projections():
-    """Projection matrices offered by the ClipProj pack, or the missing marker."""
-    mod = clipproj_module()
-    if mod is None:
-        return [CLIPPROJ_MISSING]
-    try:
-        return list(mod.list_projections())
-    except Exception as e:
-        logging.warning("[CCTech] could not list ClipProj projections: %s", e)
-        return [CLIPPROJ_MISSING]
+# Size -> the matrix that goes with it, for error messages.
+MATRIX_FOR = {"krea2": "mmh3-4b-*", "boogu": "mmh3-8b-*", "minimax": "mmh3-32b-*"}
 
 
 class DualVAELoader:
@@ -108,22 +75,28 @@ class ClipProjLoader(CLIPLoaderGGUF):
 
     @classmethod
     def INPUT_TYPES(s):
-        types = list(nodes.CLIPLoader.INPUT_TYPES()["required"]["type"][0])
+        stock = list(nodes.CLIPLoader.INPUT_TYPES()["required"]["type"][0])
+        types = ["auto"] + [t for t in stock if t in QWEN3VL_TYPES]
         return {
             "required": {
                 "clip_name": (s.get_filename_list(), {
-                    "tooltip": "Small encoder: a Qwen3-VL-4B or -8B, .gguf or "
-                               ".safetensors. It must be a VL model — a "
-                               "text-only Qwen3 of the same size loads without "
-                               "complaint and ignores your prompt."}),
+                    "tooltip": "A full Qwen3-VL text encoder, .gguf or "
+                               ".safetensors. Not an mmproj file, which is the "
+                               "vision projector alone and carries no text "
+                               "model. It must be a VL model: a text-only Qwen3 "
+                               "of the same size loads without complaint and "
+                               "produces conditioning that ignores your prompt."}),
                 "type": (types, {
-                    "default": "krea2" if "krea2" in types else types[0],
-                    "tooltip": "krea2 = 4B, boogu = 8B, minimax = 32B."}),
-                "projection": (list_projections(), {
+                    "default": "auto",
+                    "tooltip": "auto reads the file header and picks the "
+                               "architecture. Override only if that fails: "
+                               "krea2 = 4B, boogu = 8B, minimax = 32B."}),
+                "projection": (clipproj.list_projections(), {
                     "tooltip": "Learned matrix from models/clip_projections/, or "
                                "a <control:...> baseline. mmh3-4b-* goes with a "
                                "4B, mmh3-8b-* with an 8B; they are not "
-                               "interchangeable."}),
+                               "interchangeable. Run the controls first: they "
+                               "show what the diffusion model does on its own."}),
             }
         }
 
@@ -131,29 +104,65 @@ class ClipProjLoader(CLIPLoaderGGUF):
     FUNCTION = "load_clip_projected"
     CATEGORY = "🤖 CCTech/GGUF"
     TITLE = "Text Encoder + ClipProj Loader ⚡"
-    DESCRIPTION = ("Load a small text encoder and project it into the large "
-                   "one's space. Reads GGUF encoders, which ComfyUI-ClipProj's "
-                   "own loader cannot. Requires ComfyUI-ClipProj for the "
-                   "projection itself.")
+    DESCRIPTION = ("Load a small text encoder and project it into a large one's "
+                   "space, so a 4B or 8B Qwen3-VL can stand in for the 32B "
+                   "MiniMax H3 expects. Matrices go in models/clip_projections/.")
+
+    def resolve_type(self, clip_path, clip_name, requested):
+        """Settle the architecture, checking the file when it can be read.
+
+        Detection runs even when the type is given by hand: it looks for the
+        vision tower, so it tells a Qwen3-VL from an ordinary Qwen3 -- which the
+        hidden width does not, both families share 2560 and 4096. It also
+        catches a file that is not a text encoder at all, before a load that can
+        be ten gigabytes.
+        """
+        found = clipproj.detect_arch(clip_path)
+        if found is None:
+            if requested == "auto":
+                raise ValueError(
+                    "Could not identify %s as a Qwen3-VL text encoder, so there "
+                    "would be nothing for the projection to read.\n"
+                    "  - an mmproj file is the vision projector on its own, a "
+                    "few hundred MB against several GB, and carries no text "
+                    "model at all. That is the usual mistake.\n"
+                    "  - a text-only Qwen3 has no vision tower either; it would "
+                    "load and then ignore your prompt.\n"
+                    "Set 'type' by hand to load it anyway: krea2 = 4B, "
+                    "boogu = 8B, minimax = 32B." % clip_name)
+            logging.warning(
+                "[ClipProj] no vision tower found in %s. If it is a text-only "
+                "Qwen3 rather than a Qwen3-VL, the projection will load without "
+                "complaint and produce conditioning that ignores your prompt.",
+                clip_name)
+            return requested
+        detected, label = found
+        if requested == "auto":
+            logging.info("[ClipProj] %s detected as a %s", clip_name, label)
+            return detected
+        if requested != detected:
+            raise ValueError(
+                "%s is a %s, but 'type' is set to %s. Use auto, or %s. The "
+                "matrix has to match as well: %s."
+                % (clip_name, label, requested, detected,
+                   MATRIX_FOR.get(detected, "the matching mmh3-* file")))
+        return requested
 
     def load_clip_projected(self, clip_name, type, projection):
         """Load through the GGUF or the stock path, then wrap in the projection."""
-        mod = clipproj_module()
-        if mod is None:
-            raise RuntimeError(
-                "This node needs the ComfyUI-ClipProj pack for the projection "
-                "itself — it is not installed. Clone it into custom_nodes and "
-                "restart:\n    git clone %s\nThe matrices go in "
-                "models/clip_projections/." % CLIPPROJ_URL)
-        if projection == CLIPPROJ_MISSING:
-            raise ValueError(
-                "No projection selected. Put a matrix in "
-                "models/clip_projections/ (see %s) and pick it here." % CLIPPROJ_URL)
-
         clip_path = folder_paths.get_full_path("clip", clip_name)
         if clip_path is None:
             clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
-        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+        resolved = self.resolve_type(clip_path, clip_name, type)
+        clip_type = getattr(comfy.sd.CLIPType, resolved.upper(),
+                            comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+        # Drop the previous run's device-side projection before the new encoder
+        # lands, not after: ComfyUI only replaces this node's output once the
+        # load has finished, so otherwise both sets sit on the card at the
+        # moment it is most loaded.
+        clipproj.purge_projection_caches()
 
         if clip_path.lower().endswith(".gguf"):
             clip = self.load_patcher([clip_path], clip_type, self.load_data([clip_path]))
@@ -166,7 +175,26 @@ class ClipProjLoader(CLIPLoaderGGUF):
                 embedding_directory=folder_paths.get_folder_paths("embeddings"),
                 clip_type=clip_type,
             )
-        return (mod._wrap(clip, projection),)
+
+        # Last guard, on the built model rather than the file. ComfyUI falls back
+        # to CLIP-L when it cannot identify a state dict: it logs every key as
+        # missing, returns a randomly initialised model, and raises nothing.
+        try:
+            sub = clipproj.submodel(clip)
+        except Exception:
+            sub = None
+        tr = getattr(sub, "transformer", None)
+        if tr is None or not hasattr(tr, "preprocess_embed"):
+            # tr.__class__ rather than type(tr): `type` is this function's
+            # parameter name, matching the widget.
+            built = tr.__class__.__name__ if tr is not None else "no text model"
+            raise ValueError(
+                "%s loaded as %s, not as a Qwen3-VL text encoder, so the "
+                "projection has nothing to read. Check that the file is a full "
+                "text encoder and that 'type' matches its size."
+                % (clip_name, built))
+
+        return (clipproj.wrap(clip, projection),)
 
 
 NODE_CLASS_MAPPINGS = {
