@@ -345,3 +345,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF.TITLE,
 }
 
+# Imported last: nodes_extra subclasses CLIPLoaderGGUF, so it has to come after
+# the class definitions above rather than at the top of the file.
+from .nodes_extra import (NODE_CLASS_MAPPINGS as _EXTRA_CLASSES,
+                          NODE_DISPLAY_NAME_MAPPINGS as _EXTRA_NAMES)
+
+NODE_CLASS_MAPPINGS.update(_EXTRA_CLASSES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_EXTRA_NAMES)
+
