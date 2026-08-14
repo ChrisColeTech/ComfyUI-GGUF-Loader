@@ -3,6 +3,9 @@
 *.safetensors
 tools/llama.cpp*
 
+# local loader smoke-test scratch output
+_smoke_test_out.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
