@@ -922,6 +922,15 @@ class ScenemaAudioGenerate:
             ref = ref_latent["samples"]
             if getattr(ref, "is_nested", False):
                 ref = ref.unbind()[-1]
+            if (ref.dim() != 4 or ref.shape[-3] != fsm.latent_channels
+                    or ref.shape[-1] != fsm.latent_frequency_bins):
+                raise ValueError(
+                    f"ref_latent shape {tuple(ref.shape)} is not a Scenema audio "
+                    f"VAE latent (expected [B, {fsm.latent_channels}, T, "
+                    f"{fsm.latent_frequency_bins}]). Connect the output of "
+                    "'Scenema VAE Encode (voice reference)' fed by LoadAudio — "
+                    "a plain audio latent (e.g. EmptyLatentAudio) carries no "
+                    "voice identity and cannot be used for cloning.")
             b, c, t, f = ref.shape
             current_ref = ref.permute(0, 2, 1, 3).reshape(b, t, c * f).to(device)
 
