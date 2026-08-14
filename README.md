@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-All of them live under `🤖 CCTech/GGUF`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; the Scenema Audio nodes under `🤖 CCTech/Scenema`.
 
 | Node | Purpose |
 |---|---|
@@ -67,6 +67,9 @@ All of them live under `🤖 CCTech/GGUF`.
 | **Dual / Triple / Quadruple CLIP Loader (GGUF)** | the same for models taking several encoders |
 | **Dual VAE Loader (video + audio)** | two VAEs from one node, with the outputs named for their streams |
 | **Text Encoder + ClipProj Loader** | loads a small encoder, GGUF included, and projects it into a large one's space |
+| **Scenema Models Loader** | the Scenema Audio stack from your own folders — DiT, Gemma-3 text encoder (safetensors **or GGUF**), pipeline checkpoint, VAE encoder |
+| **Scenema VAE Encode (voice reference)** | reference clip → audio latent for voice cloning || **Scenema VAE Encode (voice reference)** | reference clip → audio latent for voice cloning |
+| **Scenema Audio Generate** | expressive TTS with presets, scene/language, chunking and A2V voice cloning |
 
 ### Dual VAE Loader
 
@@ -86,10 +89,27 @@ Differences from the upstream node:
 - **`type` defaults to `auto`** and is checked against the file even when set by hand. Detection reads headers only, so a 10 GB encoder costs nothing to identify — and an mmproj file, which is the vision projector alone with no text model in it, is refused before the load instead of surfacing later as a missing-attribute error.
 - **No `device` or `mode` widget.** Those exist upstream for multi-GPU pinning, which its own README calls actively harmful on a single card: a pinned encoder holds 4–9 GB away from the diffusion model at every sampling step. This node uses ComfyUI's normal paging. If you do want an encoder pinned to a chosen card, install the upstream pack and use its `ClipProj Device Loader` → `ClipProj Apply`.
 
+### Scenema Audio
+
+Ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT), rebuilt on ComfyUI's native LTX-AV machinery and this pack's loaders — no vendored model code, no HuggingFace auto-download. Point the nodes at the same components the sidecar uses (from [ScenemaAI/scenema-audio](https://huggingface.co/ScenemaAI/scenema-audio)):
+
+| File | Folder | Dropdown |
+|---|---|---|
+| `scenema-audio-transformer-int8.safetensors` (or bf16, or a GGUF quant) | `models/diffusion_models` (unet) | transformer |
+| `gemma-3-12b-it-*.gguf` (or a safetensors single-file Gemma-3 12B) | `models/text_encoders` (clip) | text encoder |
+| `scenema-audio-pipeline.safetensors` | `models/vae` | pipeline |
+| `scenema-audio-vae-encoder.safetensors` | `models/vae` | VAE encoder |
+
+The Models Loader outputs plain comfy **MODEL / CLIP / VAE**: the audio DiT loads as a comfy LTX-AV model with the video paths gated off (the comfy-native equivalent of the original nodes' audio-only monkey-patch), the Gemma text encoder runs as comfy's `LTXAVTEModel` — a GGUF stays quantized through this pack's ops, with the tokenizer rebuilt from the GGUF metadata — and the VAE is comfy's `AudioVAE` (encoder + decoder + BigVGAN vocoder with the 16 kHz → 48 kHz bandwidth extension, so output is 48 kHz stereo). The pipeline checkpoint also supplies the text projection and embeddings connectors.
+
+Generate keeps the original node's behaviour: the `<speak>` XML prompt compiler (with `[bracketed cues]` and per-line action tags), the 12 production presets, scene/language dropdowns, pace, seed, automatic sentence-boundary chunking with A2V voice chaining between chunks, and per-chunk trim/normalize before concatenation. Optional `ref_latent` (from Scenema VAE Encode fed by LoadAudio) gives zero-shot voice cloning. Not ported, because they need non-comfy dependencies: Whisper word-match validation, SeedVC polish, and the MelBandRoFormer SFX strip.
+
+A CPU smoke test for the load paths lives at `tools/smoke_scenema.py`.
+
 ## Credits
 
 Fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (Apache-2.0) — the loader, the quantization tooling and the custom ops are theirs; the backported PRs are their authors', listed in [PR_BACKPORT.md](PR_BACKPORT.md). Report bugs in this fork here, not upstream.
 
-`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp).
+`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT).
 
 Model weights stay under their own licences — MiniMax-H3's is a custom one, worth reading before any use.
