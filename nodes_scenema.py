@@ -44,6 +44,7 @@ import torch
 
 import comfy.model_management
 import comfy.nested_tensor
+import comfy.ops
 import comfy.sample
 import comfy.sd
 import comfy.utils
@@ -517,23 +518,70 @@ PRESET_NAMES = [CUSTOM] + list(PRESETS.keys())
 
 # ── Checkpoint loading helpers ────────────────────────────────────────────
 
-def _expand_int8(sd):
-    """Expand ltx_core Int8Linear keys (`.weight.int8` + `.weight.scale`) to dense.
+def _convert_int8_keys(sd):
+    """Expose Scenema INT8 tensors through comfy's native quantized ops.
 
-    Matches the original nodes' Int8Linear semantics exactly:
-    ``w = weight_int8.float() * scale.unsqueeze(1)`` (scale is per output row).
+    This only renames tensors and views the per-row scale as ``[out, 1]``.
+    The packed weight is never dequantized here; comfy expands only the active
+    layer at forward time and accounts for the packed storage during offload.
     """
     int8_keys = [k for k in sd if k.endswith(".weight.int8")]
+    if not int8_keys:
+        return sd
+
+    try:
+        from comfy.quant_ops import QUANT_ALGOS
+        supported = "int8_tensorwise" in QUANT_ALGOS
+    except ImportError:
+        supported = False
+    if not supported or not hasattr(comfy.ops, "mixed_precision_ops"):
+        raise RuntimeError(
+            "This Scenema INT8 checkpoint requires a ComfyUI version with "
+            "native int8_tensorwise mixed-precision operations. Update ComfyUI; "
+            "the checkpoint will not be expanded to a dense fallback."
+        )
+
+    marker = torch.tensor(
+        list(b'{"format":"int8_tensorwise"}'), dtype=torch.uint8)
     for k8 in int8_keys:
-        base = k8[: -len(".int8")]
-        scale = sd[base + ".scale"].float()
+        weight_key = k8[: -len(".int8")]
+        scale_key = weight_key + ".scale"
+        if scale_key not in sd:
+            raise RuntimeError(f"Scenema INT8 layer has no scale tensor: {k8}")
+        weight = sd.pop(k8)
+        scale = sd.pop(scale_key)
+        if weight.dtype != torch.int8:
+            raise RuntimeError(f"Scenema INT8 layer is {weight.dtype}, expected int8: {k8}")
         if scale.dim() == 1:
             scale = scale.unsqueeze(1)
-        sd[base] = sd[k8].float() * scale
-        del sd[k8], sd[base + ".scale"]
-    if int8_keys:
-        logger.info("Scenema: expanded %d INT8 linear layers to dense", len(int8_keys))
+        module_prefix = weight_key[: -len("weight")]
+        sd[weight_key] = weight
+        sd[module_prefix + "weight_scale"] = scale
+        sd[module_prefix + "comfy_quant"] = marker
+    logger.info("Scenema: retained %d linear layers as native packed INT8", len(int8_keys))
     return sd
+
+
+class _ScenemaGGMLOps(GGMLOps):
+    """GGUF ops which leave absent audio-only video weights unallocated."""
+
+    class Linear(GGMLOps.Linear):
+        def ggml_load_from_state_dict(
+                self, state_dict, prefix, local_metadata, strict,
+                missing_keys, unexpected_keys, error_msgs):
+            prefix_len = len(prefix)
+            for key, value in state_dict.items():
+                name = key[prefix_len:]
+                if name == "weight":
+                    self.weight = torch.nn.Parameter(value, requires_grad=False)
+                elif name == "bias" and value is not None:
+                    self.bias = torch.nn.Parameter(value, requires_grad=False)
+                else:
+                    unexpected_keys.append(key)
+            if self.weight is None:
+                missing_keys.append(prefix + "weight")
+            elif getattr(self.weight, "is_largest_weight", False):
+                self.largest_layer = True
 
 
 def _normalize_transformer_keys(sd):
@@ -545,6 +593,17 @@ def _normalize_transformer_keys(sd):
                 for k, v in sd.items()}
     # bare keys (e.g. a GGUF quantized with the diffusion_model prefix stripped)
     return {"model.diffusion_model." + k: v for k, v in sd.items()}
+
+
+def _nuke_video_paths(model):
+    """Remove every per-block module skipped by the permanent audio gates."""
+    blocks = model.model.diffusion_model.transformer_blocks
+    names = ("attn1", "attn2", "ff", "audio_to_video_attn", "video_to_audio_attn")
+    for block in blocks:
+        for name in names:
+            setattr(block, name, torch.nn.Identity())
+    model.size = 0
+    logger.info("Scenema: removed %d unused video/cross-modal modules", len(blocks) * len(names))
 
 
 def _pad_detection_key(sd, metadata):
@@ -630,8 +689,8 @@ class ScenemaModelLoader:
                 "transformer_name": (_unet_filename_list(), {
                     "tooltip": "scenema-audio-transformer-int8.safetensors (or the bf16 "
                                "checkpoint, or a GGUF quant of either) from "
-                               "models/diffusion_models (unet). INT8 checkpoints are "
-                               "expanded to dense bf16 at load."}),
+                               "models/diffusion_models (unet). INT8 and GGUF weights "
+                               "remain quantized and dequantize one layer at a time."}),
                 "text_encoder_name": (_clip_filename_list(), {
                     "tooltip": "Gemma-3 12B text encoder, .gguf (stays quantized) or "
                                "safetensors, from models/text_encoders (clip)."}),
@@ -664,7 +723,8 @@ class ScenemaModelLoader:
             or folder_paths.get_full_path_or_raise("vae", pipeline_name)
         p_sd, p_meta, _ = _load_file_sd(pipeline_path)
 
-        t_sd = _expand_int8(t_sd)
+        has_native_int8 = any(k.endswith(".weight.int8") for k in t_sd)
+        t_sd = _convert_int8_keys(t_sd)
         t_sd = _normalize_transformer_keys(t_sd)
 
         # Merge the embeddings connectors from the pipeline checkpoint so the
@@ -687,7 +747,11 @@ class ScenemaModelLoader:
         if "metadata" in valid and metadata:
             kwargs["metadata"] = metadata
         if is_gguf:
-            model_options["custom_operations"] = GGMLOps()
+            model_options["custom_operations"] = _ScenemaGGMLOps()
+        elif not has_native_int8:
+            # MixedPrecisionOps creates linears without dense weight storage.
+            # Present BF16 weights are assigned; absent video weights stay None.
+            model_options["custom_operations"] = comfy.ops.mixed_precision_ops({})
 
         model = comfy.sd.load_diffusion_model_state_dict(
             t_sd, model_options=model_options, **kwargs,
@@ -699,6 +763,8 @@ class ScenemaModelLoader:
         if is_gguf:
             from .nodes import GGUFModelPatcher
             model = GGUFModelPatcher.clone(model)
+
+        _nuke_video_paths(model)
 
         # Audio-only forward — the comfy-native equivalent of the original
         # nodes' monkey-patched BasicAVTransformerBlock.forward.

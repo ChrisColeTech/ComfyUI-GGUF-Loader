@@ -1,0 +1,178 @@
+# AGENTS.md — Comfy-GGUF (CCTech fork) + Scenema Audio nodes
+
+Working notes for any agent (or human) continuing work in this repo. Everything
+below was verified against real checkpoints and real ComfyUI code, not inferred.
+
+## Repo layout
+
+- `nodes.py` — GGUF loader nodes (UNET/CLIP loaders, dual-VAE, ClipProj). Registers
+  `unet_gguf` / `clip_gguf` folder keys. Node category: `🤖 CCTech/GGUF`.
+- `nodes_scenema.py` — the Scenema Audio nodes (category `🤖 CCTech/Scenema`).
+- `loader.py` — GGUF → fake-quantized state dict (`gguf_sd_loader`), text-encoder
+  post-processing (`gguf_clip_loader`: key remaps, Gemma-3 norm `+1` un-bake,
+  sentencepiece tokenizer rebuild from GGUF metadata — now cached next to the
+  GGUF as `<name>.spiece_cache.bin`).
+- `ops.py` / `dequant.py` — GGMLTensor/GGMLOps: weights stay quantized, dequant
+  per-layer at forward time. **This is the repo's core identity.**
+- `nodes_extra.py`, `clipproj.py` — DualVAELoader, ClipProjLoader.
+- `tools/smoke_scenema.py` — CPU dry-run of the Scenema load paths against real
+  checkpoints (`--skip-te` skips the slow Gemma GGUF part).
+
+Reference ComfyUI checkout used for verification: `D:\Projects\ComfyUI\upstream\ComfyUI`
+(rev 155 / v0.32.0 era). Weights: `D:\models\image-models\scenema-audio` (the
+sidecar layout, `split/` subdirs). The original node pack lives at
+`D:\Projects\ComfyUI\ComfyUI-ScenemaAudio` (MIT, ScenemaAI); the pure-torch
+sidecar port at `D:\Projects\giga-videos\src\sidecar\vendor\pipelines\scenema_audio`.
+
+## The Scenema weight set (what the nodes must load)
+
+| File | Role |
+|---|---|
+| `scenema-audio-transformer-int8.safetensors` (4.9 GB) | audio DiT. INT8 per-layer: keys `…weight.int8` (int8, `[out,in]`) + `…weight.scale` (fp32, per output row). Metadata `config` holds the full transformer/VAE/vocoder config. **Video-path weights are stripped** — audio-only checkpoint. |
+| `scenema-audio-transformer.safetensors` (9.8 GB) | same DiT in bf16 |
+| `scenema-audio-pipeline.safetensors` (7 GB) | text_embedding_projection (dual: 3840·49 → 4096 video / 2048 audio), `model.diffusion_model.{audio,video}_embeddings_connector` (8× transformer-1d blocks + 128 learnable registers each), audio VAE encoder+decoder, BigVGAN vocoder + BWE stage (16 kHz → 48 kHz stereo). Same `config` metadata. |
+| `scenema-audio-pipeline-audio.safetensors` | decoder+vocoder only subset (optional; not on disk here) |
+| `scenema-audio-vae-encoder.safetensors` (43 MB) | standalone VAE encoder (44 tensors, bare keys `encoder.*`, `per_channel_statistics.*`) |
+| `gemma-3-12b-it-Q4_K_M.gguf` | the text encoder. arch `gemma3` — already supported by this repo's `gguf_clip_loader`. |
+
+DiT keys are `velocity_model.*` → comfy layout is `model.diffusion_model.*`.
+Key names then match comfy's `LTXAVModel` **1:1** (verified against
+`comfy/ldm/lightricks/av_model.py`: `transformer_blocks.N.audio_attn1/2`,
+`audio_ff`, `audio_to_video_attn`, `video_to_audio_attn`, adaln singles, etc.).
+There is also `mmproj-F16.gguf` in the TE folder — that is Gemma's SigLIP
+vision projector, **not** usable as the text encoder.
+
+## The comfy-native mapping (why this port works at all)
+
+ComfyUI core ships the entire LTX-2 A/V stack; nothing needs vendoring:
+
+- **DiT** → `comfy.ldm.lightricks.av_model.LTXAVModel`. Detection
+  (`model_detection.py:398-408`) reads `transformer_blocks.0.attn2.to_k.weight`
+  (a *video* tensor, missing in the audio-only ckpt) — so the loader pads one
+  zero tensor of the right shape; the embedded `config` metadata then overrides
+  every detection value. `image_model: "ltxav"` requires `audio_adaln_single.linear.weight`
+  present (it is). Embeddings connectors are real comfy modules on LTXAVModel
+  (`preprocess_text_embeds`) — merge the pipeline ckpt's
+  `model.diffusion_model.*` tensors into the DiT sd before load.
+- **Audio-only forward**: comfy's block forward has native gates —
+  `transformer_options["run_vx"]=False`, `a2v_cross_attn=False`,
+  `v2a_cross_attn=False` — which reproduce the original pack's monkey-patched
+  `audio_only_forward` exactly. Bake them into `model.model_options["transformer_options"]`;
+  samplers merge patcher-level transformer_options into every step (`samplers.py:312`).
+- **Text encoder** → `comfy.sd.load_text_encoder_state_dicts(clip_type=CLIPType.LTXV,
+  state_dicts=[gemma_sd, pipeline_sd])`. Comfy detects the dual projection from
+  `text_embedding_projection.audio_aggregate_embed.bias` (`sd_detect` in
+  `comfy/text_encoders/lt.py`) and builds `LTXAVTEModel` = `Gemma3_12BModel`
+  (layer="all" → all 49 hidden states via `Llama2_.forward(intermediate_output="all")`)
+  + `DualLinearProjection`. The GGUF path rebuilds a spiece tokenizer from
+  metadata; Gemma-3 norm `+1` un-bake and key remap are already in `loader.py`.
+  `CLIPType.LTXV` branch lives at `sd.py:1962`. A plain `CLIP Loader (GGUF)`
+  (e.g. type `stable_diffusion`) emits raw Gemma hidden states in the wrong
+  layout — the DiT's connector crashes on them (`cat 4-D vs 3-D`). Generate
+  validates for `text_embedding_projection` and errors early.
+- **VAE** → `comfy.sd.VAE(sd={audio_vae.*, vocoder.*}, metadata=pipeline meta)`.
+  The `vocoder.resblocks…` detection branch (`sd.py:931`) builds
+  `comfy.ldm.lightricks.vae.audio_vae.AudioVAE` (encoder + decoder + BigVGAN
+  vocoder with BWE → 48 kHz stereo out). The VAE loader node in comfy core
+  (`nodes_lt_audio.py LTXVAudioVAELoader`) does exactly this prefix replace.
+  `AudioVAE.encode(waveform[B,C,T], sample_rate=…)`, `.decode(latent)` returns
+  [B, T, C]; `fsm.num_of_latents_from_frames(frames, fps)`, `latent_channels=8`,
+  `latent_frequency_bins=16`, `sample_rate=16000`, `output_sample_rate=48000`.
+  10 s @ 24 fps → 251 latents (verified).
+- **Sampling** → comfy's normal stack. The distilled schedule is
+  `[1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]`
+  (8 steps, `ltx_pipelines/utils/constants.py DISTILLED_SIGMAS`).
+  `ModelSamplingFlux.timestep(sigma)=sigma` and the DiT applies ×1000 itself —
+  identical semantics to ltx_core, so passing these sigmas directly to
+  `comfy.sample.sample(..., cfg=1.0, sampler="euler", scheduler="simple")`
+  matches `SimpleDenoiser` + `EulerDiffusionStep`. Latents are comfy
+  NestedTensors: build `(video_zeros[1,128,1,1,1], audio_zeros[1,8,T,16])`,
+  `comfy.sample.prepare_noise(latent, seed)`, output `.unbind()[-1]` is the
+  audio stream.
+- **A2V voice reference** → cond `ref_audio={"tokens": [B, T, C*F]}` on the
+  conditioning (comfy's `LTXVReferenceAudio` node is the reference impl); the
+  model prepends them at timestep 0 and strips them on output
+  (`av_model.py:708-731, 1029-1033`). Chunk chaining: encode 3 s tail of chunk
+  N as the reference for chunk N+1 (original: `REF_TAIL_SECONDS=3.0`).
+
+## What the original ScenemaAudio nodes did that we ported
+
+XML `<speak>` prompt compiler (voice/gender/scene/language/shot attrs, action/
+sound/text blocks, `[bracketed cues]` inline), 12 production presets,
+scene presets + CLEAN_SPEECH_SCENES, sentence-boundary chunking at 15 s max
+with per-sentence action re-attachment, pace multiplier (default 1.5), word-count
+duration fallback (no Kokoro), per-chunk trim/normalize/LUFS then concat +
+silence shortening, 20 s reference cap. Dropped (non-comfy deps): Whisper
+validation, SeedVC polish, MelBandRoFormer SFX strip.
+
+## Resource-correct implementation
+
+The broken loader from commit 8c2cd9f called `_expand_int8`, multiplying every
+INT8 matrix by its scale into a persistent float32 state dict. That path has
+been removed. The current implementation follows these rules:
+
+1. **Scenema safetensors INT8 stays packed.** `_convert_int8_keys` only maps
+   `<layer>.weight.int8` to `<layer>.weight`, maps the scale to
+   `<layer>.weight_scale` (a `[out, 1]` view), and adds
+   `<layer>.comfy_quant = {"format":"int8_tensorwise"}`. Comfy selects
+   `mixed_precision_ops`, stores a `QuantizedTensor`, accounts the actual INT8
+   bytes, and dequantizes only the active layer during forward. There is no
+   dense fallback; old Comfy versions fail with an upgrade message.
+2. **Missing video weights are never created for INT8 or bf16.** Native mixed
+   ops construct Linear modules with `weight=None`. The INT8 metadata selects
+   them automatically; bf16 explicitly uses `comfy.ops.mixed_precision_ops({})`.
+   Present bf16 weights are assigned normally while missing video weights stay
+   `None`.
+3. **GGUF missing video weights also stay unallocated.** `_ScenemaGGMLOps`
+   overrides the generic GGMLOps missing-Linear behavior, which otherwise
+   creates a large dense zero tensor.
+4. **All gated block modules are removed before staging.** `_nuke_video_paths`
+   replaces `attn1`, `attn2`, `ff`, `audio_to_video_attn`, and
+   `video_to_audio_attn` on all 48 blocks, then resets ModelPatcher size
+   accounting. The permanent gates are `run_vx=False`,
+   `a2v_cross_attn=False`, and `v2a_cross_attn=False`.
+5. **Chunk generation has two phases.** All prompts are encoded in one TE
+   session; all chunks then diffuse in one DiT session. There is no per-chunk
+   `soft_empty_cache()` that would swap TE/DiT/VAE repeatedly.
+6. **Tokenizer rebuilding is cached.** SentencePiece reconstruction is cached
+   at `<gguf>.spiece_cache.bin`; verified 22.4 s first build to 0.5 s cached,
+   byte-identical.
+
+Real-checkpoint CPU smoke verification (`tools/smoke_scenema.py --skip-te`):
+
+- all mapped transformer storage bytes remain INT8;
+- loaded audio linears are Comfy `QuantizedTensor` objects;
+- model detects as LTXAV with 48 layers;
+- 240 unused block modules are removed;
+- final ModelPatcher size is 10.96 GiB, down from the reported 40.05 GB staged;
+- AudioVAE remains 16 kHz input / 48 kHz output with 251 latents per 10 s.
+
+GPU sampling still needs validation on the target RTX 5090; the CPU test proves
+the persistent representation and model-size accounting, not CUDA peak memory.
+
+Other verified gotchas:
+
+- `AudioVAE.encode` wants `[B, C, T]` (mono auto-expands to stereo); decode
+  returns `[B, T, C]`. The VAE wrapper `vae.decode` is safe (no latent-format
+  scaling on audio); direct `fsm.encode` calls need
+  `comfy.model_management.load_models_gpu([vae.patcher], force_full_load=…)`
+  first (helper `_audio_vae_loaded`).
+- Conditioning must carry `frame_rate=24` (FPS constant) or RoPE positions are
+  wrong.
+- `ref_latent` from comfy-core `EmptyLatentAudio` is `[B, C, samples]` — not a
+  Scenema VAE latent; Generate validates shape (4-D, 8 ch, 16 freq bins).
+- The workflow-side fix for the `cat 4-D vs 3-D` crash: Generate's `clip` input
+  must come from Scenema Models Loader's `clip` output (Gemma + pipeline
+  projection + connectors), **not** a plain CLIP Loader (GGUF); VAE from the
+  Models Loader too (merges the reference encoder).
+
+## Test infrastructure
+
+`tools/smoke_scenema.py` — CPU dry-run (`--cpu` via comfy cli args, needs
+`comfy.options.args_parsing = True` before importing comfy). Checks: DiT
+detects as ltxav/48 layers; VAE is AudioVAE 16k→48k with 251 latents/10s;
+optional Gemma GGUF → LTXAVTEModel with DualLinearProjection + tokenizer.
+A node-level test (registering folder_paths manually) lives at
+`C:\Users\RISKYB~1\AppData\Local\Temp\opencode\node_test.py` — temp, not in repo.
+Note: the dev box's Python env intermittently access-violates (0xC0000005) in
+native code during model builds; rerun before assuming code is broken.

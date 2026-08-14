@@ -3,7 +3,7 @@
 Run: python tools/smoke_scenema.py [--models-dir D:/models/image-models/scenema-audio]
 
 Exercises the load paths ported in nodes_scenema.py against real checkpoints:
-  1. transformer: int8 expansion + key normalization + connector merge +
+  1. transformer: native packed INT8 mapping + key normalization + connector merge +
      detection pad + comfy LTXAV detection
   2. VAE: AudioVAE construction from the pipeline checkpoint
   3. text encoder: gemma GGUF -> LTXAVTEModel with dual projection (optional;
@@ -51,9 +51,17 @@ def main():
 
     # ── transformer ──
     t_sd, t_meta, _ = ns._load_file_sd(t_path)
-    t_sd = ns._expand_int8(t_sd)
+    int8_storage = sum(v.numel() * v.element_size() for k, v in t_sd.items()
+                       if k.endswith(".weight.int8"))
+    t_sd = ns._convert_int8_keys(t_sd)
     t_sd = ns._normalize_transformer_keys(t_sd)
-    assert "model.diffusion_model.transformer_blocks.0.audio_attn1.to_q.weight" in t_sd
+    q_prefix = "model.diffusion_model.transformer_blocks.0.audio_attn1.to_q."
+    assert t_sd[q_prefix + "weight"].dtype == torch.int8
+    assert t_sd[q_prefix + "weight_scale"].shape[1] == 1
+    assert bytes(t_sd[q_prefix + "comfy_quant"].tolist()) == b'{"format":"int8_tensorwise"}'
+    mapped_storage = sum(v.numel() * v.element_size() for k, v in t_sd.items()
+                         if k.endswith(".weight") and v.dtype == torch.int8)
+    assert mapped_storage == int8_storage
 
     p_sd, p_meta, _ = ns._load_file_sd(p_path)
     merged = 0
@@ -67,7 +75,15 @@ def main():
     model = comfy.sd.load_diffusion_model_state_dict(t_sd, metadata=metadata)
     assert model.model.model_config.unet_config.get("image_model") == "ltxav"
     assert model.model.model_config.unet_config.get("num_layers") == 48
-    print("[ok] transformer loads as comfy LTXAV (48 layers)")
+    first_q = model.model.diffusion_model.transformer_blocks[0].audio_attn1.to_q.weight
+    assert type(first_q).__name__ == "QuantizedTensor"
+    ns._nuke_video_paths(model)
+    first_block = model.model.diffusion_model.transformer_blocks[0]
+    assert isinstance(first_block.attn1, torch.nn.Identity)
+    assert isinstance(first_block.video_to_audio_attn, torch.nn.Identity)
+    stored_gib = model.model_size() / (1024 ** 3)
+    assert stored_gib < 12, f"audio-only packed model is unexpectedly large: {stored_gib:.2f} GiB"
+    print(f"[ok] transformer loads as comfy LTXAV with packed INT8 ({stored_gib:.2f} GiB, 48 layers)")
     del t_sd, model
 
     # ── VAE ──

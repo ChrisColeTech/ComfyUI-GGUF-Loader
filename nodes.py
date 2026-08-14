@@ -353,8 +353,7 @@ from .nodes_extra import (NODE_CLASS_MAPPINGS as _EXTRA_CLASSES,
 NODE_CLASS_MAPPINGS.update(_EXTRA_CLASSES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_EXTRA_NAMES)
 
-# Scenema Audio nodes also build on CLIPLoaderGGUF-era helpers, so they import
-# last for the same reason.
+# Imported last because the Scenema nodes reuse GGUF loader helpers above.
 from .nodes_scenema import (NODE_CLASS_MAPPINGS as _SCENEMA_CLASSES,
                             NODE_DISPLAY_NAME_MAPPINGS as _SCENEMA_NAMES)
 
