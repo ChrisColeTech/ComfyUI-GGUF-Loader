@@ -516,6 +516,22 @@ def gguf_gemma3_tokenizer_loader(path):
         from sentencepiece import sentencepiece_model_pb2 as model
     except ImportError:
         raise ImportError("Please install sentencepiece and protobuf.\npip install sentencepiece protobuf")
+
+    # Building the proto appends 262k pieces one at a time (~20s). The result
+    # is deterministic for a given file, so cache the serialized model next to
+    # the GGUF and reuse it.
+    cache_path = path + ".spiece_cache.bin"
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+            if len(data) > 1_000_000:  # sanity: a real Gemma-3 proto is ~5MB
+                logging.info("Using cached sentencepiece tokenizer: %s", cache_path)
+                return torch.ByteTensor(list(data))
+            logging.warning("Ignoring suspiciously small tokenizer cache, rebuilding.")
+        except OSError:
+            pass  # unreadable cache -> rebuild below
+
     spm = model.ModelProto()
     reader = gguf.GGUFReader(path)
 
@@ -547,9 +563,15 @@ def gguf_gemma3_tokenizer_loader(path):
     
     spm.trainer_spec.vocab_size = len(spm.pieces)
     logging.info(f"Created tokenizer with vocab size of {len(spm.pieces)}")
-    
+
     del reader
-    return torch.ByteTensor(list(spm.SerializeToString()))
+    data = spm.SerializeToString()
+    try:
+        with open(cache_path, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass  # read-only model dir -> just don't cache
+    return torch.ByteTensor(list(data))
 
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)

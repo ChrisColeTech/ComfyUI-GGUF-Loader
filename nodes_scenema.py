@@ -905,6 +905,13 @@ class ScenemaAudioGenerate:
         fsm = vae.first_stage_model
         if not hasattr(fsm, "num_of_latents_from_frames"):
             raise RuntimeError("The connected VAE is not a Scenema/LTX audio VAE.")
+        if not hasattr(clip.cond_stage_model, "text_embedding_projection"):
+            raise RuntimeError(
+                "The connected CLIP is not a Scenema/LTX-AV text encoder — it "
+                "emits raw Gemma hidden states the audio model cannot consume. "
+                "Connect the 'clip' output of Scenema Models Loader (it pairs "
+                "the Gemma encoder with the pipeline checkpoint's text "
+                "projection), not a plain CLIP Loader (GGUF).")
 
         xml_prompt = build_speak_xml(voice_description, gender, speech_text,
                                      scene, custom_scene, action_tags, language)
@@ -934,15 +941,29 @@ class ScenemaAudioGenerate:
             b, c, t, f = ref.shape
             current_ref = ref.permute(0, 2, 1, 3).reshape(b, t, c * f).to(device)
 
+        # ── Phase 1: encode ALL chunk prompts in one text-encoder session ──
+        # (matches the original node; keeps the TE from being swapped in and
+        # out per chunk). ref_audio differs per chunk, so it is attached in
+        # phase 2 to a shallow copy of the conditioning.
+        chunk_conds = []
+        for i, chunk in enumerate(chunks):
+            logger.info("Scenema: encoding chunk %d/%d (%.1fs)",
+                        i + 1, len(chunks), chunk.duration_s)
+            cond = clip.encode_from_tokens_scheduled(
+                clip.tokenize(chunk.compiled_prompt))
+            cond[0][0] = cond[0][0].cpu()
+            cond[0][1]["frame_rate"] = FPS
+            chunk_conds.append(cond)
+
+        # ── Phase 2: diffuse + decode all chunks in one transformer session ──
         waveforms = []
         sr = None
-        for i, chunk in enumerate(chunks):
-            logger.info("Scenema: chunk %d/%d (%.1fs) — encoding",
+        for i, (chunk, cond) in enumerate(zip(chunks, chunk_conds)):
+            logger.info("Scenema: chunk %d/%d (%.1fs) — diffusing",
                         i + 1, len(chunks), chunk.duration_s)
-            cond = clip.encode_from_tokens_scheduled(clip.tokenize(chunk.compiled_prompt))
-            cond[0][1]["frame_rate"] = FPS
             if current_ref is not None:
-                cond[0][1]["ref_audio"] = {"tokens": current_ref}
+                cond = [[cond[0][0], {**cond[0][1],
+                                      "ref_audio": {"tokens": current_ref}}]]
 
             num_latents = fsm.num_of_latents_from_frames(
                 int(chunk.duration_s * FPS) + 1, FPS)
@@ -965,7 +986,6 @@ class ScenemaAudioGenerate:
             sr = fsm.output_sample_rate
             waveforms.append(waveform)
             del cond, latent_image, noise, out, audio_latent
-            comfy.model_management.soft_empty_cache()
 
             if i < len(chunks) - 1:
                 current_ref = self._encode_reference(
