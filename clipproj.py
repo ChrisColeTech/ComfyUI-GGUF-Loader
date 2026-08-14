@@ -140,11 +140,16 @@ def load_projection(name):
         # tensors and a handful of scalars.
         data = torch.load(path, map_location="cpu", weights_only=True)
 
-    for k in ("W", "mean_in", "std_in", "mean_out", "std_out", "tap"):
+    for k in ("mean_in", "std_in", "mean_out", "std_out", "tap"):
         if k not in data:
             raise KeyError("Key '%s' missing from %s" % (k, name))
+    # v3 "-mlp" files drop the ridge matrix and store the whole projection as an
+    # MLP; either form of the map must be present.
+    if "W" not in data and "mlp.0.weight" not in data:
+        raise KeyError("Key 'W' missing from %s (and no mlp.* layers found)" % name)
     for k in ("W", "mean_in", "std_in", "mean_out", "std_out"):
-        data[k] = data[k].float()
+        if k in data:
+            data[k] = data[k].float()
 
     _CACHE.clear()  # one at a time: several tens of MB each
     _CACHE[key] = data
@@ -191,7 +196,7 @@ def guess_cond_dim():
         if name in CONTROLS:
             continue
         try:
-            return int(load_projection(name)["W"].shape[1])
+            return int(load_projection(name)["mean_out"].shape[0])
         except Exception:
             continue
     return DEFAULT_COND_DIM
@@ -543,7 +548,8 @@ class ProjectedCLIP:
             if "control" in proj:
                 cache["p"] = build_control(proj["control"], d_in, guess_cond_dim(), dev)
             else:
-                if d_in != proj["W"].shape[0]:
+                proj_d_in = proj["mean_in"].shape[0]
+                if d_in != proj_d_in:
                     # Naming both sizes is not enough: whoever hits this has
                     # almost always downloaded one matrix and plugged in another
                     # encoder, so name the file they need.
@@ -555,11 +561,12 @@ class ProjectedCLIP:
                         "size: pick the mmh3-%s-ClipProj file, or point the "
                         "loader at a %s encoder."
                         % (size.get(d_in, "?"), d_in,
-                           size.get(proj["W"].shape[0], "?"), proj["W"].shape[0],
+                           size.get(proj_d_in, "?"), proj_d_in,
                            size.get(d_in, "?").lower(),
-                           size.get(proj["W"].shape[0], "?")))
+                           size.get(proj_d_in, "?")))
                 cache["p"] = {k: proj[k].to(dev) for k in
-                              ("W", "mean_in", "std_in", "mean_out", "std_out")}
+                              ("W", "mean_in", "std_in", "mean_out", "std_out")
+                              if k in proj}
                 cache["mlp"] = build_residual(proj, dev)
         p = cache["p"]
 
@@ -567,10 +574,11 @@ class ProjectedCLIP:
         # when the file carries one, corrects inside that same space so it works
         # at the scale of what it is correcting. Its last layer was trained from
         # a zero initialisation, so a network that learned nothing reproduces the
-        # matrix exactly.
+        # matrix exactly. v3 "-mlp" files have no matrix at all: there the MLP
+        # is the projection, not a correction on top of one.
         xn = (h - p["mean_in"]) / p["std_in"]
-        yn = xn @ p["W"]
         net = cache.get("mlp")
+        yn = xn @ p["W"] if "W" in p else 0
         if net is not None:
             # The network keeps the dtype of the file and we convert around it,
             # so a fp16 residual stays fp16 in VRAM and not only on disk.
@@ -636,7 +644,8 @@ def wrap(clip, projection):
         logging.info("[ClipProj] control %s: a reference point, not a learned "
                      "projection", projection)
     else:
-        logging.info("[ClipProj] %s | tap %d | %d -> %d%s", projection,
-                     int(p["tap"]), p["W"].shape[0], p["W"].shape[1],
+        logging.info("[ClipProj] %s | tap %d | %d -> %d%s%s", projection,
+                     int(p["tap"]), p["mean_in"].shape[0], p["mean_out"].shape[0],
+                     "" if "W" in p else " | mlp-only",
                      " | cos_test %.4f" % float(p["cos_test"]) if "cos_test" in p else "")
     return wrapped
