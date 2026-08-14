@@ -868,7 +868,8 @@ class ScenemaVAEEncode:
         if not hasattr(fsm, "encode"):
             raise RuntimeError("The connected VAE is not a Scenema/LTX audio VAE.")
 
-        waveform = audio["waveform"][0].float()  # [C, T]
+        waveform = audio["waveform"][0].to(
+            device=vae.device, dtype=vae.vae_dtype)  # [C, T]
         sr = audio["sample_rate"]
 
         max_samples = int(max_seconds * sr)
@@ -876,7 +877,8 @@ class ScenemaVAEEncode:
             waveform = waveform[:, :max_samples]
 
         # AudioVAE.encode takes [B, C, T]; mono is expanded to stereo inside
-        audio_vae = fsm.encode(waveform.unsqueeze(0), sample_rate=sr)
+        audio_vae = fsm.encode(waveform.unsqueeze(0), sample_rate=sr).to(
+            vae.output_device)
         return ({"samples": audio_vae, "type": "audio"},)
 
 
@@ -1085,7 +1087,8 @@ class ScenemaAudioGenerate:
         ``waveform`` is [T, C] (decode layout); encode wants [B, C, T].
         """
         fsm = _audio_vae_loaded(vae)
-        tail = waveform[-int(REF_TAIL_SECONDS * sr):, :]
+        tail = waveform[-int(REF_TAIL_SECONDS * sr):, :].to(
+            device=vae.device, dtype=vae.vae_dtype)
         latents = fsm.encode(tail.T.unsqueeze(0), sample_rate=sr)
         b, c, t, f = latents.shape
         return latents.permute(0, 2, 1, 3).reshape(b, t, c * f)

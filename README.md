@@ -14,7 +14,7 @@ Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not inst
 
 - **Open upstream PRs backported**, including newer architectures (LTX-2, Z-Image, Ideogram-4, Qwen3-VL / MiniMax-H3 text encoders). See [PR_BACKPORT.md](PR_BACKPORT.md).
 - **MiniMax-H3 fix**: high-precision buffers such as `adaln_t_table` are kept in float32 through both conversion and loading. Stored as F16 they crash the sampler on the first step with `expected dtype struct c10::Half for 'weight' but got dtype float`.
-- **Two extra loader nodes**: a dual VAE loader and a text encoder + ClipProj loader (see *Nodes* below).
+- **Convenience pipelines**: Scenema Audio and MiniMax Music 3 loaders/generators built on ComfyUI's native models.
 
 ## Installation
 
@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-The GGUF loaders live under `🤖 CCTech/GGUF`; the Scenema Audio nodes under `🤖 CCTech/Scenema`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`.
 
 | Node | Purpose |
 |---|---|
@@ -68,8 +68,10 @@ The GGUF loaders live under `🤖 CCTech/GGUF`; the Scenema Audio nodes under `�
 | **Dual VAE Loader (video + audio)** | two VAEs from one node, with the outputs named for their streams |
 | **Text Encoder + ClipProj Loader** | loads a small encoder, GGUF included, and projects it into a large one's space |
 | **Scenema Models Loader** | the Scenema Audio stack from your own folders — DiT, Gemma-3 text encoder (safetensors **or GGUF**), pipeline checkpoint, VAE encoder |
-| **Scenema VAE Encode (voice reference)** | reference clip → audio latent for voice cloning || **Scenema VAE Encode (voice reference)** | reference clip → audio latent for voice cloning |
+| **Scenema VAE Encode (voice reference)** | reference clip → audio latent for voice cloning |
 | **Scenema Audio Generate** | expressive TTS with presets, scene/language, chunking and A2V voice cloning |
+| **MiniMax Music 3 Models Loader** | loads the pruned AR conditioner, flow DiT, and DAV decoder from explicit dropdowns |
+| **MiniMax Music 3 Audio Generate** | caption + structured lyrics → 44.1 kHz stereo music, including AR and DiT controls |
 
 ### Dual VAE Loader
 
@@ -105,6 +107,20 @@ The Models Loader outputs plain comfy **MODEL / CLIP / VAE**: the audio DiT load
 Generate keeps the original node's behaviour: the `<speak>` XML prompt compiler (with `[bracketed cues]` and per-line action tags), the 12 production presets, scene/language dropdowns, pace, seed, automatic sentence-boundary chunking with A2V voice chaining between chunks, and per-chunk trim/normalize before concatenation. Optional `ref_latent` (from Scenema VAE Encode fed by LoadAudio) gives zero-shot voice cloning. Not ported, because they need non-comfy dependencies: Whisper word-match validation, SeedVC polish, and the MelBandRoFormer SFX strip.
 
 A CPU smoke test for the load paths lives at `tools/smoke_scenema.py`.
+
+### MiniMax Music 3
+
+The two-node convenience pipeline composes ComfyUI's native MiniMax Music 3 implementation; no model code is vendored. Download `Comfy-Org/MiniMax-Music-3` and place its split files as follows:
+
+| File | Folder |
+|---|---|
+| `minimax_music3_text_encoder_pruned_int8_convrot.safetensors` (or a prepared GGUF) | `models/text_encoders` |
+| `minimax_music3_dit_int8_convrot.safetensors` (or fp16/bf16/GGUF) | `models/diffusion_models` |
+| `minimax_music3_dav.safetensors` | `models/vae` |
+
+The loader returns standard comfy **MODEL / CLIP / VAE** objects. Native ConvRot INT8 safetensors use Comfy's optimized mixed-precision path; GGUF remains packed through this pack's operations. Generate exposes caption, section-tagged lyrics, maximum duration (up to 360 seconds), seed, AR CFG/top-k, Euler/simple steps and DiT CFG. Duration is an upper bound: the autoregressive model can end a musically complete song earlier. DAV decoding switches to tiled mode automatically for long outputs and returns 44.1 kHz stereo `AUDIO`.
+
+`tools/smoke_minimax_music3.py` validates the three real checkpoint load paths without generating a song.
 
 ## Credits
 
