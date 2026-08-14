@@ -23,6 +23,7 @@ IMG_ARCH_LIST = {
     "flux2",       # Flux2 conversion scripts (alias; some files also use "flux")
     "flux1",       # Flux1 VAE / older flux tags seen in the wild
     "krea2",       # Krea-2 (some builds; files may also use qwen_image)
+    "minimax_music3",  # MiniMax Music 3 DiT (same tag on the TE, see below)
     "diffusion_model",  # generic fallback used by agnostic convert scripts
 }
 TXT_ARCH_LIST = {
@@ -34,6 +35,10 @@ TXT_ARCH_LIST = {
     # Other TE GGUFs under image-models / open PRs
     "mistral3",  # Ministral-3 (Flux2 TE) — PR #440 / #436
     "clip",      # CLIP TE (and some mmproj files tagged arch=clip)
+    # MiniMax Music 3 AR text encoder. Same arch tag as the DiT (both halves of
+    # the model are tagged minimax_music3); keys are the original comfy names so
+    # this arch is intentionally absent from every SD_MAP below.
+    "minimax_music3",
 }
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
@@ -151,6 +156,16 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
             torch_tensor = torch.from_numpy(tensor.data) # mmap
+
+        # MiniMax Music 3: the text encoder GGUF carries the whole tokenizer.json
+        # as a raw byte blob (GGML type I8) under this key. It is data, not a
+        # weight — comfy's MiniMaxMusic3Tokenizer does .numpy().tobytes() on it,
+        # so it has to survive verbatim. Wrapping it in a GGMLTensor (or letting
+        # the non-weight float32 branch below dequantize it) destroys the bytes.
+        if sd_key == "tokenizer_json":
+            state_dict[sd_key] = torch_tensor.clone()
+            qtype_dict["I8/blob"] = qtype_dict.get("I8/blob", 0) + 1
+            continue
 
         shape = get_orig_shape(reader, tensor_name)
         if shape is None:
