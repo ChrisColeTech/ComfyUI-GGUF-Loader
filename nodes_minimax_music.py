@@ -208,7 +208,8 @@ class MiniMaxMusic3AudioGenerate:
                     "default": "[intro]\n\n[verse]\nWrite your first verse here\n\n"
                                "[chorus]\nWrite your chorus here\n\n[outro]",
                     "tooltip": "Use tags such as [intro], [verse], [pre-chorus], "
-                               "[chorus], [bridge], [instrumental], [drop], and [outro]."}),
+                               "[chorus], [bridge], [instrumental], [drop], and [outro]. "
+                               "Leave empty for an instrumental track."}),
                 "max_duration": ("FLOAT", {
                     "default": 120.0, "min": 0.04, "max": 360.0, "step": 0.04,
                     "tooltip": "Upper bound in seconds; the model may finish earlier."}),
@@ -246,8 +247,10 @@ class MiniMaxMusic3AudioGenerate:
                  ar_top_k=50, tile_size=1536, tile_overlap=64):
         if not caption or not caption.strip():
             raise ValueError("caption must not be empty")
-        if not lyrics or not lyrics.strip():
-            raise ValueError("lyrics must not be empty")
+        # Empty lyrics are an instrumental request, not an error: the prompt
+        # builder turns them into a bare "[start]" section the same way comfy's
+        # own MiniMaxMusic3TextEncode does.
+        lyrics = lyrics or ""
         if type(clip.cond_stage_model).__name__ != "MiniMaxMusic3TEModel":
             raise RuntimeError("Connect the CLIP output of MiniMax Music 3 Models Loader.")
         model_config = getattr(getattr(model.model, "model_config", None), "unet_config", {})
