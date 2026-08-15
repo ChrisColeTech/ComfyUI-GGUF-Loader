@@ -308,12 +308,12 @@ class SeedVCModel(nn.Module):
 
 
 # CAMPPlus, adapted from 3D-Speaker (Apache-2.0).
-def _nonlinear(channels, affine=True):
+def _nonlinear(channels, affine=True, relu=True):
     from collections import OrderedDict
-    return nn.Sequential(OrderedDict([
-        ("batchnorm", nn.BatchNorm1d(channels, affine=affine)),
-        ("relu", nn.ReLU(inplace=True)),
-    ]))
+    layers = [("batchnorm", nn.BatchNorm1d(channels, affine=affine))]
+    if relu:
+        layers.append(("relu", nn.ReLU(inplace=True)))
+    return nn.Sequential(OrderedDict(layers))
 
 
 class BasicResBlock(nn.Module):
@@ -392,7 +392,7 @@ class TransitLayer(nn.Module):
 
 class DenseLayer(nn.Module):
     def __init__(self, inc, outc):
-        super().__init__(); self.linear, self.nonlinear = nn.Conv1d(inc, outc, 1, bias=False), _nonlinear(outc, False)
+        super().__init__(); self.linear, self.nonlinear = nn.Conv1d(inc, outc, 1, bias=False), _nonlinear(outc, False, False)
     def forward(self, x): return self.nonlinear(self.linear(x.unsqueeze(-1))).squeeze(-1)
 
 

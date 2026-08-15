@@ -1,6 +1,6 @@
 import torch
 
-from seedvc_arch import InterpolateRegulator, SConv1d, sequence_mask
+from seedvc_arch import CAMPPlus, InterpolateRegulator, SConv1d, sequence_mask
 
 
 def test_sequence_mask_and_regulator_shapes():
@@ -15,3 +15,8 @@ def test_sequence_mask_and_regulator_shapes():
 def test_padding_wrapper_preserves_length():
     layer = SConv1d(4, 8, 5, norm="weight_norm").eval()
     assert layer(torch.randn(2, 4, 3)).shape == (2, 8, 3)
+
+
+def test_campplus_final_embedding_does_not_clamp_identity():
+    model = CAMPPlus()
+    assert list(model.dense.nonlinear._modules) == ["batchnorm"]
