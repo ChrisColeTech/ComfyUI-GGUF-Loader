@@ -904,8 +904,8 @@ class ScenemaAudioGenerate:
                 "vae": ("VAE",),
                 "preset": (PRESET_NAMES, {
                     "default": CUSTOM,
-                    "tooltip": "Pick a preset to auto-fill voice, gender, scene, action "
-                               "tags and speech text. Choose Custom to write your own."}),
+                    "tooltip": "Apply a preset's voice, gender, scene, and performance "
+                               "tags. The speech_text field is always used as entered."}),
                 "voice_description": ("STRING", {
                     "multiline": True,
                     "default": "Male, late 60s. Deep, gravelly. Slow and deliberate. "
@@ -960,7 +960,6 @@ class ScenemaAudioGenerate:
             p = PRESETS[preset]
             voice_description = p["voice_description"]
             gender = p["gender"]
-            speech_text = p["speech_text"]
             scene = p["scene"]
             custom_scene = p.get("custom_scene", "")
             action_tags = p["action_tags"]
