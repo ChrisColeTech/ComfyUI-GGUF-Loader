@@ -103,7 +103,115 @@ scene presets + CLEAN_SPEECH_SCENES, sentence-boundary chunking at 15 s max
 with per-sentence action re-attachment, pace multiplier (default 1.5), word-count
 duration fallback (no Kokoro), per-chunk trim/normalize/LUFS then concat +
 silence shortening, 20 s reference cap. Dropped (non-comfy deps): Whisper
-validation, SeedVC polish, MelBandRoFormer SFX strip.
+validation and MelBandRoFormer SFX strip. **SeedVC must not be treated as
+optional for multi-chunk voice consistency**; the current node omitted it and
+therefore does not reproduce the complete Scenema pipeline.
+
+## SeedVC voice-consistency stage
+
+The Hugging Face model card explicitly documents both the ~15-second segment
+window and the long-form continuity path:
+
+- Limitations: "15-second generation window: Each segment capped at ~15s."
+- Architecture: long text splits at sentence boundaries, A2V conditions the
+  next segment, then SeedVC performs voice identity transfer for multi-chunk
+  output (or an explicit reference).
+
+`nodes_scenema.py` implements A2V latent chaining and a final SeedVC pass over
+the combined waveform using one fixed identity. These are separate stages:
+using only each generated tail as the next A2V reference can accumulate small
+voice changes, while SeedVC anchors the final output to one identity.
+
+### Verified reference implementations
+
+- Standalone Comfy SeedVC node used as the architecture port source:
+  `D:\Projects\ComfyUI\ComfyUI_Seed-VC-main`
+- Original Comfy pack wrapper:
+  `D:\Projects\ComfyUI\ComfyUI-ScenemaAudio\nodes\seedvc.py`
+  - public helper: `convert_voice(source_audio, reference_audio, steps=25,
+    cfg_rate=0.5)`
+  - standalone node: `ScenemaAudioVoiceClone`
+  - automatic Generate call:
+    `D:\Projects\ComfyUI\ComfyUI-ScenemaAudio\nodes\generate.py:417-428,557-571`
+- Pure-torch reference (preferred behavior, no transformers/diffusers/HF
+  runtime download):
+  `D:\Projects\giga-videos\src\sidecar\vendor\pipelines\scenema_audio\ops\seed_vc.py`
+  - `load_seed_vc(device=None)`
+  - `unload_seed_vc()`
+  - `convert_voice(source, source_sr, reference, reference_sr, *, steps=25,
+    cfg_rate=0.5, output_sr=None, unload_after=True, device=None)`
+  - `apply_seed_vc_to_result(...)`
+- Pure Whisper-small encoder used by that path:
+  `D:\Projects\giga-videos\src\sidecar\vendor\pipelines\scenema_audio\models\whisper_encoder.py`
+- SeedVC architecture reference:
+  `D:\Projects\giga-videos\src\sidecar\vendor\pipelines\scenema_audio\vendor\seedvc\modules`
+
+The Comfy custom node should use Comfy's own model/device/offload facilities
+and existing installed model classes where available. Do not import the
+`giga-videos` checkout at runtime and do not make the node depend on a
+machine-specific source path.
+
+### Required components and model layout
+
+Canonical download source:
+`https://huggingface.co/ChrisColeTech/scenema-audio/tree/main/extras`.
+Install beneath the target Comfy models tree's Scenema extras directory (the
+loader must register/resolve this location rather than hard-code a development
+checkout). Components:
+
+| Component | Required files | Role |
+|---|---|---|
+| SeedVC DiT | `seedvc/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth`, `seedvc/config_dit_mel_seed_uvit_whisper_small_wavenet.yml` | conditional flow/diffusion voice conversion model |
+| CAMPPlus | `campplus/campplus_cn_common.bin` | 192-d speaker identity encoder |
+| BigVGAN | `bigvgan/config.json`, `bigvgan/bigvgan_generator.pt` | 22.05 kHz waveform vocoder |
+| Whisper-small | `whisper-small/config.json`, `whisper-small/model.safetensors`, `whisper-small/preprocessor_config.json` | semantic speech encoder |
+
+Known development copy with matching sizes/checksums:
+`D:\models\image-models\scenema-audio\extras\{seedvc,campplus,bigvgan,whisper-small}`.
+The target portable Comfy tree is:
+`P:\Projects\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\ComfyUI\models`.
+
+Principal weight sizes are approximately 440 MB SeedVC DiT, 28 MB CAMPPlus,
+449 MB BigVGAN, and 967 MB Whisper-small (about 1.76 GiB total).
+
+### Runtime contract
+
+- Internal SeedVC waveform rate: 22,050 Hz.
+- Whisper/CAMPPlus feature rate: 16,000 Hz.
+- Defaults: 25 diffusion steps, CFG rate 0.5, length adjustment 1.0,
+  three quantizers.
+- Reference is capped at 25 seconds.
+- Sources over 30 seconds use overlapping semantic windows; generated SeedVC
+  chunks overlap by 16 mel frames (~186 ms) and are crossfaded.
+- Input/output Comfy contract: `AUDIO` waveform `[B,C,T]`; internal conversion
+  is mono; resample final output back to 48 kHz and restore the original channel
+  count so Generate still returns `[1,C,T]` stereo-compatible audio.
+
+Correct automatic trigger and identity precedence (sidecar reference):
+
+1. Run when `not skip_vc and (len(chunks) > 1 or reference_audio is not None)`.
+2. Explicit reference waveform wins when supplied.
+3. Otherwise use the first post-trim/normalized generated chunk as the fixed
+   identity for the entire combined output.
+4. `ref_latent` remains the separate LTX A2V conditioning input; do not confuse
+   it with SeedVC waveform identity. Add an optional `AUDIO` reference input if
+   explicit SeedVC identity is required.
+5. Automatic Generate integration should catch SeedVC failures, log them, and
+   return the already-generated unpolished waveform rather than losing a long
+   generation. A standalone explicitly requested voice-conversion node may
+   raise.
+
+### Resource lifecycle
+
+- Finish all DiT chunks and VAE decoding first.
+- Release/offload Gemma, Scenema DiT, and VAE through Comfy model management
+  before staging SeedVC; do not use unmanaged permanent CUDA singletons.
+- Load SeedVC components only for the final post-pass and unload them in
+  `finally`, including partial-load failures.
+- Keep final conversion out of the per-chunk loop.
+- The original wrapper estimates roughly 3.5 GB SeedVC VRAM. The portable
+  environment must not overlap that with the 7.3 GB Scenema DiT or 28 GB text
+  encoder staging.
 
 ## Resource-correct implementation
 

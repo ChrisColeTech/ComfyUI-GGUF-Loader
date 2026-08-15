@@ -134,15 +134,23 @@ class MiniMaxMusic3ModelsLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
+        transformers = [name for name in _file_list(
+            "diffusion_models", "unet", "unet_gguf")
+            if "minimax_music3_dit" in name.lower()]
+        text_encoders = [name for name in _file_list(
+            "text_encoders", "clip", "clip_gguf")
+            if "minimax_music3_text_encoder" in name.lower()]
+        davs = [name for name in _file_list("vae")
+                if "minimax_music3_dav" in name.lower()]
         return {
             "required": {
-                "transformer_name": (_file_list("diffusion_models", "unet", "unet_gguf"), {
+                "transformer_name": (transformers, {
                     "tooltip": "MiniMax Music 3 DiT from models/diffusion_models; native "
                                "ConvRot INT8, fp16/bf16, and GGUF are supported."}),
-                "text_encoder_name": (_file_list("text_encoders", "clip", "clip_gguf"), {
+                "text_encoder_name": (text_encoders, {
                     "tooltip": "Pruned MiniMax Music 3 AR text/audio encoder with embedded "
                                "tokenizer_json, from models/text_encoders."}),
-                "dav_name": (_file_list("vae"), {
+                "dav_name": (davs, {
                     "tooltip": "minimax_music3_dav.safetensors from models/vae."}),
             },
         }

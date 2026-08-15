@@ -70,6 +70,7 @@ The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech
 | **Scenema Models Loader** | the Scenema Audio stack from your own folders — DiT, Gemma-3 text encoder (safetensors **or GGUF**), pipeline checkpoint, VAE encoder |
 | **Scenema VAE Encode (voice reference)** | reference clip → audio latent for voice cloning |
 | **Scenema Audio Generate** | expressive TTS with presets, scene/language, chunking and A2V voice cloning |
+| **Scenema Audio Voice Clone** | standalone offline SeedVC identity transfer |
 | **MiniMax Music 3 Models Loader** | loads the pruned AR conditioner, flow DiT, and DAV decoder from explicit dropdowns |
 | **MiniMax Music 3 Audio Generate** | caption + structured lyrics → 44.1 kHz stereo music, including AR and DiT controls |
 
@@ -93,7 +94,7 @@ Differences from the upstream node:
 
 ### Scenema Audio
 
-Ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT), rebuilt on ComfyUI's native LTX-AV machinery and this pack's loaders — no vendored model code, no HuggingFace auto-download. Point the nodes at the same components the sidecar uses (from [ScenemaAI/scenema-audio](https://huggingface.co/ScenemaAI/scenema-audio)):
+Ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT), rebuilt on ComfyUI's native LTX-AV machinery and this pack's loaders with no HuggingFace runtime downloads. The SeedVC post-pass reuses Comfy's Whisper and BigVGAN implementations and includes only the checkpoint-specific architecture that Comfy core does not provide. Point the nodes at the same components the sidecar uses (from [ScenemaAI/scenema-audio](https://huggingface.co/ScenemaAI/scenema-audio)):
 
 | File | Folder | Dropdown |
 |---|---|---|
@@ -104,7 +105,7 @@ Ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyU
 
 The Models Loader outputs plain comfy **MODEL / CLIP / VAE**: the audio DiT loads as a comfy LTX-AV model with the video paths gated off (the comfy-native equivalent of the original nodes' audio-only monkey-patch), the Gemma text encoder runs as comfy's `LTXAVTEModel` — a GGUF stays quantized through this pack's ops, with the tokenizer rebuilt from the GGUF metadata — and the VAE is comfy's `AudioVAE` (encoder + decoder + BigVGAN vocoder with the 16 kHz → 48 kHz bandwidth extension, so output is 48 kHz stereo). The pipeline checkpoint also supplies the text projection and embeddings connectors.
 
-Generate keeps the original node's behaviour: the `<speak>` XML prompt compiler (with `[bracketed cues]` and per-line action tags), the 12 production presets, scene/language dropdowns, pace, seed, automatic sentence-boundary chunking with A2V voice chaining between chunks, and per-chunk trim/normalize before concatenation. Optional `ref_latent` (from Scenema VAE Encode fed by LoadAudio) gives zero-shot voice cloning. Not ported, because they need non-comfy dependencies: Whisper word-match validation, SeedVC polish, and the MelBandRoFormer SFX strip.
+Generate keeps the original node's behaviour: the `<speak>` XML prompt compiler (with `[bracketed cues]` and per-line action tags), the 12 production presets, scene/language dropdowns, pace, seed, automatic sentence-boundary chunking with A2V voice chaining between chunks, and per-chunk trim/normalize before concatenation. Optional `ref_latent` (from Scenema VAE Encode fed by LoadAudio) gives zero-shot A2V cloning. A final offline SeedVC pass provides fixed identity consistency for multi-chunk output or an explicit `identity_reference`; `Scenema Audio Voice Clone` exposes the same conversion independently. Place the `seedvc`, `campplus`, `bigvgan`, and `whisper-small` folders from [ChrisColeTech/scenema-audio extras](https://huggingface.co/ChrisColeTech/scenema-audio/tree/main/extras) under `models/scenema-audio/extras`. Whisper word-match validation and the MelBandRoFormer SFX strip remain unported.
 
 A CPU smoke test for the load paths lives at `tools/smoke_scenema.py`.
 
@@ -126,6 +127,6 @@ The loader returns standard comfy **MODEL / CLIP / VAE** objects. Native ConvRot
 
 Fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (Apache-2.0) — the loader, the quantization tooling and the custom ops are theirs; the backported PRs are their authors', listed in [PR_BACKPORT.md](PR_BACKPORT.md). Report bugs in this fork here, not upstream.
 
-`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT).
+`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT). SeedVC inference is adapted from [billwuhao/ComfyUI_Seed-VC](https://github.com/billwuhao/ComfyUI_Seed-VC) and [Plachtaa/seed-vc](https://github.com/Plachtaa/seed-vc) (Apache-2.0).
 
 Model weights stay under their own licences — MiniMax-H3's is a custom one, worth reading before any use.

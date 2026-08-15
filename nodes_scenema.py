@@ -22,13 +22,15 @@ GGUF loaders:
     vocoder with the 16k→48k bandwidth extension), built from the pipeline
     checkpoint's config metadata;
   * sampling uses the distilled 8-step sigma schedule with cfg=1 (the
-    original's SimpleDenoiser) through comfy's regular sampler stack.
+    original's SimpleDenoiser) through comfy's regular sampler stack;
+  * SeedVC runs as a final, optional identity-consistency pass using offline
+    weights from ``models/scenema-audio/extras`` and Comfy model management.
 
 Dropped from the original pack because they carry heavy non-comfy deps:
-Whisper word-match validation (faster-whisper), SeedVC polish, and the
-MelBandRoFormer SFX strip. Everything else — the XML prompt compiler,
-Kokoro-free chunk planning, per-chunk trim/normalize/concat, A2V reference
-chaining, and the 12 production presets — is ported.
+Whisper word-match validation (faster-whisper) and the MelBandRoFormer SFX
+strip. Everything else — the XML prompt compiler, Kokoro-free chunk planning,
+per-chunk trim/normalize/concat, A2V reference chaining, SeedVC polish, and the
+12 production presets — is ported.
 """
 
 import inspect
@@ -52,6 +54,7 @@ import folder_paths
 
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .ops import GGMLOps
+from .seedvc_utils import select_seedvc_identity
 
 logger = logging.getLogger(__name__)
 
@@ -670,6 +673,15 @@ def _clip_filename_list():
 SCENEMA_CATEGORY = "🤖 CCTech/Scenema"
 
 
+def _select_seedvc_identity(skip_vc, chunk_count, identity_reference,
+                            first_processed, sample_rate):
+    """Return the fixed SeedVC identity, or None when the post-pass is disabled."""
+    waveform = torch.from_numpy(first_processed.T.copy()).float().unsqueeze(0)
+    generated = {"waveform": waveform, "sample_rate": int(sample_rate)}
+    return select_seedvc_identity(
+        skip_vc, chunk_count, identity_reference, generated)
+
+
 class ScenemaModelLoader:
     """Load the Scenema Audio stack from user-selectable checkpoint files.
 
@@ -942,7 +954,17 @@ class ScenemaAudioGenerate:
                                "1.5 is the validated default."}),
                 "ref_latent": ("LATENT", {
                     "tooltip": "Optional voice reference (Scenema VAE Encode output) "
-                               "for zero-shot cloning."}),
+                                "for zero-shot cloning."}),
+                "skip_vc": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Skip the final SeedVC identity-consistency pass."}),
+                "identity_reference": ("AUDIO", {
+                    "tooltip": "Optional fixed voice identity for SeedVC. This is separate "
+                               "from the LTX A2V ref_latent input."}),
+                "vc_steps": ("INT", {
+                    "default": 25, "min": 1, "max": 200, "step": 1}),
+                "vc_cfg_rate": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
         }
 
@@ -955,7 +977,9 @@ class ScenemaAudioGenerate:
     @torch.inference_mode()
     def generate(self, model, clip, vae, preset, voice_description, gender,
                  speech_text, scene, seed, custom_scene="", action_tags="",
-                 language="English", pace=LTX_MULTIPLIER, ref_latent=None):
+                 language="English", pace=LTX_MULTIPLIER, ref_latent=None,
+                 skip_vc=False, identity_reference=None, vc_steps=25,
+                 vc_cfg_rate=0.5):
         if preset != CUSTOM and preset in PRESETS:
             p = PRESETS[preset]
             voice_description = p["voice_description"]
@@ -1075,6 +1099,24 @@ class ScenemaAudioGenerate:
             combined = torch.from_numpy(combined_np.T).float()
         combined = combined.unsqueeze(0)  # [1, C, T]
 
+        identity = _select_seedvc_identity(
+            skip_vc, len(chunks), identity_reference, processed[0], sr)
+        if identity is not None:
+            unpolished = combined
+            try:
+                # SeedVC needs its own VRAM stage. Offload the Gemma encoder,
+                # Scenema DiT, and VAE before loading any conversion component.
+                comfy.model_management.unload_all_models()
+                comfy.model_management.soft_empty_cache()
+                from .seedvc import apply_seed_vc_to_result
+                combined = apply_seed_vc_to_result(
+                    combined, int(sr), identity, int(identity["sample_rate"]),
+                    steps=int(vc_steps), cfg_rate=float(vc_cfg_rate))
+            except Exception:
+                logger.exception(
+                    "Scenema: SeedVC polish failed; returning generated audio unchanged")
+                combined = unpolished
+
         total = combined.shape[-1] / sr
         logger.info("Scenema: done — %.1fs of audio from %d chunk(s)", total, len(chunks))
         return ({"waveform": combined, "sample_rate": int(sr)},)
@@ -1093,14 +1135,52 @@ class ScenemaAudioGenerate:
         return latents.permute(0, 2, 1, 3).reshape(b, t, c * f)
 
 
+class ScenemaAudioVoiceClone:
+    """Apply SeedVC voice identity transfer to an existing Comfy AUDIO value."""
+
+    CATEGORY = SCENEMA_CATEGORY
+    TITLE = "Scenema Audio Voice Clone ⚡"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "source_audio": ("AUDIO",),
+            "identity_reference": ("AUDIO",),
+            "steps": ("INT", {"default": 25, "min": 1, "max": 200, "step": 1}),
+            "cfg_rate": ("FLOAT", {
+                "default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
+        }}
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "convert"
+    DESCRIPTION = "Transfer a fixed voice identity with the offline SeedVC bundle."
+
+    @torch.inference_mode()
+    def convert(self, source_audio, identity_reference, steps=25, cfg_rate=0.5):
+        from .seedvc import convert_voice
+
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        waveform, sample_rate = convert_voice(
+            source_audio, int(source_audio["sample_rate"]),
+            identity_reference, int(identity_reference["sample_rate"]),
+            steps=int(steps), cfg_rate=float(cfg_rate),
+            output_sr=int(source_audio["sample_rate"]),
+        )
+        return ({"waveform": waveform, "sample_rate": sample_rate},)
+
+
 NODE_CLASS_MAPPINGS = {
     "ScenemaModelLoader": ScenemaModelLoader,
     "ScenemaVAEEncode": ScenemaVAEEncode,
     "ScenemaAudioGenerate": ScenemaAudioGenerate,
+    "ScenemaAudioVoiceClone": ScenemaAudioVoiceClone,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ScenemaModelLoader": ScenemaModelLoader.TITLE,
     "ScenemaVAEEncode": ScenemaVAEEncode.TITLE,
     "ScenemaAudioGenerate": ScenemaAudioGenerate.TITLE,
+    "ScenemaAudioVoiceClone": ScenemaAudioVoiceClone.TITLE,
 }
