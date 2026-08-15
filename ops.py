@@ -67,7 +67,17 @@ class GGMLTensor(torch.Tensor):
         return new
 
     def clone(self, *args, **kwargs):
-        return self
+        # Returning self only makes sense for packed quantized weights: copying
+        # those would duplicate gigabytes and every caller treats the result as
+        # read-only. Everything else must be a real copy. This subclass also
+        # leaks onto activations whenever a model uses a bare nn.Parameter for a
+        # GGUF weight (comfy's llama RMSNorm does), and callers that snapshot an
+        # activation with .clone() before writing the buffer in place — comfy's
+        # per-layer `all_intermediate` capture, which the LTX-AV/Scenema text
+        # encoder depends on — silently get 49 aliases of the final layer.
+        if is_quantized(self):
+            return self
+        return super().clone(*args, **kwargs).as_subclass(torch.Tensor)
 
     def detach(self, *args, **kwargs):
         return self

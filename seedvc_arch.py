@@ -280,8 +280,9 @@ class CFM(nn.Module):
         self.estimator = DiT()
         self.in_channels = 80
 
-    def inference(self, mu, lengths, prompt, style, steps=25, cfg_rate=0.5):
-        x = torch.randn(mu.shape[0], 80, mu.shape[1], device=mu.device, dtype=mu.dtype)
+    def inference(self, mu, lengths, prompt, style, steps=25, cfg_rate=0.5, generator=None):
+        x = torch.randn(mu.shape[0], 80, mu.shape[1], device=mu.device, dtype=mu.dtype,
+                        generator=generator)
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt.shape[-1]] = prompt
         x[..., :prompt.shape[-1]] = 0

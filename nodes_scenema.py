@@ -54,7 +54,7 @@ import folder_paths
 
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .ops import GGMLOps
-from .seedvc_utils import select_seedvc_identity
+from .seedvc_utils import select_seedvc_identity, seedvc_output_is_usable
 
 logger = logging.getLogger(__name__)
 
@@ -1109,9 +1109,16 @@ class ScenemaAudioGenerate:
                 comfy.model_management.unload_all_models()
                 comfy.model_management.soft_empty_cache()
                 from .seedvc import apply_seed_vc_to_result
-                combined = apply_seed_vc_to_result(
+                polished = apply_seed_vc_to_result(
                     combined, int(sr), identity, int(identity["sample_rate"]),
-                    steps=int(vc_steps), cfg_rate=float(vc_cfg_rate))
+                    steps=int(vc_steps), cfg_rate=float(vc_cfg_rate), seed=seed)
+                # Conversion can fail without raising. Never trade good speech
+                # for a result that is not a same-shape, audible, finite take.
+                if seedvc_output_is_usable(polished, unpolished):
+                    combined = polished
+                else:
+                    logger.warning(
+                        "Scenema: SeedVC returned unusable audio; keeping generated audio")
             except Exception:
                 logger.exception(
                     "Scenema: SeedVC polish failed; returning generated audio unchanged")
@@ -1149,6 +1156,10 @@ class ScenemaAudioVoiceClone:
             "steps": ("INT", {"default": 25, "min": 1, "max": 200, "step": 1}),
             "cfg_rate": ("FLOAT", {
                 "default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "seed": ("INT", {
+                "default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFF,
+                "tooltip": "Seeds the flow-matching noise so a conversion is "
+                           "reproducible."}),
         }}
 
     RETURN_TYPES = ("AUDIO",)
@@ -1157,7 +1168,7 @@ class ScenemaAudioVoiceClone:
     DESCRIPTION = "Transfer a fixed voice identity with the offline SeedVC bundle."
 
     @torch.inference_mode()
-    def convert(self, source_audio, identity_reference, steps=25, cfg_rate=0.5):
+    def convert(self, source_audio, identity_reference, steps=25, cfg_rate=0.5, seed=0):
         from .seedvc import convert_voice
 
         comfy.model_management.unload_all_models()
@@ -1165,7 +1176,7 @@ class ScenemaAudioVoiceClone:
         waveform, sample_rate = convert_voice(
             source_audio, int(source_audio["sample_rate"]),
             identity_reference, int(identity_reference["sample_rate"]),
-            steps=int(steps), cfg_rate=float(cfg_rate),
+            steps=int(steps), cfg_rate=float(cfg_rate), seed=int(seed),
             output_sr=int(source_audio["sample_rate"]),
         )
         return ({"waveform": waveform, "sample_rate": sample_rate},)

@@ -200,6 +200,15 @@ Correct automatic trigger and identity precedence (sidecar reference):
    return the already-generated unpolished waveform rather than losing a long
    generation. A standalone explicitly requested voice-conversion node may
    raise.
+6. An exception is not the only failure mode. Validate the returned waveform
+   (`seedvc_output_is_usable`) before it replaces good speech: same shape, a
+   comparable length, finite, and audible.
+7. The flow-matching noise is seeded from the workflow seed, so a conversion is
+   reproducible and A/B comparisons against the reference implementation use
+   identical initial noise.
+8. `convert_voice` either owns its bundle (loads and unloads it) or borrows a
+   caller-supplied `bundle=`. There is no flag that loads a bundle and then
+   drops the only reference to it.
 
 ### Resource lifecycle
 
@@ -260,6 +269,19 @@ the persistent representation and model-size accounting, not CUDA peak memory.
 
 Other verified gotchas:
 
+- **`GGMLTensor` must never alias an activation.** The subclass leaks out of
+  any module that uses a bare `nn.Parameter` for a GGUF weight instead of a
+  `GGMLLayer` — comfy's `text_encoders/llama.py` `RMSNorm` does, so with a GGUF
+  Gemma every hidden state downstream of the first norm is a `GGMLTensor`.
+  `GGMLTensor.clone()` returns `self` for packed quantized weights, so any
+  comfy code that snapshots an activation with `.clone()` and then writes the
+  buffer in place gets an alias. That is exactly what LTX-AV's text encoder
+  does: it asks for `layer="all"` and comfy captures the 49 per-layer hidden
+  states as `x.unsqueeze(1).clone()`. Measured with a GGUF Gemma-3 12B and
+  ComfyUI `af3d2153`, all 48 post-embedding states collapsed to the final one
+  (per-state std 1840.30 for every layer, max abs error 6.66e5 vs correct),
+  which is heard as fluent speech with the wrong phonemes. `clone()` now copies
+  for real unless the tensor is actually quantized.
 - `AudioVAE.encode` wants `[B, C, T]` (mono auto-expands to stereo); decode
   returns `[B, T, C]`. The VAE wrapper `vae.decode` is safe (no latent-format
   scaling on audio); direct `fsm.encode` calls need
@@ -280,6 +302,13 @@ Other verified gotchas:
 `comfy.options.args_parsing = True` before importing comfy). Checks: DiT
 detects as ltxav/48 layers; VAE is AudioVAE 16k→48k with 251 latents/10s;
 optional Gemma GGUF → LTXAVTEModel with DualLinearProjection + tokenizer.
+`tools/smoke_seedvc.py` — opt-in real-checkpoint SeedVC test. Loads every
+component from `--extras` and runs a full end-to-end conversion (`--device
+cuda|cpu`, `--load-only` to skip the conversion), asserting a finite,
+same-length, audible result that is bit-identical across two seeded runs.
+Verified on the RTX 5090 (fp16 autocast, peak 0.309) and on CPU float32
+(peak 0.327), both reproducible with `seed=1234`.
+
 A node-level test (registering folder_paths manually) lives at
 `C:\Users\RISKYB~1\AppData\Local\Temp\opencode\node_test.py` — temp, not in repo.
 Note: the dev box's Python env intermittently access-violates (0xC0000005) in

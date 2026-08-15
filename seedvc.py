@@ -343,7 +343,7 @@ def _crossfade(previous, current, overlap):
 
 
 @torch.inference_mode()
-def _convert(bundle, source, reference, steps, cfg_rate, length_adjust):
+def _convert(bundle, source, reference, steps, cfg_rate, length_adjust, generator=None):
     source_22k = source.to(bundle.device)
     reference_22k = reference[..., :SEEDVC_SR * 25].to(bundle.device)
     if source_22k.shape[-1] < 1024:
@@ -376,7 +376,8 @@ def _convert(bundle, source, reference, steps, cfg_rate, length_adjust):
         joined = torch.cat([prompt_cond, chunk_cond], 1)
         lengths = torch.tensor([joined.shape[1]], device=bundle.device)
         with torch.autocast(bundle.device.type, dtype=torch.float16, enabled=bundle.device.type == "cuda"):
-            mel = bundle.seed.cfm.inference(joined, lengths, prompt_mel, style, steps, cfg_rate)
+            mel = bundle.seed.cfm.inference(joined, lengths, prompt_mel, style, steps,
+                                            cfg_rate, generator=generator)
             mel = mel[..., prompt_mel.shape[-1]:]
         wave = bundle.vocoder(mel.float())[0, 0]
         if previous is not None:
@@ -392,8 +393,15 @@ def _convert(bundle, source, reference, steps, cfg_rate, length_adjust):
 
 def convert_voice(source, source_sr, reference, reference_sr, *, steps=DEFAULT_STEPS,
                   cfg_rate=DEFAULT_CFG_RATE, length_adjust=1.0, output_sr=None,
-                  unload_after=True, device=None, root=None):
-    """Convert Comfy AUDIO-like source identity; return ``([1,C,T], sample_rate)``."""
+                  seed=None, bundle=None, device=None, root=None):
+    """Convert Comfy AUDIO-like source identity; return ``([1,C,T], sample_rate)``.
+
+    Pass ``bundle`` to reuse a caller-owned bundle across several conversions;
+    the caller then also owns unloading it. Without one, this call loads and
+    unloads its own bundle, so no component is ever left resident by accident.
+    ``seed`` ties the flow-matching noise to the workflow seed; ``None`` draws
+    from the global RNG the way the reference implementation does.
+    """
     if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 200:
         raise ValueError("steps must be an integer from 1 to 200")
     if not isinstance(cfg_rate, (int, float)) or isinstance(cfg_rate, bool) or not math.isfinite(cfg_rate) or cfg_rate < 0:
@@ -408,14 +416,18 @@ def convert_voice(source, source_sr, reference, reference_sr, *, steps=DEFAULT_S
     reference, _ = _mono_audio(reference, "reference")
     source = _resample(source, int(source_sr), SEEDVC_SR)
     reference = _resample(reference, int(reference_sr), SEEDVC_SR)
-    bundle = None
+    owned = bundle is None
     try:
-        bundle = load_seed_vc(device=device, root=root)
-        result = _convert(bundle, source, reference, int(steps), float(cfg_rate), float(length_adjust))
+        if owned:
+            bundle = load_seed_vc(device=device, root=root)
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=bundle.device)
+            generator.manual_seed(int(seed) & 0xFFFFFFFFFFFFFFF)
+        result = _convert(bundle, source, reference, int(steps), float(cfg_rate),
+                          float(length_adjust), generator=generator)
     finally:
-        # Conversion owns this bundle. Callers needing a longer-lived bundle can
-        # use load_seed_vc()/unload_seed_vc() around lower-level integration.
-        if unload_after:
+        if owned:
             unload_seed_vc(bundle)
     output_sr = source_sr if output_sr is None else output_sr
     if not isinstance(output_sr, int) or isinstance(output_sr, bool) or output_sr <= 0:
