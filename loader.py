@@ -77,22 +77,36 @@ def get_list_field(reader, field_name, field_type):
     else:
         raise TypeError(f"Unknown field type {field_type}")
 
+GGUF_SCALAR_TYPES = {
+    gguf.GGUFValueType.UINT8: int, gguf.GGUFValueType.INT8: int,
+    gguf.GGUFValueType.UINT16: int, gguf.GGUFValueType.INT16: int,
+    gguf.GGUFValueType.UINT32: int, gguf.GGUFValueType.INT32: int,
+    gguf.GGUFValueType.UINT64: int, gguf.GGUFValueType.INT64: int,
+    gguf.GGUFValueType.FLOAT32: float, gguf.GGUFValueType.FLOAT64: float,
+    gguf.GGUFValueType.BOOL: bool,
+}
+
 def get_gguf_metadata(reader):
     """Extract all simple metadata fields like safetensors"""
     metadata = {}
     for field_name in reader.fields:
         try:
             field = reader.get_field(field_name)
-            if len(field.types) == 1:  # Simple scalar fields only
-                if field.types[0] == gguf.GGUFValueType.STRING:
-                    metadata[field_name] = str(field.parts[field.data[-1]], "utf-8")
-                elif field.types[0] == gguf.GGUFValueType.INT32:
-                    metadata[field_name] = int(field.parts[field.data[-1]])
-                elif field.types[0] == gguf.GGUFValueType.F32:
-                    metadata[field_name] = float(field.parts[field.data[-1]])
-                elif field.types[0] == gguf.GGUFValueType.BOOL:
-                    metadata[field_name] = bool(field.parts[field.data[-1]])
-        except:
+            if len(field.types) != 1:  # Simple scalar fields only
+                continue
+            value = field.parts[field.data[-1]]
+            if field.types[0] == gguf.GGUFValueType.STRING:
+                metadata[field_name] = str(value, "utf-8")
+                continue
+            cast = GGUF_SCALAR_TYPES.get(field.types[0])
+            if cast is not None:
+                # These parts are 1-element 1-D numpy arrays. numpy>=2 refuses to
+                # convert those with int()/float(), so read through .item() —
+                # otherwise every numeric field is silently dropped. Writers also
+                # use the unsigned types for counts, so cover the whole set.
+                metadata[field_name] = cast(value.item())
+        except Exception as e:
+            logging.debug(f"Skipping GGUF metadata field {field_name!r}: {e}")
             continue
     return metadata
 
@@ -305,6 +319,21 @@ def sd_map_replace(raw_sd, key_map):
             k = k.replace(s,d)
         sd[k] = v
     return sd
+
+def llama_head_counts(metadata, arch_str, default_head=32, default_head_kv=8):
+    """Read the real attention head counts for the Q/K un-permute.
+
+    A wrong count does not raise: several head counts divide the same hidden
+    size (28 and 32 both divide 3584), so the wrong permutation applies silently
+    and the model emits fluent nonsense. Always prefer what the file says.
+    """
+    n_head = metadata.get(f"{arch_str}.attention.head_count")
+    n_head_kv = metadata.get(f"{arch_str}.attention.head_count_kv")
+    if n_head is None or n_head_kv is None:
+        logging.warning(
+            f"GGUF {arch_str} file has no attention head counts; assuming "
+            f"{default_head}/{default_head_kv} for the Q/K un-permute.")
+    return int(n_head or default_head), int(n_head_kv or default_head_kv)
 
 def llama_permute(raw_sd, n_head, n_head_kv):
     # Reverse version of LlamaModel.permute in llama.cpp convert script
@@ -603,7 +632,9 @@ def gguf_clip_loader(path):
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch in {"llama", "mistral3", "qwen2"}:
-            sd = llama_permute(sd, 32, 8) # L3 / Mistral / qwen2-compat
+            # L3 / Mistral / qwen2-compat. Head counts come from the file: the
+            # 32/8 that fits L3-8B silently corrupts anything shaped otherwise.
+            sd = llama_permute(sd, *llama_head_counts(extra.get("metadata", {}), arch))
         if arch in {"qwen2vl", "qwen3vl"}:
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)

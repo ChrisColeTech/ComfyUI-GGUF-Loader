@@ -1,40 +1,9 @@
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
 import torch
 
 import dequant
+from conftest import load_pack_module
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def _make_ops_module():
-    """Import ops.py without pulling in ComfyUI, which tests do not install."""
-    name = "comfy_gguf_test_pkg"
-    if f"{name}.ops" in sys.modules:
-        return sys.modules[f"{name}.ops"]
-    for mod in ("comfy", "comfy.ops", "comfy.lora", "comfy.model_management"):
-        sys.modules.setdefault(mod, types.ModuleType(mod))
-    for attr in ("ops", "lora", "model_management"):
-        setattr(sys.modules["comfy"], attr, sys.modules[f"comfy.{attr}"])
-    sys.modules["comfy.ops"].manual_cast = type("manual_cast", (), {
-        "Linear": torch.nn.Linear, "Conv2d": torch.nn.Conv2d,
-        "Embedding": torch.nn.Embedding, "LayerNorm": torch.nn.LayerNorm,
-        "GroupNorm": torch.nn.GroupNorm})
-
-    package = types.ModuleType(name)
-    package.__path__ = [str(ROOT)]
-    sys.modules[name] = package
-    spec = importlib.util.spec_from_file_location(f"{name}.ops", ROOT / "ops.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-ops = _make_ops_module()
+ops = load_pack_module("ops")
 
 
 def _plain(values):
