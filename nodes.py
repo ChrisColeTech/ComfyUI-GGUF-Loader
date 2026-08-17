@@ -208,11 +208,10 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
 class CLIPLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
-        base = nodes.CLIPLoader.INPUT_TYPES()
         return {
             "required": {
                 "clip_name": (s.get_filename_list(),),
-                "type": base["required"]["type"],
+                "type": _merged_type_options(),
             }
         }
 
@@ -274,13 +273,16 @@ class CLIPLoaderGGUF:
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
-        base = nodes.DualCLIPLoader.INPUT_TYPES()
         file_options = (s.get_filename_list(), )
+        # Same canonical type list as every other GGUF CLIP loader: core's
+        # dual-only list (SD3/Flux pairs) omits single-TE types like
+        # qwen_image, but this node happily loads one TE in a dual-template
+        # workflow and must offer those types too.
         return {
             "required": {
                 "clip_name1": file_options,
                 "clip_name2": file_options,
-                "type": base["required"]["type"],
+                "type": _merged_type_options(),
             }
         }
 
@@ -295,28 +297,56 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
 
-def _core_type_widget(core_class_name):
-    """Core's `type` options for a CLIP loader class, with a safe fallback.
+def _type_values(widget):
+    """Combo widget value -> flat list of option strings.
 
-    Newer ComfyUI moved Triple/Quadruple loaders to comfy_extras as
-    io.ComfyNode (no legacy INPUT_TYPES), so the named class can vanish
-    between releases — in that case fall back to the single CLIPLoader's
-    list, which every core exposes and which carries the full type set
-    (qwen_image etc.). Returning None would render NO type widget, leaving
-    the loader silently stuck on its Python default.
+    Combos arrive as ([...],) or [...]; accept either shape.
     """
-    base = getattr(nodes, core_class_name, None)
-    if base is not None:
+    if isinstance(widget, (tuple, list)) and len(widget) == 1 \
+            and isinstance(widget[0], (tuple, list)):
+        return list(widget[0])
+    return list(widget)
+
+def _merged_type_options():
+    """One canonical `type` list shared by EVERY GGUF CLIP loader.
+
+    Core splits its type vocabulary across loader classes — the single list
+    carries qwen_image/minimax/etc., the dual list carries sdxl/flux, and the
+    triple/quadruple classes may only exist as comfy_extras nodes on newer
+    cores. The GGUF loaders accept arbitrary TE files regardless of slot
+    count, so all four expose the same union: the single list first (native
+    order), then any values only present in the multi-loader lists appended.
+    A class that is missing or broken is skipped; the union still builds
+    from whatever remains.
+
+    Raises (at node registration) if NO core loader yields a list at all —
+    never returns an empty widget: a silently empty type dropdown would pin
+    the Python-default CLIPType and every GGUF choice would validate against
+    the wrong type.
+    """
+    merged, seen, errors = [], set(), []
+    for name in ("CLIPLoader", "DualCLIPLoader",
+                 "TripleCLIPLoader", "QuadrupleCLIPLoader"):
+        base = getattr(nodes, name, None)
+        if base is None:
+            errors.append(f"{name!r} not in core 'nodes'")
+            continue
         try:
-            widget = base.INPUT_TYPES()["required"].get("type")
-            if widget is not None:
-                return widget
-        except Exception:
-            pass
-    try:
-        return nodes.CLIPLoader.INPUT_TYPES()["required"]["type"]
-    except Exception:
-        return None
+            widget = base.INPUT_TYPES()["required"]["type"]
+        except Exception as e:
+            errors.append(f"{name!r} INPUT_TYPES failed ({e!r})")
+            continue
+        for t in _type_values(widget):
+            if t not in seen:
+                merged.append(t)
+                seen.add(t)
+    if not merged:
+        raise RuntimeError(
+            "Comfy-GGUF: cannot build the 'type' dropdown for the GGUF "
+            f"CLIP loaders ({'; '.join(errors)}). ComfyUI core changed "
+            "incompatibly - update ComfyUI or this node pack."
+        )
+    return (merged,)
 
 class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -326,10 +356,8 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
             "clip_name1": file_options,
             "clip_name2": file_options,
             "clip_name3": file_options,
+            "type": _merged_type_options(),
         }
-        type_widget = _core_type_widget("TripleCLIPLoader")
-        if type_widget is not None:
-            required["type"] = type_widget
         return {"required": required}
 
     TITLE = "Triple CLIP Loader (GGUF) ⚡"
@@ -353,10 +381,8 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
             "clip_name2": file_options,
             "clip_name3": file_options,
             "clip_name4": file_options,
+            "type": _merged_type_options(),
         }
-        type_widget = _core_type_widget("QuadrupleCLIPLoader")
-        if type_widget is not None:
-            required["type"] = type_widget
         return {"required": required}
 
     TITLE = "Quadruple CLIP Loader (GGUF) ⚡"
