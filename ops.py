@@ -161,7 +161,9 @@ class GGMLLayer(torch.nn.Module):
 
         # For Linear layer with missing weight
         if self.weight is None and isinstance(self, torch.nn.Linear):
-            v = torch.zeros(self.in_features, self.out_features)
+            # nn.Linear weights are (out_features, in_features); the transposed
+            # placeholder blows up in the matmul for any non-square layer.
+            v = torch.zeros(self.out_features, self.in_features)
             self.weight = torch.nn.Parameter(v, requires_grad=False)
             missing_keys.append(prefix+"weight")
 

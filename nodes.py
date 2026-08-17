@@ -1,4 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import os
 import torch
 import logging
 import inspect
@@ -14,7 +15,7 @@ import comfy.model_management
 import folder_paths
 
 from .ops import GGMLOps, move_patch_to_device
-from .loader import gguf_sd_loader, gguf_clip_loader, validate_te_type
+from .loader import gguf_sd_loader, gguf_clip_loader, validate_te_type, is_vision_projector
 from .dequant import is_quantized, is_torch_compatible
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -241,14 +242,38 @@ class CLIPLoaderGGUF:
 
     def load_data(self, ckpt_paths):
         clip_data = []
+        vision_data = []
         for p in ckpt_paths:
             if p.endswith(".gguf"):
+                # An mmproj is the vision tower of a VL text encoder, not a text
+                # encoder in its own right. Handing it to comfy as a second
+                # state dict makes TE detection fall through to SDXLClipModel,
+                # whose clip_g then never gets loaded at all. Merge it into the
+                # TE instead - the same thing the sibling auto-detection in
+                # gguf_clip_loader() does when the mmproj isn't picked by hand.
+                if is_vision_projector(p):
+                    vision_data.append((p, gguf_clip_loader(p)))
+                    continue
                 sd = gguf_clip_loader(p)
             else:
                 sd = comfy.utils.load_torch_file(p, safe_load=True)
                 if "scaled_fp8" in sd: # NOTE: Scaled FP8 would require different custom ops, but only one can be active
                     raise NotImplementedError(f"Mixing scaled FP8 with GGUF is not supported! Use regular CLIP loader or switch model(s)\n({p})")
             clip_data.append(sd)
+
+        for p, vsd in vision_data:
+            if not clip_data:
+                raise ValueError(
+                    f"'{os.path.basename(p)}' is an mmproj vision tower, not a text"
+                    f" encoder - it can only accompany the VL text encoder it belongs"
+                    f" to. Select that text encoder GGUF as well (it is picked up"
+                    f" automatically when both live in the same folder)."
+                )
+            # Prefer the VL text encoder if several are loaded; explicit picks
+            # override the keys auto-detection already merged in.
+            target = next((sd for sd in clip_data if any(k.startswith("visual.") for k in sd)), clip_data[0])
+            logging.info(f"Merging mmproj '{os.path.basename(p)}' into the text encoder it belongs to.")
+            target.update(vsd)
         return clip_data
 
     def load_patcher(self, clip_paths, clip_type, clip_data):

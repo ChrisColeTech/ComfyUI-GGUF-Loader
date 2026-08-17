@@ -167,6 +167,31 @@ def test_validate_te_type_requires_qwen_image_for_qwen2vl(tmp_path):
         loader.validate_te_type(str(te), "stable_diffusion")
 
 
+def test_mmproj_picked_by_hand_loads_as_a_vision_tower(tmp_path):
+    # DualCLIPLoaderGGUF(clip_name1=<VL TE>, clip_name2=<mmproj>) used to hand
+    # comfy two state dicts; TE detection then fell through to SDXLClipModel and
+    # its clip_g never got loaded, dying at the first forward with
+    # "'NoneType' object has no attribute 'device'". An explicitly picked mmproj
+    # must map to the same vision keys the sibling auto-detection produces.
+    mmproj = tmp_path / "Qwen2.5-VL-7B-Instruct-mmproj-f16.gguf"
+    _write_qwen2vl_mmproj(mmproj)
+    _write_te_gguf(tmp_path / "Qwen2.5-VL-7B-Instruct-q4_0.gguf", "qwen2vl")
+
+    assert loader.is_vision_projector(str(mmproj))
+    assert not loader.is_vision_projector(str(tmp_path / "Qwen2.5-VL-7B-Instruct-q4_0.gguf"))
+
+    picked = loader.gguf_clip_loader(str(mmproj))
+    auto = loader.gguf_mmproj_loader(str(tmp_path / "Qwen2.5-VL-7B-Instruct-q4_0.gguf"))
+    assert set(picked) == set(auto)
+    assert picked["visual.blocks.0.attn.qkv.weight"].shape == (12, 4)
+    # no text-encoder keys: it must never look like a second TE to comfy
+    assert not any(k.startswith(("model.", "text_model.")) for k in picked)
+
+    # type validation is a no-op for it - the mmproj carries no type of its own
+    for type_str in ("qwen_image", "sdxl", "stable_diffusion"):
+        loader.validate_te_type(str(mmproj), type_str)
+
+
 def test_validate_te_type_is_a_noop_without_a_requirement(tmp_path):
     te = tmp_path / "some-llama-te.gguf"
     _write_te_gguf(te, "llama")

@@ -74,6 +74,18 @@ TE_TYPE_REQUIREMENTS = {
     "qwen2vl": "qwen_image",  # Qwen-Image / Qwen-Image-Edit 2509 TE
 }
 
+# llama.cpp writes `general.architecture = "clip"` for mmproj vision projectors.
+# They carry the vision tower belonging to a VL text encoder (`v.blk.*` keys),
+# never a text encoder of their own, so they are merged into the TE's state dict
+# rather than handed to comfy as a second text encoder.
+VISION_PROJECTOR_ARCHES = {"clip"}
+
+def is_vision_projector(path):
+    """True for mmproj GGUF files (vision tower, no text encoder)."""
+    if not str(path).endswith(".gguf"):
+        return False
+    return read_gguf_arch(path) in VISION_PROJECTOR_ARCHES
+
 def validate_te_type(path, type_str):
     """Raise a clear error when a GGUF TE is loaded with the wrong CLIP type.
 
@@ -82,6 +94,8 @@ def validate_te_type(path, type_str):
     if not str(path).endswith(".gguf"):
         return
     arch = read_gguf_arch(path)
+    if arch in VISION_PROJECTOR_ARCHES:
+        return  # merged into the TE, carries no type of its own
     required = TE_TYPE_REQUIREMENTS.get(arch)
     if required is not None and type_str != required:
         raise ValueError(
@@ -455,9 +469,19 @@ def gguf_mmproj_loader(path):
         logging.info(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
-    target = os.path.join(root, target[0])
-    vsd, _ = gguf_sd_loader(target, is_text_model=True)
+    return load_mmproj_sd(os.path.join(root, target[0]))
 
+def load_mmproj_sd(path):
+    """Map an mmproj GGUF to the vision-tower keys comfy's VL TEs expect.
+
+    Split out from `gguf_mmproj_loader` so a user who picks the mmproj in a CLIP
+    slot explicitly gets the same state dict the sibling auto-detection builds.
+    """
+    vsd, _ = gguf_sd_loader(path, is_text_model=True)
+    return map_mmproj_sd(vsd)
+
+def map_mmproj_sd(vsd):
+    """mmproj GGUF keys -> comfy vision-tower keys (`visual.*`)."""
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
         w1 = dequantize_tensor(vsd.pop("v.patch_embd.weight"), dtype=torch.float32)
@@ -666,6 +690,10 @@ def gguf_gemma3_tokenizer_loader(path):
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
+    if arch in VISION_PROJECTOR_ARCHES:
+        # mmproj picked directly: hand back the mapped vision tower so the
+        # caller can merge it into the TE it belongs to.
+        return map_mmproj_sd(sd)
     if arch in {"t5", "t5encoder"}:
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape == (256384, 4096):
