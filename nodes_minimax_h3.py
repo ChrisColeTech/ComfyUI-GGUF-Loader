@@ -15,11 +15,9 @@ import logging
 import comfy.model_management
 import comfy.sd
 import folder_paths
-import nodes
 
-from .minimax_h3_prompt import (build_prompt, duration_seconds, on_frame_grid,
-                                parse_fields, reference_header, schema_problems,
-                                snap_to_frame_grid)
+from .minimax_h3_prompt import (build_prompt, duration_seconds, last_shot_index,
+                                parse_fields, reference_header, schema_problems)
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +109,31 @@ def _text_encoder_list():
     return sorted(files) or ["none"]
 
 
-def _encoder_types():
+# comfy identifies the architecture from the state dict itself; a CLIP type only
+# selects which downstream wrapper gets built around it. Most generation-capable
+# encoders ignore it entirely (the Gemma-3 12B branch has no type check at all),
+# and where it does branch — Qwen3-VL — the variants differ in chat templating,
+# which this node supplies itself. So pick a type that is known to yield a full
+# LLM and let detection do the real work.
+_TYPE_FOR_ARCH = {
+    "GEMMA_3_12B": "ltxv",
+    "GEMMA_3_4B": "lumina2",
+    "GEMMA_3_4B_VISION": "lumina2",
+    "QWEN3VL_4B": "qwen_image",
+    "QWEN3VL_8B": "qwen_image",
+    "QWEN25_7B": "qwen_image",
+    "QWEN25_3B": "omnigen2",
+}
+_DEFAULT_TYPE = "stable_diffusion"
+
+
+def _detect_encoder_type(state_dict):
     try:
-        return nodes.CLIPLoader.INPUT_TYPES()["required"]["type"][0]
+        detected = comfy.sd.detect_te_model(state_dict)
     except Exception:
-        return ["ltxv"]
+        detected = None
+    name = getattr(detected, "name", None)
+    return name, _TYPE_FOR_ARCH.get(name, _DEFAULT_TYPE)
 
 
 # Loading a text encoder costs several GB and many seconds, and ComfyUI re-runs
@@ -124,18 +142,26 @@ def _encoder_types():
 _ENCODER_CACHE = {}
 
 
-def _load_text_encoder(name, type_name):
-    key = (name, type_name)
-    cached = _ENCODER_CACHE.get(key)
+def _load_text_encoder(name):
+    cached = _ENCODER_CACHE.get(name)
     if cached is not None:
         return cached
 
     from .nodes import CLIPLoaderGGUF
 
+    loader = CLIPLoaderGGUF()
+    path = folder_paths.get_full_path("clip", name) \
+        or folder_paths.get_full_path_or_raise("text_encoders", name)
+    state_dict = loader.load_data([path])[0]
+    arch, type_name = _detect_encoder_type(state_dict)
+    logger.info("MiniMax H3: loading %s (detected %s, building as %s)",
+                name, arch or "unknown architecture", type_name)
+
+    clip_type = getattr(comfy.sd.CLIPType, type_name.upper(),
+                        comfy.sd.CLIPType.STABLE_DIFFUSION)
     _ENCODER_CACHE.clear()
-    logger.info("MiniMax H3: loading text encoder %s (%s)", name, type_name)
-    clip = CLIPLoaderGGUF().load_clip(name, type_name)[0]
-    _ENCODER_CACHE[key] = clip
+    clip = loader.load_patcher([path], clip_type, [state_dict])
+    _ENCODER_CACHE[name] = clip
     return clip
 
 
@@ -174,11 +200,8 @@ class MiniMaxH3PromptWriter:
                 "text_encoder": (_text_encoder_list(), {
                     "tooltip": "Local LLM that writes the prompt. Needs a "
                                "generation-capable encoder such as Gemma-3 12B "
-                               "or a Qwen3-VL; ignored when a clip is connected."}),
-                "encoder_type": (_encoder_types(), {
-                    "default": "ltxv",
-                    "tooltip": "How to build the encoder, same as the CLIP loaders. "
-                               "ltxv covers the Gemma-3 12B used by Scenema."}),
+                               "or a Qwen3-VL. The architecture is detected from "
+                               "the file; ignored when a clip is connected."}),
                 "idea": ("STRING", {
                     "multiline": True,
                     "dynamicPrompts": True,
@@ -208,17 +231,9 @@ class MiniMaxH3PromptWriter:
             },
             "optional": {
                 "clip": ("CLIP", {
-                    "tooltip": "Optional. Overrides the dropdowns and avoids "
+                    "tooltip": "Optional. Overrides the dropdown and avoids "
                                "reloading, e.g. the CLIP already loaded for the "
                                "video model."}),
-                "frames": ("INT", {
-                    "default": 0, "min": 0, "max": 100000,
-                    "tooltip": "Exact frame count, overriding the length preset. "
-                               "H3 wants n % 17 == 5; other values are snapped."}),
-                "last_shot_index": ("INT", {
-                    "default": 1, "min": 1, "max": 99,
-                    "tooltip": "Shot that owns the last frame, for fl2va and l2va. "
-                               "Single-shot clips use 1."}),
             },
         }
 
@@ -229,25 +244,19 @@ class MiniMaxH3PromptWriter:
                    "supplies the three core fields; the node assembles the exact "
                    "MiniMax envelope around them.")
 
-    def write(self, text_encoder, encoder_type, idea, mode, length, seed, max_length,
-              temperature, include_music, clip=None, frames=0, last_shot_index=1):
+    def write(self, text_encoder, idea, mode, length, seed, max_length,
+              temperature, include_music, clip=None):
         if not idea or not idea.strip():
             raise ValueError("idea must not be empty")
 
-        frame_count = int(frames) if frames else FRAME_PRESETS[length]
-        if not on_frame_grid(frame_count):
-            snapped = snap_to_frame_grid(frame_count)
-            logger.info("MiniMax H3: %d frames is off the n%%17==5 grid; using %d",
-                        frame_count, snapped)
-            frame_count = snapped
-        seconds = duration_seconds(frame_count)
+        seconds = duration_seconds(FRAME_PRESETS[length])
 
         if clip is None:
             if text_encoder == "none":
                 raise ValueError(
                     "No text encoders found. Put one in models/text_encoders, or "
                     "connect a CLIP.")
-            clip = _load_text_encoder(text_encoder, encoder_type)
+            clip = _load_text_encoder(text_encoder)
         if not hasattr(clip.cond_stage_model, "generate"):
             raise ValueError(
                 f"{type(clip.cond_stage_model).__name__} cannot generate text. Use a "
@@ -297,8 +306,11 @@ class MiniMaxH3PromptWriter:
                 logger.warning(
                     "MiniMax H3: the model omitted %s; H3 quality drops without it", name)
 
+        # N in the keyframe instruction is the shot owning the last frame,
+        # which the timeline just written already states.
         final = build_prompt(visual, soundscape, music, mode=mode,
-                             duration_s=seconds, last_shot_index=int(last_shot_index))
+                             duration_s=seconds,
+                             last_shot_index=last_shot_index(visual))
         logger.info("MiniMax H3: wrote a %d-character %s prompt for %.2fs",
                     len(final), mode, seconds)
         return (final, raw)
@@ -327,10 +339,6 @@ class MiniMaxH3PromptFormat:
                 "mode": (list(MODE_GUIDANCE), {"default": "t2va"}),
                 "length": (list(FRAME_PRESETS), {"default": "243 (~10.13s)"}),
             },
-            "optional": {
-                "frames": ("INT", {"default": 0, "min": 0, "max": 100000}),
-                "last_shot_index": ("INT", {"default": 1, "min": 1, "max": 99}),
-            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -340,18 +348,16 @@ class MiniMaxH3PromptFormat:
                    "including the keyframe instruction line.")
 
     def format(self, integrated_multimodal_description, overall_soundscape,
-               non_diegetic_music, mode, length, frames=0, last_shot_index=1):
+               non_diegetic_music, mode, length):
         if not integrated_multimodal_description.strip():
             raise ValueError("integrated_multimodal_description must not be empty")
-        frame_count = int(frames) if frames else FRAME_PRESETS[length]
-        if not on_frame_grid(frame_count):
-            frame_count = snap_to_frame_grid(frame_count)
-        seconds = duration_seconds(frame_count)
+        seconds = duration_seconds(FRAME_PRESETS[length])
         for problem in schema_problems(integrated_multimodal_description, seconds):
             logger.warning("MiniMax H3: %s", problem)
-        return (build_prompt(integrated_multimodal_description, overall_soundscape,
-                             non_diegetic_music, mode=mode, duration_s=seconds,
-                             last_shot_index=int(last_shot_index)),)
+        return (build_prompt(
+            integrated_multimodal_description, overall_soundscape, non_diegetic_music,
+            mode=mode, duration_s=seconds,
+            last_shot_index=last_shot_index(integrated_multimodal_description)),)
 
 
 NODE_CLASS_MAPPINGS = {

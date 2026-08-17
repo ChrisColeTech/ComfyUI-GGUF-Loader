@@ -14,7 +14,7 @@ import comfy.model_management
 import folder_paths
 
 from .ops import GGMLOps, move_patch_to_device
-from .loader import gguf_sd_loader, gguf_clip_loader
+from .loader import gguf_sd_loader, gguf_clip_loader, validate_te_type
 from .dequant import is_quantized, is_torch_compatible
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -255,6 +255,9 @@ class CLIPLoaderGGUF:
 
     def load_clip(self, clip_name, type="stable_diffusion"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
+        if clip_path is None and clip_name.endswith(".gguf"):
+            clip_path = folder_paths.get_full_path("clip_gguf", clip_name)
+        validate_te_type(clip_path, type)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
 
@@ -276,6 +279,8 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     def load_clip(self, clip_name1, clip_name2, type):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
         clip_path2 = folder_paths.get_full_path("clip", clip_name2)
+        validate_te_type(clip_path1, type)
+        validate_te_type(clip_path2, type)
         clip_paths = (clip_path1, clip_path2)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)

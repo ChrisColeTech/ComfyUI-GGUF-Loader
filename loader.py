@@ -17,7 +17,7 @@ IMG_ARCH_LIST = {
     "flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos",
     "ltxv", "hyvid", "wan", "lumina2", "qwen_image",
     # Custom DiT tags used by our quant pipelines
-    "ltx2",        # MiniMax-H3 DiT (and LTX-2-family DiTs tagged ltx2)
+    "minimax_h3",  # MiniMax H3 files are content-detected from the ltx2 tag
     "zimage",      # Z-Image turbo DiT
     "ideogram4",   # Ideogram-4 DiT
     "flux2",       # Flux2 conversion scripts (alias; some files also use "flux")
@@ -41,6 +41,55 @@ TXT_ARCH_LIST = {
     "minimax_music3",
 }
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
+
+MINIMAX_H3_TENSOR_SIGNATURE = {
+    "video_patch_proj.weight",
+    "audio_patch_proj.weight",
+}
+
+def image_architecture(arch_str, tensor_names):
+    """Return a safe, content-derived image architecture identifier."""
+    if arch_str == "ltx2" and MINIMAX_H3_TENSOR_SIGNATURE <= set(tensor_names):
+        return "minimax_h3"
+    return arch_str
+
+def read_gguf_arch(path):
+    """Read general.architecture from a GGUF file, or None if absent/invalid.
+
+    Cheap header-only probe used to validate loader node settings before the
+    (slow) full state-dict load.
+    """
+    reader = gguf.GGUFReader(path)
+    try:
+        return get_field(reader, "general.architecture", str)
+    except TypeError:
+        return None
+
+# GGUF text-encoder architectures that only work with one specific CLIPLoader
+# `type`. Loaded under any other type, every key misses the target model and
+# comfy crashes at first forward with a cryptic `'NoneType' object has no
+# attribute 'device'` (seen in the wild with the Qwen2.5-VL TE + default
+# `stable_diffusion` type → SDXLClipModel). Fail at load with the fix instead.
+TE_TYPE_REQUIREMENTS = {
+    "qwen2vl": "qwen_image",  # Qwen-Image / Qwen-Image-Edit 2509 TE
+}
+
+def validate_te_type(path, type_str):
+    """Raise a clear error when a GGUF TE is loaded with the wrong CLIP type.
+
+    No-op for non-GGUF files and architectures without a known requirement.
+    """
+    if not str(path).endswith(".gguf"):
+        return
+    arch = read_gguf_arch(path)
+    required = TE_TYPE_REQUIREMENTS.get(arch)
+    if required is not None and type_str != required:
+        raise ValueError(
+            f"'{os.path.basename(path)}' is a {arch!r} text encoder: load it with"
+            f" type '{required}' (got '{type_str or 'stable_diffusion'}')."
+            f" The mmproj vision tower is picked up automatically from the same"
+            f" folder when present."
+        )
 
 def get_orig_shape(reader, tensor_name):
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
@@ -140,6 +189,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     compat = None
     arch_str = get_field(reader, "general.architecture", str)
     type_str = get_field(reader, "general.type", str)
+    arch_str = image_architecture(arch_str, (key for key, _ in tensors))
     if arch_str in [None, "pig", "cow"]:
         if is_text_model:
             raise ValueError(f"This gguf file is incompatible with llama.cpp!\nConsider using safetensors or a compatible gguf file\n({path})")
@@ -148,6 +198,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         from .tools.convert import detect_arch
         try:
             arch_str = detect_arch(set(val[0] for val in tensors)).arch
+            arch_str = image_architecture(arch_str, (key for key, _ in tensors))
         except Exception as e:
             raise ValueError(f"This model is not currently supported - ({e})")
     elif arch_str not in TXT_ARCH_LIST and is_text_model:
@@ -442,7 +493,17 @@ def gguf_mmproj_loader(path):
                 v[f"k.{suffix}"],
                 v[f"v.{suffix}"],
             ], dim=0)
+            # remove the consumed per-q/k/v tensors: leaving them in produces
+            # hundreds of bogus "unexpected keys" in comfy's load report and
+            # would break any strict consumer of the merged sd.
+            for side in ("q", "k", "v"):
+                block = k[: -len(".attn.qkv." + suffix)]
+                vsd.pop(f"{block}.attn_{side}.{suffix}", None)
         del attns
+
+    # comfy's Qwen2VLVisionTransformer positions via rope and has no pos_embed
+    # parameter; the mmproj's position table would arrive as an unexpected key.
+    vsd.pop("v.position_embd.weight", None)
 
     return vsd
 

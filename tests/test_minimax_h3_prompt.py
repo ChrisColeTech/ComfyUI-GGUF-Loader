@@ -1,6 +1,7 @@
 import pytest
 
 from minimax_h3_prompt import (build_prompt, duration_seconds, ensure_shot_marker,
+                               last_shot_index,
                                looks_structured, on_frame_grid, parse_fields,
                                reference_header, schema_problems, snap_to_frame_grid,
                                strip_shot1_timestamp)
@@ -139,3 +140,16 @@ def test_shot_one_timestamp_is_repaired_not_just_reported():
     kept = build_prompt("[Shot 1] A tower. [Shot 2] At 00:03.000, the camera cuts to sea.",
                         mode="t2va")
     assert "At 00:03.000" in kept
+
+
+def test_last_shot_index_is_derived_from_the_timeline():
+    # The keyframe instruction's N is in the text the model just wrote, so it is
+    # read back rather than asked for.
+    assert last_shot_index("[Shot 1] A tower.") == 1
+    assert last_shot_index("[Shot 1] A tower. [Shot 2] At 00:03.000, cut. [Shot 3] End.") == 3
+    assert last_shot_index("") == 1
+    prompt = build_prompt("[Shot 1] Open. [Shot 2] At 00:04.000, cut to the sea.",
+                          mode="fl2va", duration_s=8.0,
+                          last_shot_index=last_shot_index(
+                              "[Shot 1] Open. [Shot 2] At 00:04.000, cut to the sea."))
+    assert "Picture 2 (from Shot 2)" in prompt

@@ -76,7 +76,7 @@ def main():
         ("ltxv", {"adaln_single.emb.timestep_embedder.linear_2.weight": 1, "transformer_blocks.27.scale_shift_table": 1, "caption_projection.linear_2.weight": 1}, "ltxv"),
     ]
     load_cases = [
-        (r"D:\models\image-models\minimax-h3\split\diffusion_models\minimax_h3_fl2va_turbo_Q6_K.gguf", False, "ltx2"),
+        (r"D:\models\image-models\minimax-h3\split\diffusion_models\minimax_h3_ref2va_turbo_Q6_K.gguf", False, "minimax_h3"),
         (r"D:\models\image-models\ltxv25\split\diffusion_models\ltx-2.5-22b-distilled-transformer-Q6_K.gguf", False, "ltxv"),
         (r"D:\models\image-models\z-image\split\z-image-turbo-q6k-fresh.gguf", False, "zimage"),
         (r"D:\models\image-models\ideogram\split\ideogram4-turbo-Q6_K.gguf", False, "ideogram4"),
@@ -111,9 +111,11 @@ def main():
             reader = gguf.GGUFReader(str(p))
             arch = get_field(reader, "general.architecture")
             n = len(reader.tensors)
+            names = {t.name for t in reader.tensors}
             if arch is None:
-                names = {t.name for t in reader.tensors}
                 arch = convert.detect_arch({k: 1 for k in names}).arch
+            if arch == "ltx2" and {"video_patch_proj.weight", "audio_patch_proj.weight"} <= names:
+                arch = "minimax_h3"
             allow = TXT if is_text else IMG
             if arch not in allow:
                 raise ValueError("arch %r not in allowlist" % arch)

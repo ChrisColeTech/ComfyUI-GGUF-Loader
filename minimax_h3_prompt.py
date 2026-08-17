@@ -83,6 +83,19 @@ _SHOT1_LEADING_TIME_RE = re.compile(
     r"(\[Shot 1\]\s*)(?:at\s+\d{1,2}:\d{2}(?:\.\d{1,3})?\s*,?\s*)", re.IGNORECASE)
 
 
+_SHOT_INDEX_RE = re.compile(r"\[Shot\s+(\d{1,2})\]", re.IGNORECASE)
+
+
+def last_shot_index(visual):
+    """The ``N`` the FL2VA/L2VA instruction needs: the shot owning the last frame.
+
+    Derived from the timeline rather than asked for, since the shots are right
+    there in the text that was just written.
+    """
+    found = [int(n) for n in _SHOT_INDEX_RE.findall(visual or "")]
+    return max(found) if found else 1
+
+
 def strip_shot1_timestamp(visual):
     """Drop a cut time from the first shot.
 
