@@ -228,6 +228,18 @@ class CLIPLoaderGGUF:
         files += folder_paths.get_filename_list("clip_gguf")
         return sorted(files)
 
+    @staticmethod
+    def _resolve_clip_path(clip_name):
+        """Resolve a file listed by get_filename_list to its full path.
+
+        The listing merges `clip` and `clip_gguf`, so resolution has to try
+        both — files living only in clip_gguf would otherwise 404 on load.
+        """
+        clip_path = folder_paths.get_full_path("clip", clip_name)
+        if clip_path is None and clip_name.endswith(".gguf"):
+            clip_path = folder_paths.get_full_path("clip_gguf", clip_name)
+        return clip_path
+
     def load_data(self, ckpt_paths):
         clip_data = []
         for p in ckpt_paths:
@@ -254,9 +266,7 @@ class CLIPLoaderGGUF:
         return clip
 
     def load_clip(self, clip_name, type="stable_diffusion"):
-        clip_path = folder_paths.get_full_path("clip", clip_name)
-        if clip_path is None and clip_name.endswith(".gguf"):
-            clip_path = folder_paths.get_full_path("clip_gguf", clip_name)
+        clip_path = self._resolve_clip_path(clip_name)
         validate_te_type(clip_path, type)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
@@ -277,32 +287,51 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     TITLE = "Dual CLIP Loader (GGUF) ⚡"
 
     def load_clip(self, clip_name1, clip_name2, type):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
+        clip_path1 = self._resolve_clip_path(clip_name1)
+        clip_path2 = self._resolve_clip_path(clip_name2)
         validate_te_type(clip_path1, type)
         validate_te_type(clip_path2, type)
         clip_paths = (clip_path1, clip_path2)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
 
+def _core_type_widget(core_class_name, clip_key):
+    """Core's `type` options for a CLIP loader class, or None if absent.
+
+    Newer ComfyUI moved Triple/Quadruple loaders to comfy_extras as
+    io.ComfyNode (no legacy INPUT_TYPES), so the inheritance can vanish
+    between releases — probe instead of assuming.
+    """
+    base = getattr(nodes, core_class_name, None)
+    if base is None:
+        return None
+    try:
+        return base.INPUT_TYPES()["required"].get("type")
+    except Exception:
+        return None
+
 class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
         file_options = (s.get_filename_list(), )
-        return {
-            "required": {
-                "clip_name1": file_options,
-                "clip_name2": file_options,
-                "clip_name3": file_options,
-            }
+        required = {
+            "clip_name1": file_options,
+            "clip_name2": file_options,
+            "clip_name3": file_options,
         }
+        type_widget = _core_type_widget("TripleCLIPLoader", "clip_name3")
+        if type_widget is not None:
+            required["type"] = type_widget
+        return {"required": required}
 
     TITLE = "Triple CLIP Loader (GGUF) ⚡"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
-        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
+        clip_path1 = self._resolve_clip_path(clip_name1)
+        clip_path2 = self._resolve_clip_path(clip_name2)
+        clip_path3 = self._resolve_clip_path(clip_name3)
+        for p in (clip_path1, clip_path2, clip_path3):
+            validate_te_type(p, type)
         clip_paths = (clip_path1, clip_path2, clip_path3)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
@@ -311,22 +340,26 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
         file_options = (s.get_filename_list(), )
-        return {
-            "required": {
+        required = {
             "clip_name1": file_options,
             "clip_name2": file_options,
             "clip_name3": file_options,
             "clip_name4": file_options,
         }
-    }
+        type_widget = _core_type_widget("QuadrupleCLIPLoader", "clip_name4")
+        if type_widget is not None:
+            required["type"] = type_widget
+        return {"required": required}
 
     TITLE = "Quadruple CLIP Loader (GGUF) ⚡"
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
-        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
-        clip_path4 = folder_paths.get_full_path("clip", clip_name4)
+        clip_path1 = self._resolve_clip_path(clip_name1)
+        clip_path2 = self._resolve_clip_path(clip_name2)
+        clip_path3 = self._resolve_clip_path(clip_name3)
+        clip_path4 = self._resolve_clip_path(clip_name4)
+        for p in (clip_path1, clip_path2, clip_path3, clip_path4):
+            validate_te_type(p, type)
         clip_paths = (clip_path1, clip_path2, clip_path3, clip_path4)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
