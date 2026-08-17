@@ -295,18 +295,26 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
 
-def _core_type_widget(core_class_name, clip_key):
-    """Core's `type` options for a CLIP loader class, or None if absent.
+def _core_type_widget(core_class_name):
+    """Core's `type` options for a CLIP loader class, with a safe fallback.
 
     Newer ComfyUI moved Triple/Quadruple loaders to comfy_extras as
-    io.ComfyNode (no legacy INPUT_TYPES), so the inheritance can vanish
-    between releases — probe instead of assuming.
+    io.ComfyNode (no legacy INPUT_TYPES), so the named class can vanish
+    between releases — in that case fall back to the single CLIPLoader's
+    list, which every core exposes and which carries the full type set
+    (qwen_image etc.). Returning None would render NO type widget, leaving
+    the loader silently stuck on its Python default.
     """
     base = getattr(nodes, core_class_name, None)
-    if base is None:
-        return None
+    if base is not None:
+        try:
+            widget = base.INPUT_TYPES()["required"].get("type")
+            if widget is not None:
+                return widget
+        except Exception:
+            pass
     try:
-        return base.INPUT_TYPES()["required"].get("type")
+        return nodes.CLIPLoader.INPUT_TYPES()["required"]["type"]
     except Exception:
         return None
 
@@ -319,7 +327,7 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
             "clip_name2": file_options,
             "clip_name3": file_options,
         }
-        type_widget = _core_type_widget("TripleCLIPLoader", "clip_name3")
+        type_widget = _core_type_widget("TripleCLIPLoader")
         if type_widget is not None:
             required["type"] = type_widget
         return {"required": required}
@@ -346,7 +354,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
             "clip_name3": file_options,
             "clip_name4": file_options,
         }
-        type_widget = _core_type_widget("QuadrupleCLIPLoader", "clip_name4")
+        type_widget = _core_type_widget("QuadrupleCLIPLoader")
         if type_widget is not None:
             required["type"] = type_widget
         return {"required": required}
