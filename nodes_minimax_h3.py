@@ -12,7 +12,11 @@ instruction wording, the labels, and the blank-line layout come from
 
 import logging
 
+import nodes
+import torch
+
 import comfy.model_management
+import comfy.nested_tensor
 import comfy.sd
 import folder_paths
 
@@ -360,12 +364,161 @@ class MiniMaxH3PromptFormat:
             last_shot_index=last_shot_index(integrated_multimodal_description)),)
 
 
+# AV latent geometry ported from comfy_extras/nodes_minimax_h3.py.
+FPS = 24
+AUDIO_LATENT_FPS = 40
+
+
+def align_frame_count(n):
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+def video_latent_t(frame_count):
+    return 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2
+
+
+def temporal_shape(length):
+    frame_count = align_frame_count(max(5, length))
+    duration = frame_count / FPS
+    return frame_count, video_latent_t(frame_count), round(duration * AUDIO_LATENT_FPS)
+
+
+def empty_av_latent(width, height, length, batch_size=1):
+    frame_count, latent_t, audio_t = temporal_shape(length)
+    device = comfy.model_management.intermediate_device()
+    video = torch.zeros([batch_size, 24, latent_t, height // 16, width // 16], device=device)
+    audio = torch.zeros([batch_size, 32, 2, audio_t], device=device)
+    return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}, frame_count
+
+
+class MiniMaxH3EmptyLatentAVBatch:
+    """Empty H3 AV latent with a batch dimension, ported from comfy core.
+
+    The upstream node is fixed at batch 1; this exposes the batch so one
+    sampler job yields several videos (each latent row gets its own noise
+    from the KSampler seed, so every output differs).
+    """
+
+    CATEGORY = H3_CATEGORY
+    TITLE = "Empty MiniMax H3 AV Latent (Batch) ⚡"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "width": ("INT", {"default": 1344, "min": 32, "max": nodes.MAX_RESOLUTION,
+                                  "step": 32}),
+                "height": ("INT", {"default": 768, "min": 32, "max": nodes.MAX_RESOLUTION,
+                                   "step": 32}),
+                "length": ("INT", {
+                    "default": 124, "min": 5, "max": 3600, "step": 17,
+                    "tooltip": "Frame count at 24 fps, snapped up to the model's "
+                               "17k+5 grid (124 = ~5s; trained range is ~124-362, "
+                               "longer is untested)."}),
+                "batch_size": ("INT", {
+                    "default": 1, "min": 1, "max": 64,
+                    "tooltip": "Videos per job. Each gets distinct noise from the "
+                               "sampler seed. Combine with MiniMax H3 Batch Patch: "
+                               "the DiT itself only accepts batch 1, so the patch "
+                               "node is required for values above 1."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "generate"
+    DESCRIPTION = ("Joint video+audio latent for MiniMax H3 with a batch size. "
+                   "Duration snaps to the model's 17k+5 frame grid at 24 fps. "
+                   "For batch_size > 1, route the model through MiniMax H3 "
+                   "Batch Patch.")
+
+    def generate(self, width, height, length, batch_size):
+        latent, _ = empty_av_latent(width, height, length, batch_size)
+        return (latent,)
+
+
+class MiniMaxH3BatchPatch:
+    """Let the H3 DiT accept a batched AV latent.
+
+    The DiT packs text, condition rows, and the AV streams into one flat
+    [S, hidden] sequence with no batch axis and raises on batch > 1
+    (comfy/ldm/minimax/model.py). This patches diffusion_model.forward to
+    run each batch row as its own full forward and concatenate the stream
+    outputs, which is mathematically identical to sampling the rows
+    separately while sharing one model load, one conditioning encode, and
+    one sampler pass. Peak VRAM stays at the batch-1 level; step time
+    scales with the batch.
+    """
+
+    CATEGORY = H3_CATEGORY
+    TITLE = "MiniMax H3 Batch Patch ⚡"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "MiniMax H3 diffusion model. Patch it when sampling "
+                               "an AV latent with batch_size > 1 from Empty MiniMax "
+                               "H3 AV Latent (Batch)."}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    DESCRIPTION = ("Enable batch sampling on the MiniMax H3 DiT by looping batch "
+                   "rows inside the model forward. Pair with Empty MiniMax H3 AV "
+                   "Latent (Batch).")
+
+    def patch(self, model):
+        from comfy.ldm.minimax.model import MiniMaxH3Model
+
+        m = model.clone()
+        dit = m.model.model.diffusion_model
+        if not isinstance(dit, MiniMaxH3Model):
+            raise ValueError(
+                "MiniMax H3 Batch Patch needs a MiniMax H3 diffusion model, got "
+                f"{type(dit).__name__}")
+        orig_forward = type(dit).forward
+
+        def batched_forward(x, timestep, context=None, transformer_options=None,
+                            minimax_payload=None, **kwargs):
+            batch = x[0].shape[0] if isinstance(x, (list, tuple)) else x.shape[0]
+            if batch <= 1 or not isinstance(x, (list, tuple)):
+                return orig_forward(dit, x, timestep, context=context,
+                                    transformer_options=transformer_options or {},
+                                    minimax_payload=minimax_payload, **kwargs)
+            to = transformer_options or {}
+            outs = []
+            for i in range(batch):
+                row_x = [t[i:i + 1] for t in x]
+                row_ctx = context
+                if isinstance(context, torch.Tensor) and context.shape[0] == batch:
+                    row_ctx = context[i:i + 1]
+                outs.append(orig_forward(dit, row_x, timestep, context=row_ctx,
+                                         transformer_options=to,
+                                         minimax_payload=minimax_payload,
+                                         **kwargs))
+            if isinstance(outs[0], (list, tuple)):
+                return [torch.cat([o[k] for o in outs], dim=0)
+                        for k in range(len(outs[0]))]
+            return torch.cat(outs, dim=0)
+
+        m.add_object_patch("diffusion_model.forward", batched_forward)
+        return (m,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3PromptWriter": MiniMaxH3PromptWriter,
     "MiniMaxH3PromptFormat": MiniMaxH3PromptFormat,
+    "MiniMaxH3EmptyLatentAVBatch": MiniMaxH3EmptyLatentAVBatch,
+    "MiniMaxH3BatchPatch": MiniMaxH3BatchPatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3PromptWriter": MiniMaxH3PromptWriter.TITLE,
     "MiniMaxH3PromptFormat": MiniMaxH3PromptFormat.TITLE,
+    "MiniMaxH3EmptyLatentAVBatch": MiniMaxH3EmptyLatentAVBatch.TITLE,
+    "MiniMaxH3BatchPatch": MiniMaxH3BatchPatch.TITLE,
 }
