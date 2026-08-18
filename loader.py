@@ -441,6 +441,16 @@ def strip_quant_suffix(name):
         name = name[:match.start()]
     return name
 
+def squash_name(name):
+    """Filename reduced to [a-z0-9], for punctuation-insensitive matching.
+
+    A TE and its mmproj are rarely punctuated the same way by whoever quantized
+    them: 'qwen3vl_8b_Q4_K_M.gguf' ships beside 'qwen3vl8b-mmproj-f16.gguf'. A
+    plain substring test misses that pair, so the vision tower never loads and
+    comfy detects the file as plain Qwen3-8B instead of Qwen3-VL.
+    """
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
 def gguf_mmproj_loader(path):
     # Reverse version of Qwen2VLVisionModel.modify_tensors
     logging.info("Attenpting to find mmproj file for text encoder...")
@@ -459,7 +469,7 @@ def gguf_mmproj_loader(path):
             continue
         if "mmproj" not in name.lower():
             continue
-        if tenc in name.lower():
+        if squash_name(tenc) in squash_name(name):
             target.append(fname)
 
     if len(target) == 0:

@@ -167,6 +167,29 @@ def test_validate_te_type_requires_qwen_image_for_qwen2vl(tmp_path):
         loader.validate_te_type(str(te), "stable_diffusion")
 
 
+def test_mmproj_sibling_match_ignores_punctuation(tmp_path):
+    # Real pair on disk: the TE separates "vl" and "8b" with an underscore, the
+    # mmproj does not. A plain substring match misses it, the vision tower never
+    # merges, and comfy then detects the file as plain Qwen3-8B - which makes
+    # CCTechClipProjLoader raise "not as a Qwen3-VL text encoder".
+    te = tmp_path / "qwen3vl_8b_Q4_K_M.gguf"
+    _write_te_gguf(te, "qwen3vl")
+    _write_qwen2vl_mmproj(tmp_path / "qwen3vl8b-mmproj-f16.gguf")
+
+    vsd = loader.gguf_mmproj_loader(str(te))
+    assert vsd, "mmproj sibling was not found for the punctuation-mismatched pair"
+    assert any(k.startswith("visual.") for k in vsd)
+
+
+def test_squash_name_does_not_match_a_different_model(tmp_path):
+    # Punctuation-insensitive must not become model-insensitive.
+    te = tmp_path / "qwen3vl_4b_Q4_K_M.gguf"
+    _write_te_gguf(te, "qwen3vl")
+    _write_qwen2vl_mmproj(tmp_path / "qwen3vl8b-mmproj-f16.gguf")
+
+    assert loader.gguf_mmproj_loader(str(te)) == {}
+
+
 def test_mmproj_picked_by_hand_loads_as_a_vision_tower(tmp_path):
     # DualCLIPLoaderGGUF(clip_name1=<VL TE>, clip_name2=<mmproj>) used to hand
     # comfy two state dicts; TE detection then fell through to SDXLClipModel and
