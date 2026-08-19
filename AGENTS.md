@@ -95,6 +95,43 @@ ComfyUI core ships the entire LTX-2 A/V stack; nothing needs vendoring:
   (`av_model.py:708-731, 1029-1033`). Chunk chaining: encode 3 s tail of chunk
   N as the reference for chunk N+1 (original: `REF_TAIL_SECONDS=3.0`).
 
+## LTX-2.5 split support (D:\models\image-models\ltxv25\split)
+
+Verified headless on the portable (ComfyUI 0.33.0, RTX 5090): full E2E
+generation (Gemma-4 TE GGUF + ltx-v2-projections → 22B distilled DiT GGUF →
+video+audio VAE decode) works. Three sidecar bridges make the GGUFs loadable:
+
+1. **Gemma-4 tokenizer sidecar** — `gemma4`-arch TEs need the full HF
+   `tokenizer.json` (comfy's `Gemma4SDTokenizer` is `tokenizers`-lib based,
+   NOT sentencepiece-rebuildable like gemma3). Without it comfy falls back to
+   a path string and dies on `'str' object has no attribute 'decode'`. The
+   loader reads `<gguf>.tokenizer.json` (extract once from the comfy
+   safetensors' `tokenizer_json` U8 tensor) and vocab-checks it against the
+   GGUF token count.
+2. **Gemma-4 fixup sidecar** — `<gguf>.fixup.safetensors` carries the 48
+   per-layer `layer_scalar` constants (learned values ~0.005–0.93, multiplied
+   into every block output; comfy holds them in `torch.empty` buffers, so a
+   missing tensor = silent garbage, and the loader now hard-errors instead).
+   Extract from the source checkpoint's `model.layers.N.layer_scalar` (BF16
+   [1]).
+3. **DiT config sidecar** — `UnetLoaderGGUF` merges `<gguf>-metadata.json` /
+   a sole `*metadata*.json` sibling into the metadata, translates LTX's key
+   names to comfy kwargs (`cross_attn_mod`→`cross_attention_adaln`,
+   `gated_attn`→`apply_gated_attention`, `rope_theta`→
+   `positional_embedding_theta`, `cross_attn_timestep_scale_multiplier`→
+   `av_ca_timestep_scale_multiplier`, `pos_embed_max_pos`+base_*→
+   `positional_embedding_max_pos`, connector heads from main heads), and
+   forces flags from weight shapes (9-row `scale_shift_table`→adaln,
+   connector `to_gate_logits`→`connector_apply_gated_attention`, no
+   `caption_projection.*`+connectors→`caption_proj_before_connector=True` +
+   identity projections for the 6144-dim pre-projected context). GGUFs also
+   store `keyframes_abs_pos_embedding` 1-D; the loader reshapes to `[1, dim]`.
+
+Correct workflow wiring: `Dual CLIP Loader (GGUF)` clip1=`gemma4-12b-ltx-2.5-
+Q6_K.gguf`, clip2=`ltx-v2-projections.safetensors`, type=`ltxv`; VAEs via the
+stock VAE Loader (`ltx-2.5-video-vae-bf16`, `ltx-2.5-audio-vae-bf16`). The
+portable copies of all sidecars are already in place.
+
 ## What the original ScenemaAudio nodes did that we ported
 
 XML `<speak>` prompt compiler (voice/gender/scene/language/shot attrs, action/
