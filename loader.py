@@ -261,6 +261,12 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             if len(shape) == 1:
                 shape = torch.Size((1, shape[0]))
 
+        # LTX-2: keyframes_abs_pos_embedding is a [1, dim] parameter that
+        # quantizers drop the batch axis from; restore it or load_state_dict
+        # rejects the tensor with a size mismatch.
+        if arch_str in {"ltxv", "ltx2"} and sd_key.endswith("keyframes_abs_pos_embedding") and len(shape) == 1:
+            shape = torch.Size((1, shape[0]))
+
         # add to state dict
         if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
             torch_tensor = torch_tensor.view(*shape)
@@ -697,6 +703,75 @@ def gguf_gemma3_tokenizer_loader(path):
         pass  # read-only model dir -> just don't cache
     return torch.ByteTensor(list(data))
 
+def gguf_gemma4_tokenizer_loader(path):
+    """The HF tokenizer.json document for a Gemma-4 text encoder GGUF.
+
+    Comfy's Gemma-4 tokenizers consume the full `tokenizers`-library JSON
+    (BPE vocab + merges, pretokenizer, added tokens). GGUF has no field for
+    that document and it cannot be rebuilt from the sentencepiece-style
+    metadata the way Gemma-3's can, so it rides in a sidecar file next to the
+    GGUF: `<gguf name>.tokenizer.json` (e.g. extracted from the matching
+    comfy safetensors' `tokenizer_json` entry, or the model's HF repo).
+    """
+    import json
+    sidecar = path + ".tokenizer.json"
+    if not os.path.isfile(sidecar):
+        raise ValueError(
+            f"'{os.path.basename(path)}' is a Gemma-4 text encoder: its "
+            "tokenizer needs the HF tokenizer.json, which the GGUF format "
+            "cannot carry. Put it next to the GGUF as "
+            f"'{os.path.basename(path)}.tokenizer.json' — extract the "
+            "'tokenizer_json' entry from the matching comfy safetensors "
+            "checkpoint, or download tokenizer.json from the model's HF repo."
+        )
+    with open(sidecar, "rb") as f:
+        data = f.read()
+    doc = json.loads(data.decode("utf-8"))
+    vocab = len(doc.get("model", {}).get("vocab", {}))
+    reader = gguf.GGUFReader(path)
+    gguf_tokens = len(get_list_field(reader, "tokenizer.ggml.tokens", str))
+    del reader
+    if vocab != gguf_tokens:
+        raise ValueError(
+            f"The tokenizer sidecar {os.path.basename(sidecar)} has {vocab} "
+            f"vocab entries but the GGUF has {gguf_tokens} tokens — it belongs "
+            "to a different model and would silently mistokenize every prompt."
+        )
+    logging.info("Using Gemma-4 tokenizer sidecar: %s (%d tokens)",
+                 sidecar, vocab)
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+
+def _merge_gemma4_fixups(path, sd):
+    """Merge tiny non-quantizable buffers from `<gguf>.fixup.safetensors`.
+
+    Gemma-4 multiplies every block output by a per-layer learned scalar held
+    in a `torch.empty` buffer (comfy/text_encoders/gemma4.py). Quantizers drop
+    these 1-element tensors because they are not 2-D weights, and comfy only
+    logs 'clip missing' — the model then runs on uninitialized garbage. The
+    sidecar carries them (comfy-layout keys; extract from the source
+    checkpoint), and a missing scalar without a sidecar is a hard error.
+    """
+    sidecar = path + ".fixup.safetensors"
+    if os.path.isfile(sidecar):
+        import safetensors.torch
+        fix = safetensors.torch.load_file(sidecar)
+        merged = [k for k in fix if k not in sd]
+        for k in merged:
+            sd[k] = fix[k].float()
+        logging.info("Merged %d missing Gemma-4 tensors from %s", len(merged), sidecar)
+    missing = sum(1 for k in sd if k.endswith(".layer_scalar"))
+    if missing == 0:
+        raise ValueError(
+            f"'{os.path.basename(path)}' carries no model.layers.*.layer_scalar "
+            "tensors. Gemma-4 scales every block output by these learned "
+            "per-layer constants; without them the text encoder runs on "
+            "uninitialized memory and every prompt becomes garbage. Extract "
+            "them from the matching comfy safetensors checkpoint into "
+            f"'{os.path.basename(path)}.fixup.safetensors' (keys "
+            "model.layers.N.layer_scalar)."
+        )
+    return sd
+
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
@@ -720,14 +795,21 @@ def gguf_clip_loader(path):
             if arch in {"llama", "mistral3"} and sd[temb_key].shape in {(131072, 5120), (131072, 3072)}:
                 # non-standard Comfy-Org tokenizer
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
-            elif arch in {"gemma3", "gemma4", "gemma4_unified"}:
+            elif arch == "gemma3":
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
             # See note above for T5.
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         if arch in {"gemma3", "gemma4", "gemma4_unified"}:
+            if arch != "gemma3" and "tokenizer_json" not in sd:
+                # Gemma-4: comfy's tokenizer needs the HF tokenizer.json (see
+                # gguf_gemma4_tokenizer_loader); without it SDTokenizer falls
+                # back to a path string and crashes on .decode().
+                sd["tokenizer_json"] = gguf_gemma4_tokenizer_loader(path)
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
+            if arch != "gemma3":
+                sd = _merge_gemma4_fixups(path, sd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch in {"llama", "mistral3", "qwen2"}:
