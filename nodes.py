@@ -1,5 +1,6 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import os
+import re
 import torch
 import logging
 import inspect
@@ -173,6 +174,60 @@ def _translate_ltx_transformer_cfg(t):
         out["audio_connector_attention_head_dim"] = out["audio_attention_head_dim"]
     return out
 
+# Tokens that say nothing about which checkpoint a sidecar belongs to, so
+# they must not be what makes a folder-level sidecar look like a match.
+_SIDECAR_GENERIC_TOKENS = frozenset((
+    "metadata", "config", "model", "models", "transformer", "dit", "unet",
+    "diffusion", "weights", "fp8", "fp16", "bf16", "f16", "f32", "int8",
+    "gguf", "safetensors", "k", "m", "s", "l", "xl", "0", "1",
+))
+
+
+def _name_tokens(stem):
+    """Distinctive lowercase tokens of a filename stem, quant tags dropped."""
+    parts = re.split(r"[^0-9a-zA-Z]+", stem.lower())
+    tokens = set()
+    for part in parts:
+        if not part or part in _SIDECAR_GENERIC_TOKENS:
+            continue
+        if re.fullmatch(r"q\d(_[km])?", part):  # q6, q4_k, q8 ...
+            continue
+        if len(part) < 3 and part.isdigit():  # version fragments: "2", "5"
+            continue
+        tokens.add(part)
+    return tokens
+
+
+def _sidecar_claims(sidecar_path, unet_path):
+    """Does a folder-level sidecar actually belong to this checkpoint?
+
+    A sidecar may say so outright with an ``applies_to`` list of filename
+    globs. Failing that, fall back to sharing a distinctive filename token —
+    ``ltx-2.5-transformer-metadata.json`` claims
+    ``ltx-2.5-22b-distilled-transformer-Q6_K.gguf`` but not
+    ``minimax_h3_ref2va_turbo_Q6_K.gguf``. Sidecars whose own name carries no
+    distinctive token (a bare ``metadata.json``) are taken at face value,
+    since there is nothing to check them against.
+    """
+    import fnmatch
+    import json
+    unet_name = os.path.basename(unet_path)
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            patterns = json.load(f).get("applies_to")
+    except (OSError, ValueError):
+        patterns = None
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if isinstance(patterns, (list, tuple)) and patterns:
+        return any(fnmatch.fnmatch(unet_name.lower(), str(p).lower()) for p in patterns)
+
+    sidecar_tokens = _name_tokens(os.path.splitext(os.path.basename(sidecar_path))[0])
+    if not sidecar_tokens:
+        return True
+    return bool(sidecar_tokens & _name_tokens(os.path.splitext(unet_name)[0]))
+
+
 def _unet_metadata_sidecar(unet_path, extra_metadata, sd=None):
     """Merge a transformer-config JSON sidecar into the GGUF metadata.
 
@@ -181,6 +236,12 @@ def _unet_metadata_sidecar(unet_path, extra_metadata, sd=None):
     cannot. Without it, detection builds the wrong architecture variant
     (LTX-2 tables instead of LTX-2.5's 9-parameter adaln) and every
     scale_shift_table copy fails with a size mismatch.
+
+    A sidecar named after the checkpoint is taken as-is. A folder-level one
+    has to earn it: ``models/diffusion_models`` is a shared drawer, and a
+    config merged onto the wrong GGUF builds a plausible-looking model with
+    the wrong block count and head geometry, which then dies deep in the
+    forward rather than at load.
     """
     import json
     candidates = [unet_path + s for s in ("-metadata.json", ".metadata.json")
@@ -189,17 +250,23 @@ def _unet_metadata_sidecar(unet_path, extra_metadata, sd=None):
         folder = os.path.dirname(unet_path)
         folder_hits = [os.path.join(folder, f) for f in os.listdir(folder)
                        if "metadata" in f.lower() and f.lower().endswith(".json")]
-        # Use a folder-level sidecar only when it is unambiguous.
-        if len(folder_hits) == 1:
-            candidates = folder_hits
-        elif len(folder_hits) > 1:
+        claimed = [f for f in folder_hits if _sidecar_claims(f, unet_path)]
+        # Use a folder-level sidecar only when exactly one claims this file.
+        if len(claimed) == 1:
+            candidates = claimed
+        elif len(claimed) > 1:
             logging.warning(
-                "Found %d metadata sidecars next to %s; none named after it, "
-                "skipping them all.", len(folder_hits), os.path.basename(unet_path))
+                "Found %d metadata sidecars claiming %s; none named after it, "
+                "skipping them all.", len(claimed), os.path.basename(unet_path))
+        elif folder_hits:
+            logging.debug(
+                "Ignoring %d metadata sidecar(s) next to %s: none name it or "
+                "list it in applies_to.", len(folder_hits), os.path.basename(unet_path))
     metadata = dict(extra_metadata)
     for cand in candidates:
         with open(cand, "r", encoding="utf-8") as f:
             sidecar = json.load(f)
+        sidecar.pop("applies_to", None)
         config = sidecar.get("config")
         if isinstance(config, str):
             config = json.loads(config)

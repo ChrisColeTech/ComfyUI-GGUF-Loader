@@ -115,7 +115,7 @@ video+audio VAE decode) works. Three sidecar bridges make the GGUFs loadable:
    Extract from the source checkpoint's `model.layers.N.layer_scalar` (BF16
    [1]).
 3. **DiT config sidecar** — `UnetLoaderGGUF` merges `<gguf>-metadata.json` /
-   a sole `*metadata*.json` sibling into the metadata, translates LTX's key
+   a *claiming* `*metadata*.json` sibling into the metadata, translates LTX's key
    names to comfy kwargs (`cross_attn_mod`→`cross_attention_adaln`,
    `gated_attn`→`apply_gated_attention`, `rope_theta`→
    `positional_embedding_theta`, `cross_attn_timestep_scale_multiplier`→
@@ -131,6 +131,17 @@ Correct workflow wiring: `Dual CLIP Loader (GGUF)` clip1=`gemma4-12b-ltx-2.5-
 Q6_K.gguf`, clip2=`ltx-v2-projections.safetensors`, type=`ltxv`; VAEs via the
 stock VAE Loader (`ltx-2.5-video-vae-bf16`, `ltx-2.5-audio-vae-bf16`). The
 portable copies of all sidecars are already in place.
+
+`models/diffusion_models` is a shared drawer, so a folder-level sidecar only
+applies to a GGUF that it *claims*: either the sidecar lists matching filename
+globs in `applies_to` (our shipped one carries `["ltx-2.5-*"]`), or its own
+name shares a distinctive token with the GGUF's (quant tags and words like
+`transformer`/`dit`/`model` do not count). A sidecar named exactly after the
+GGUF always wins; a nameless `metadata.json` is still trusted since there is
+nothing to check it against. Before this rule the sole LTX sidecar was merged
+onto every other GGUF in the folder — MiniMax H3 built with 48 blocks instead
+of 50 and the wrong attention geometry, loading fine and then failing in
+`token_refiner` with `too many values to unpack (expected 3)`.
 
 The latent comes from `LTXV25EmptyLatentAVBatch` (`nodes_ltx25.py`, category
 `🤖 CCTech/LTX-2.5`). It exists because the MiniMax H3 empty-AV node

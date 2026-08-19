@@ -184,3 +184,84 @@ def test_unet_metadata_sidecar_string_config_is_parsed(tmp_path):
     assert "config" in metadata
     t = json.loads(metadata["config"])["transformer"]
     assert "cross_attention_adaln" in t  # translated, not raw LTX names
+
+
+# --- sidecar ownership -------------------------------------------------------
+# models/diffusion_models is a shared drawer. A folder-level sidecar merged onto
+# the wrong GGUF builds a model with the wrong block count and head geometry,
+# which survives loading and then dies inside attention.
+
+def _sidecar_folder(tmp_path, sidecar_name, gguf_names, body=None):
+    folder = tmp_path / "diffusion_models"
+    folder.mkdir()
+    (folder / sidecar_name).write_text(
+        json.dumps(body if body is not None else {"config": {"transformer": {"gated_attn": True}}}),
+        encoding="utf-8")
+    for name in gguf_names:
+        (folder / name).write_bytes(b"")
+    return folder
+
+
+def test_folder_sidecar_applies_to_its_own_family(tmp_path):
+    folder = _sidecar_folder(tmp_path, "ltx-2.5-transformer-metadata.json",
+                             ["ltx-2.5-22b-distilled-transformer-Q6_K.gguf"])
+    meta = nodes_mod._unet_metadata_sidecar(
+        str(folder / "ltx-2.5-22b-distilled-transformer-Q6_K.gguf"), {})
+    assert "config" in meta
+
+
+def test_folder_sidecar_does_not_leak_onto_an_unrelated_gguf(tmp_path):
+    """The v1.4.4 regression: the LTX sidecar was merged onto a MiniMax H3 DiT."""
+    folder = _sidecar_folder(tmp_path, "ltx-2.5-transformer-metadata.json",
+                             ["minimax_h3_ref2va_turbo_Q6_K.gguf"])
+    meta = nodes_mod._unet_metadata_sidecar(
+        str(folder / "minimax_h3_ref2va_turbo_Q6_K.gguf"), {})
+    assert "config" not in meta
+
+
+def test_applies_to_globs_win_over_the_name_heuristic(tmp_path):
+    folder = _sidecar_folder(
+        tmp_path, "shared-metadata.json", ["someones_dit_Q6_K.gguf"],
+        body={"applies_to": ["someones_*"], "config": {"transformer": {}}})
+    assert "config" in nodes_mod._unet_metadata_sidecar(
+        str(folder / "someones_dit_Q6_K.gguf"), {})
+
+
+def test_applies_to_excludes_everything_it_does_not_list(tmp_path):
+    folder = _sidecar_folder(
+        tmp_path, "shared-metadata.json", ["other_dit_Q6_K.gguf"],
+        body={"applies_to": ["someones_*"], "config": {"transformer": {}}})
+    assert "config" not in nodes_mod._unet_metadata_sidecar(
+        str(folder / "other_dit_Q6_K.gguf"), {})
+
+
+def test_applies_to_is_not_merged_into_the_model_metadata(tmp_path):
+    folder = _sidecar_folder(
+        tmp_path, "ltx-2.5-transformer-metadata.json",
+        ["ltx-2.5-22b-Q6_K.gguf"],
+        body={"applies_to": ["ltx-2.5-*"], "config": {"transformer": {}}})
+    meta = nodes_mod._unet_metadata_sidecar(str(folder / "ltx-2.5-22b-Q6_K.gguf"), {})
+    assert "applies_to" not in meta
+
+
+def test_a_sidecar_named_after_the_gguf_still_wins_outright(tmp_path):
+    folder = _sidecar_folder(tmp_path, "ltx-2.5-transformer-metadata.json",
+                             ["minimax_h3_ref2va_turbo_Q6_K.gguf"])
+    unet = folder / "minimax_h3_ref2va_turbo_Q6_K.gguf"
+    (folder / (unet.name + "-metadata.json")).write_text(
+        json.dumps({"config": {"transformer": {}}}), encoding="utf-8")
+    assert "config" in nodes_mod._unet_metadata_sidecar(str(unet), {})
+
+
+def test_generic_metadata_json_is_still_taken_at_face_value(tmp_path):
+    """Nothing in a bare `metadata.json` name to check against, so trust it."""
+    folder = _sidecar_folder(tmp_path, "metadata.json", ["anything_Q6_K.gguf"])
+    assert "config" in nodes_mod._unet_metadata_sidecar(
+        str(folder / "anything_Q6_K.gguf"), {})
+
+
+def test_quant_tags_alone_do_not_make_a_match(tmp_path):
+    folder = _sidecar_folder(tmp_path, "krea2-Q6_K-metadata.json",
+                             ["qwen-image-edit-Q6_K.gguf"])
+    assert "config" not in nodes_mod._unet_metadata_sidecar(
+        str(folder / "qwen-image-edit-Q6_K.gguf"), {})
