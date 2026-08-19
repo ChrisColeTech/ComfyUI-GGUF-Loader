@@ -141,6 +141,112 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             n.size = 0 # force recalc
         return n
 
+_LTX_TRANSFORMER_KEY_MAP = {
+    # LTX's own transformer-config names -> comfy LTXV/LTXAV kwargs. The raw
+    # names land in **kwargs and are silently ignored, which builds the wrong
+    # architecture variant (6-param adaln instead of LTX-2.5's 9).
+    "cross_attn_mod": "cross_attention_adaln",
+    "gated_attn": "apply_gated_attention",
+    "rope_theta": "positional_embedding_theta",
+    "cross_attn_timestep_scale_multiplier": "av_ca_timestep_scale_multiplier",
+}
+
+def _translate_ltx_transformer_cfg(t):
+    out = dict(t)
+    for src, dst in _LTX_TRANSFORMER_KEY_MAP.items():
+        if src in out:
+            out[dst] = out.pop(src)
+    out.pop("audio_cross_attn_mod", None)  # one flag drives both streams
+    if "pos_embed_max_pos" in out:
+        v = out.pop("pos_embed_max_pos")
+        out["positional_embedding_max_pos"] = [
+            v, out.pop("base_height", 2048), out.pop("base_width", 2048)]
+    if "audio_pos_embed_max_pos" in out:
+        out["audio_positional_embedding_max_pos"] = [out.pop("audio_pos_embed_max_pos")]
+    # LTX derives the connector width from the main attention geometry
+    # (defaults 30 heads x 128 = 3840; LTX-2.5 is 32 x 128 = 4096).
+    if "num_attention_heads" in out and "connector_num_attention_heads" not in out:
+        out["connector_num_attention_heads"] = out["num_attention_heads"]
+    if "audio_num_attention_heads" in out and "audio_connector_num_attention_heads" not in out:
+        out["audio_connector_num_attention_heads"] = out["audio_num_attention_heads"]
+    if "audio_attention_head_dim" in out and "audio_connector_attention_head_dim" not in out:
+        out["audio_connector_attention_head_dim"] = out["audio_attention_head_dim"]
+    return out
+
+def _unet_metadata_sidecar(unet_path, extra_metadata, sd=None):
+    """Merge a transformer-config JSON sidecar into the GGUF metadata.
+
+    Split checkpoints (e.g. LTX-2.5) ship the model config as a JSON sidecar
+    next to the weights — safetensors carries it in file metadata, GGUF
+    cannot. Without it, detection builds the wrong architecture variant
+    (LTX-2 tables instead of LTX-2.5's 9-parameter adaln) and every
+    scale_shift_table copy fails with a size mismatch.
+    """
+    import json
+    candidates = [unet_path + s for s in ("-metadata.json", ".metadata.json")
+                  if os.path.isfile(unet_path + s)]
+    if not candidates:
+        folder = os.path.dirname(unet_path)
+        folder_hits = [os.path.join(folder, f) for f in os.listdir(folder)
+                       if "metadata" in f.lower() and f.lower().endswith(".json")]
+        # Use a folder-level sidecar only when it is unambiguous.
+        if len(folder_hits) == 1:
+            candidates = folder_hits
+        elif len(folder_hits) > 1:
+            logging.warning(
+                "Found %d metadata sidecars next to %s; none named after it, "
+                "skipping them all.", len(folder_hits), os.path.basename(unet_path))
+    metadata = dict(extra_metadata)
+    for cand in candidates:
+        with open(cand, "r", encoding="utf-8") as f:
+            sidecar = json.load(f)
+        config = sidecar.get("config")
+        if isinstance(config, str):
+            config = json.loads(config)
+        if isinstance(config, dict):
+            config = dict(config)
+            if "transformer" in config and isinstance(config["transformer"], dict):
+                config["transformer"] = _translate_ltx_transformer_cfg(config["transformer"])
+            sidecar["config"] = json.dumps(config)
+        sidecar.pop("notes", None)
+        metadata.update(sidecar)
+        logging.info("Using UNet metadata sidecar: %s", cand)
+
+    # Ground truth from the weights themselves: a 9-row scale_shift_table is
+    # the LTX-2/2.5 cross-attn-adaln layout, whatever the config called it.
+    if sd is not None and "config" in metadata:
+        table = sd.get("transformer_blocks.0.scale_shift_table")
+        force = {}
+        if table is not None and getattr(table, "shape", None) is not None:
+            if len(table.shape) >= 1 and table.shape[0] == 9:
+                force["cross_attention_adaln"] = True
+        # connectors with to_gate_logits tensors are gated-attention connectors;
+        # built without the flag, the gate weights load as "unexpected" and are
+        # silently dropped.
+        gate = "video_embeddings_connector.transformer_1d_blocks.0.attn1.to_gate_logits.weight"
+        if sd.get(gate) is not None:
+            force["connector_apply_gated_attention"] = True
+        # A checkpoint with embeddings connectors but no caption_projection
+        # weights consumes pre-projected context (the caption projection lives
+        # in the text encoder, e.g. ltx-v2-projections): split by the connector
+        # dims and make the absent projections identities instead of missing
+        # weights. Otherwise the forward splits by caption_channels and dies
+        # on a 6144-dim context.
+        if (not force.get("caption_proj_before_connector")
+                and "video_embeddings_connector.transformer_1d_blocks.0.attn1.to_q.weight" in sd
+                and not any(k.startswith("caption_projection.") for k in sd)):
+            force["caption_proj_before_connector"] = True
+            force["caption_projection_first_linear"] = False
+        if force:
+            config = json.loads(metadata["config"])
+            transformer = config.setdefault("transformer", {})
+            changed = [k for k, v in force.items() if not transformer.get(k)]
+            transformer.update({k: v for k, v in force.items() if not transformer.get(k)})
+            metadata["config"] = json.dumps(config)
+            if changed:
+                logging.info("LTX: forced %s from the weights", ", ".join(changed))
+    return metadata
+
 class UnetLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
@@ -180,7 +286,8 @@ class UnetLoaderGGUF:
         kwargs = {}
         valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
         if "metadata" in valid_params:
-            kwargs["metadata"] = extra.get("metadata", {})
+            kwargs["metadata"] = _unet_metadata_sidecar(
+                unet_path, extra.get("metadata", {}), sd)
 
         model = comfy.sd.load_diffusion_model_state_dict(
             sd, model_options={"custom_operations": ops}, **kwargs,
