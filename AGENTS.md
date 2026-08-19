@@ -350,3 +350,29 @@ A node-level test (registering folder_paths manually) lives at
 `C:\Users\RISKYB~1\AppData\Local\Temp\opencode\node_test.py` — temp, not in repo.
 Note: the dev box's Python env intermittently access-violates (0xC0000005) in
 native code during model builds; rerun before assuming code is broken.
+
+## Dev-box memory corruption (expanded 2026-08-19)
+
+The instability above is broader than a plain access violation and can surface
+*inside Python objects*, not just as a process crash. Observed from repeated runs
+of one unchanged script in the portable env:
+
+- `0xC0000409` STATUS_STACK_BUFFER_OVERRUN (fail-fast)
+- `0xC0000005` access violation / bare segfault before any stdout
+- `TypeError: 'cell' object is not subscriptable` raised inside torch's own
+  `import` (`torch/_decomp/__init__.py`, a module-level dict had become a cell)
+- `AttributeError: 'BasicAVTransformerBlock' object has no attribute '__dict__'`
+  from `nn.Module.__getattr__` — i.e. an instance whose dict pointer was gone
+
+That last one was reported as a loader bug (`_load_list` →
+`check_module_offload_mem` → `get_key_weight` → `comfy.utils.get_attr`). It is
+not: `BasicAVTransformerBlock` has no `__slots__`, and a freshly built LTX-2.5
+model scans clean (0 modules missing `__dict__`, 0 dotted submodule names across
+all 2382 loadable modules), with `_load_list` and a full `load_models_gpu` both
+passing under the live server's exact config (no CLI flags). Bare `import torch`
+is 6/6 clean and RAM is not exhausted (~108 GB free).
+
+Rule of thumb: an error that is *structurally impossible* for the object
+involved (missing `__dict__`, a dict that became a cell, a type that changed
+identity) is corruption, not logic. Rerun; if it does not reproduce with a
+deterministic replication of the same code path, stop hunting in the pack.
