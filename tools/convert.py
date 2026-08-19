@@ -150,6 +150,16 @@ class ModelZImage(ModelTemplate):
             "all_x_embedder.2-1.weight",
             "cap_embedder.1.weight",
         ),
+        # Single-resolution repack (no all_*/2-1 buckets). Shares the Lumina-2
+        # code path in ComfyUI, so the pad tokens are what separate it from a
+        # real lumina2 checkpoint — see model_detection.py's dim==3840 branch.
+        (
+            "cap_pad_token",
+            "x_pad_token",
+            "cap_embedder.1.weight",
+            "noise_refiner.0.attention.k_norm.weight",
+            "final_layer.adaLN_modulation.1.weight",
+        ),
     ]
     keys_hiprec = [
         "adaLN_modulation",  # nn.parameter / modulation tables
