@@ -772,6 +772,43 @@ def _merge_gemma4_fixups(path, sd):
         )
     return sd
 
+# Non-tensor payloads smuggled through the state dict by the loaders above.
+# They are looked up by exact name later, so they must not be prefixed.
+_SD_SIDECAR_KEYS = {"spiece_model", "tokenizer_json", "tekken_model"}
+
+
+def _add_hf_model_prefix(sd, arch):
+    """Restore the `model.` prefix on an already-HF-named text encoder.
+
+    LLAMA_SD_MAP translates GGUF-native names (`blk.0.attn_q.weight`) into HF
+    ones, and the prefix rides along in those mappings. A GGUF that was written
+    with HF names to begin with matches none of them, so it arrives as
+    `layers.0.self_attn.q_proj.weight` with no prefix at all.
+
+    comfy's detect_te_model() probes exact keys like
+    `model.layers.0.post_attention_layernorm.weight`; missing the prefix it
+    returns None, and load_text_encoder_state_dicts then falls back to an SD1
+    CLIP. That failure is silent and lands far away: the text encoder loads,
+    conditioning comes out 77x768, and the DiT raises a normalized_shape error
+    inside its caption embedder.
+
+    Only fires when nothing is prefixed yet and the layer stack is visible, so
+    a correctly-named checkpoint passes through untouched.
+    """
+    if arch not in {"llama", "qwen2", "qwen2vl", "qwen3", "qwen35", "qwen3vl",
+                    "gemma3", "gemma4", "gemma4_unified", "mistral3"}:
+        return sd
+    if any(k.startswith("model.") for k in sd):
+        return sd
+    if not any(k.startswith("layers.") for k in sd):
+        return sd
+    logging.info("Text encoder keys lack the 'model.' prefix; restoring it for detection.")
+    return {
+        k if (k in _SD_SIDECAR_KEYS or k.startswith("visual.")) else f"model.{k}": v
+        for k, v in sd.items()
+    }
+
+
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
@@ -812,6 +849,7 @@ def gguf_clip_loader(path):
                 sd = _merge_gemma4_fixups(path, sd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
+        sd = _add_hf_model_prefix(sd, arch)
         if arch in {"llama", "mistral3", "qwen2"}:
             # L3 / Mistral / qwen2-compat. Head counts come from the file: the
             # 32/8 that fits L3-8B silently corrupts anything shaped otherwise.
