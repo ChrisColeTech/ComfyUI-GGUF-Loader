@@ -132,6 +132,17 @@ Q6_K.gguf`, clip2=`ltx-v2-projections.safetensors`, type=`ltxv`; VAEs via the
 stock VAE Loader (`ltx-2.5-video-vae-bf16`, `ltx-2.5-audio-vae-bf16`). The
 portable copies of all sidecars are already in place.
 
+The latent comes from `LTXV25EmptyLatentAVBatch` (`nodes_ltx25.py`, category
+`🤖 CCTech/LTX-2.5`). It exists because the MiniMax H3 empty-AV node
+produces the same nested-tensor *type* and so wires up cleanly, then dies in
+`patchify_proj` — H3 is video `[B,24,T,H/16,W/16]` + audio `[B,32,2,T*40]`,
+LTX-2.5 is video `[B,128,(len-1)//8+1,H/32,W/32]` + audio
+`[B,z,n_latents,bins]`. The audio side is read off the audio VAE
+(`first_stage_model.num_of_latents_from_frames` / `.latent_frequency_bins`,
+25 latents/s on the shipped VAE) rather than hardcoded, and a video VAE in the
+audio slot is rejected with a named error. Unlike H3 the LTX-2.5 DiT is
+batch-aware, so `batch_size > 1` needs no patch node.
+
 ## What the original ScenemaAudio nodes did that we ported
 
 XML `<speak>` prompt compiler (voice/gender/scene/language/shot attrs, action/

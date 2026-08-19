@@ -101,7 +101,7 @@ def _import_nodes_module():
             package.__path__ = [str(ROOT)]
             sys.modules[_PKG] = package
         for name in ("nodes_extra", "nodes_scenema", "nodes_minimax_music",
-                     "nodes_stems", "nodes_minimax_h3"):
+                     "nodes_stems", "nodes_minimax_h3", "nodes_ltx25"):
             full = f"{_PKG}.{name}"
             if full not in sys.modules:
                 stub = types.ModuleType(full)
