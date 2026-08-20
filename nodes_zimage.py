@@ -132,6 +132,10 @@ class ZImageImg2Img:
                 "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01,
                                        "tooltip": "How much of the init image to discard. "
                                                   "0.6 keeps the composition; 1.0 ignores it."}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096,
+                                       "tooltip": "Variations of the same init image. The "
+                                                  "encoded latent is tiled; KSampler draws "
+                                                  "different noise per batch item."}),
             },
             "optional": {
                 # 0 keeps the input image's size. Z-Image is 1024-native.
@@ -141,7 +145,7 @@ class ZImageImg2Img:
         }
 
     def prepare(self, clip, vae, image, prompt, negative_prompt, strength,
-                width=0, height=0):
+                batch_size=1, width=0, height=0):
         te = _te_name(clip)
         if _EXPECTED_TE not in te:
             raise ValueError(
@@ -156,6 +160,12 @@ class ZImageImg2Img:
                 image.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
 
         latent = vae.encode(image[:, :, :, :3])
+        if batch_size > 1:
+            # Tile, matching RepeatLatentBatch. The latent is identical across
+            # the batch; the variation comes from KSampler drawing separate
+            # noise per item.
+            latent = latent.repeat(batch_size, *([1] * (latent.dim() - 1)))
+
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
 
