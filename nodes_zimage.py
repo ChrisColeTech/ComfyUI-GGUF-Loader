@@ -108,7 +108,7 @@ def _apply_control_patch(model, model_patch, vae, image, strength):
 
 
 class ZImageStrengthSigmas:
-    TITLE = "Z-Image Strength → Sigmas (🤖 CCTech/GGUF)"
+    TITLE = "Z-Image Strength → Sigmas ⚡"
     CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("SIGMAS",)
     FUNCTION = "get_sigmas"
@@ -129,7 +129,7 @@ class ZImageStrengthSigmas:
 
 
 class ZImageImg2Img:
-    TITLE = "Z-Image img2img (🤖 CCTech/GGUF)"
+    TITLE = "Z-Image img2img ⚡"
     CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("IMAGE", "LATENT")
     RETURN_NAMES = ("image", "latent")
