@@ -31,6 +31,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Sibling of the other suite roots (see nodes_ltx25.py): the emoji prefix is
+# what groups them together in the node menu.
+ZIMAGE_CATEGORY = "🤖 CCTech/Z-Image"
+
 # The encoder Z-Image was trained against: a text-only Qwen3-4B, read at
 # layer_idx=-2 (comfy/text_encoders/z_image.py). Qwen-Image's Qwen3-VL encoder
 # is also 2560-wide and loads happily, which is what makes the mistake silent.
@@ -105,7 +109,7 @@ def _apply_control_patch(model, model_patch, vae, image, strength):
 
 class ZImageStrengthSigmas:
     TITLE = "Z-Image Strength → Sigmas (🤖 CCTech/GGUF)"
-    CATEGORY = "CCTech/GGUF/z-image"
+    CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("SIGMAS",)
     FUNCTION = "get_sigmas"
     DESCRIPTION = ("Sigma schedule for a diffusers-style img2img `strength`. "
@@ -126,7 +130,7 @@ class ZImageStrengthSigmas:
 
 class ZImageImg2Img:
     TITLE = "Z-Image img2img (🤖 CCTech/GGUF)"
-    CATEGORY = "CCTech/GGUF/z-image"
+    CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("IMAGE", "LATENT")
     RETURN_NAMES = ("image", "latent")
     FUNCTION = "generate"
