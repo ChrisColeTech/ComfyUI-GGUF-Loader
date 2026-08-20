@@ -109,6 +109,24 @@ Generate keeps the original node's behaviour: the `<speak>` XML prompt compiler 
 
 A CPU smoke test for the load paths lives at `tools/smoke_scenema.py`.
 
+### LTX-2.3 A/V
+
+For LTX-2.3-family A/V checkpoints split into components — built for the 10Eros v1.4 distilled kit (distill LoRA pre-fused offline), works for any split with the same layout. One loader builds the whole stack on ComfyUI's native LTX-AV machinery:
+
+| File | Folder |
+|---|---|
+| `10Eros_v1.4_distilled-r72_Q4_K_M/Q6_K/Q8_0.gguf` or `..._fp8mixed.safetensors` | `models/diffusion_models` (unet) |
+| `gemma-3-12b-*-Q4_K_M.gguf` (or a Gemma-3 12B safetensors) | `models/text_encoders` |
+| `10Eros_v1.4_projections.safetensors` (text_embedding_projection) | `models/text_encoders` |
+| `10Eros_v1.4_video_vae.safetensors` | `models/vae` |
+| `10Eros_v1.4_audio_vae.safetensors` | `models/vae` |
+
+The GGUF DiTs carry their transformer config as a GGUF KV — no metadata sidecar to lose — so comfy builds the real LTX-2.3 geometry (48 layers, 9-row modulation tables, 4096/2048 embeddings connectors) instead of guessing the older LTX-2 layout. GGUF and fp8 weights stay quantized; the loader outputs plain comfy **MODEL / CLIP / VAE** plus the audio VAE, so everything composes with core nodes.
+
+Sampling: `CLIPTextEncode` → **LTX-2.3 KSampler (distilled)** driven by **Empty LTX-2.3 AV Latent** — it passes the exact LTX-2 distilled 8-step schedule (cfg 1.0, euler) and stamps `frame_rate` onto the conditioning for RoPE. Split the nested result with core `LTXVSeparateAVLatent`, then `VAE Decode` for video and `LTXVAudioVAEDecode` for audio.
+
+`tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling.
+
 ### MiniMax Music 3
 
 The two-node convenience pipeline composes ComfyUI's native MiniMax Music 3 implementation; no model code is vendored. Download `Comfy-Org/MiniMax-Music-3` and place its split files as follows:
