@@ -124,7 +124,48 @@ def main():
     sigd = ns.distilled_sigma_schedule(8, denoise=0.5)
     # comfy's convention: start_step = steps * (1 - denoise) -> sigma index 4
     assert abs(float(sigd[0]) - 0.975) < 1e-6, float(sigd[0])
-    print("[ok] distilled sigma schedule (8 exact, 16 resampled, denoise slice)")
+    refr = ns.distilled_sigma_schedule(3, sigmas=ns.REFINE_SIGMAS)
+    assert [round(float(x), 4) for x in refr] == [0.85, 0.725, 0.4219, 0.0]
+    print("[ok] distilled sigma schedule (8 exact, 16 resampled, denoise slice, refine)")
+
+    # ── prep node: t2v / i2v / a2v latent + noise masks ──
+    prep = ns.LTXV23ImgToVideo()
+    fake_image = torch.rand(1, 512, 768, 3)
+    sr = 48000
+    fake_audio = {"waveform": torch.randn(1, 2, sr * 5), "sample_rate": sr}
+
+    # t2v: no image, no audio
+    pos, neg, lat, den = prep.prepare(
+        clip, vae, audio_vae2, "a test", "", 768, 512, 121, 24.0, 1)
+    v, a = lat["samples"].unbind()
+    vm, am = lat["noise_mask"].unbind()
+    assert tuple(v.shape) == (1, 128, 16, 16, 24) and tuple(a.shape)[2] == 126
+    assert bool((vm == 1).all()) and bool((am == 1).all())
+    assert den == 1.0
+    assert pos[0][1]["frame_rate"] == 24.0
+
+    # i2v: image held at 0.7 -> first-frame mask 0.3
+    pos, neg, lat, den = prep.prepare(
+        clip, vae, audio_vae2, "a test", "", 768, 512, 121, 24.0, 1,
+        image=fake_image)
+    v, a = lat["samples"].unbind()
+    vm, am = lat["noise_mask"].unbind()
+    assert tuple(v.shape) == (1, 128, 16, 16, 24)
+    assert abs(float(vm[0, 0, 0, 0, 0]) - 0.3) < 1e-6, float(vm[0, 0, 0, 0, 0])
+    assert abs(float(vm[0, 0, 1, 0, 0]) - 1.0) < 1e-6
+    assert not bool((v[0, :, 0] == 0).all()), "first frame should be encoded image"
+
+    # a2v: 5s of audio @ 24fps -> 121 frames; audio locked (mask 0)
+    pos, neg, lat, den = prep.prepare(
+        clip, vae, audio_vae2, "a test", "", 768, 512, 97, 24.0, 1,
+        reference_audio=fake_audio)
+    v, a = lat["samples"].unbind()
+    vm, am = lat["noise_mask"].unbind()
+    assert tuple(v.shape) == (1, 128, 16, 16, 24), tuple(v.shape)  # 5s*24+1=121
+    assert bool((am == 0).all()), "reference audio must be locked"
+    assert not bool((a == 0).all()), "reference audio latent should be non-zero"
+    print("[ok] prep node: t2v/i2v/a2v latents + noise masks (audio locked, "
+          "image held @0.7)")
 
     print("LTX-2.3 SMOKE TEST PASSED")
 

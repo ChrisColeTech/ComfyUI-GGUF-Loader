@@ -123,7 +123,7 @@ For LTX-2.3-family A/V checkpoints split into components — built for the 10Ero
 
 The GGUF DiTs carry their transformer config as a GGUF KV — no metadata sidecar to lose — so comfy builds the real LTX-2.3 geometry (48 layers, 9-row modulation tables, 4096/2048 embeddings connectors) instead of guessing the older LTX-2 layout. GGUF and fp8 weights stay quantized; the loader outputs plain comfy **MODEL / CLIP / VAE** plus the audio VAE, so everything composes with core nodes.
 
-Sampling: `CLIPTextEncode` → **LTX-2.3 KSampler (distilled)** driven by **Empty LTX-2.3 AV Latent** — it passes the exact LTX-2 distilled 8-step schedule (cfg 1.0, euler) and stamps `frame_rate` onto the conditioning for RoPE. Split the nested result with core `LTXVSeparateAVLatent`, then `VAE Decode` for video and `LTXVAudioVAEDecode` for audio.
+Sampling: `CLIPTextEncode` → **LTX-2.3 Img/Audio to Video** (one prep node: leave both optionals unconnected for txt2video, connect `image` for i2v, connect `reference_audio` for lip-synced audio-to-video — the official IA2V recipe, with the audio encoded and noise-mask-locked and the video length derived from the clip) → **LTX-2.3 KSampler (distilled)**. The sampler passes the exact LTX-2 distilled 8-step schedule (cfg 1.0, euler), stamps `frame_rate` onto the conditioning for RoPE, honors the prep node's noise masks, and offers the official 3-step `refine` schedule for a second pass after a latent ×2 upscale. Split the nested result with core `LTXVSeparateAVLatent`, then `VAE Decode` for video and `LTXVAudioVAEDecode` for audio.
 
 `tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling.
 

@@ -47,6 +47,19 @@ LTX23_CATEGORY = "🤖 CCTech/LTX-2.3"
 DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975,
                     0.909375, 0.725, 0.421875, 0.0]
 
+# Stage-2 refine schedule from the official LTX-2.3 workflows (the pass after
+# the latent x2 spatial upscale): 3 steps, cfg 1.0, euler.
+REFINE_SIGMAS = [0.85, 0.725, 0.4219, 0.0]
+
+SIGMA_SETS = {
+    "distilled (8 steps)": DISTILLED_SIGMAS,
+    "refine (3 steps)": REFINE_SIGMAS,
+}
+
+# Image conditioning strength the official I2V/IA2V workflows use for the
+# first pass (LTXVImgToVideoInplace strength 0.7).
+I2V_STRENGTH = 0.7
+
 FPS = 24.0
 
 _EXPECTED_LAYERS = 48
@@ -64,14 +77,15 @@ def _clip_filename_list():
     return sorted(files)
 
 
-def distilled_sigma_schedule(steps, denoise=1.0):
+def distilled_sigma_schedule(steps, denoise=1.0, sigmas=None):
     """The LTX-2 distilled sigmas, interpolated to ``steps`` steps.
 
     At the trained 8 steps this is exactly the reference schedule; other step
     counts are a linear resample of it (not a re-derived shift schedule).
     ``denoise`` slices the tail, matching how KSampler treats denoise.
     """
-    base = torch.tensor(DISTILLED_SIGMAS, dtype=torch.float32)
+    base = torch.tensor(sigmas if sigmas is not None else DISTILLED_SIGMAS,
+                        dtype=torch.float32)
     steps = max(1, int(steps))
     if steps + 1 == len(base):
         sigmas = base
@@ -90,6 +104,66 @@ def distilled_sigma_schedule(steps, denoise=1.0):
 
 def _set_cond_frame_rate(cond, frame_rate):
     return [[c[0], {**c[1], "frame_rate": frame_rate}] for c in cond]
+
+
+def _fit_audio_latent(audio, mask, target_shape):
+    """Trim or zero-pad the audio latent to ``target_shape`` along time.
+
+    Port of core ``LTXVConcatAVLatent.fit_audio``: a padded tail keeps mask 1
+    so the model generates it, which is what a clip shorter than the video
+    should do.
+    """
+    dim = 2  # [B, C, T, bins] -> time
+    length = target_shape[dim]
+    if audio.shape[dim] > length:
+        audio = audio.narrow(dim, 0, length)
+        if mask is not None:
+            mask = mask.narrow(dim, 0, length)
+    elif audio.shape[dim] < length:
+        pad = torch.zeros(target_shape, device=audio.device, dtype=audio.dtype)
+        pad[:, :, :audio.shape[dim]] = audio
+        audio = pad
+        if mask is not None:
+            pmask = torch.ones_like(pad)
+            pmask[:, :, :mask.shape[dim]] = mask
+            mask = pmask
+    return audio, mask
+
+
+def _encode_reference_audio(audio_vae, audio, duration_s):
+    """Encode an AUDIO reference into a locked audio latent [B, C, T, bins].
+
+    Follows the official IA2V recipe: the encoded audio becomes the audio
+    stream with a ZERO noise mask, so it stays fixed while the DiT generates
+    video (and, on a shorter-than-video clip, a generated tail).
+    """
+    fsm = getattr(audio_vae, "first_stage_model", None)
+    if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
+        raise ValueError(
+            "audio_vae is not an LTX audio VAE; the reference_audio input "
+            "needs the kit's *_audio_vae.safetensors."
+        )
+    waveform = audio["waveform"][0]  # [C, T] - one reference, batched later
+    sr = audio["sample_rate"]
+    max_samples = int(duration_s * sr)
+    if waveform.shape[-1] > max_samples:
+        waveform = waveform[..., :max_samples]
+
+    comfy.model_management.load_models_gpu(
+        [audio_vae.patcher],
+        force_full_load=getattr(audio_vae, "disable_offload", False))
+    latent = fsm.encode(waveform.unsqueeze(0), sample_rate=sr)  # [1,C,T,bins]
+    latent = latent.to(comfy.model_management.intermediate_device()).float()
+    mask = torch.zeros_like(latent)  # 0 = locked: audio drives the video
+    return latent, mask
+
+
+def _align_length(length):
+    """Round a frame count up to the 8k+1 grid the video VAE tiles on."""
+    length = max(9, int(length))
+    while (length - 1) % 8 != 0:
+        length += 1
+    return length
 
 
 # The Gemma-3 12B TE plus projections costs ~24 GB and many seconds to build,
@@ -311,15 +385,195 @@ class LTXV23EmptyLatentAV:
         return (latent,)
 
 
+class LTXV23ImgToVideo:
+    """Prompts + init latent for LTX-2.3: T2V, I2V, A2V and IA2V in one node.
+
+    Everything except the prompt path is optional, mirroring the official
+    workflows' wiring but collapsed into one node:
+
+      * no image, no reference_audio           -> text-to-video
+      * image connected                        -> image-to-video (the encoded
+        first frame is injected with a per-frame noise mask at
+        ``image_strength``, exactly core ``LTXVImgToVideo``'s mechanism)
+      * reference_audio connected              -> audio-to-video: the encoded
+        audio becomes the audio stream with a ZERO noise mask so it stays
+        fixed while the DiT generates matching video (lip sync, Foley). This
+        is the official IA2V recipe.
+      * image + reference_audio                -> image-AUDIO-to-video
+
+    ``length_from_audio`` (default on when audio is connected) sizes the video
+    to the reference clip instead of the ``length`` widget.
+
+    Feed the outputs into the LTX-2.3 KSampler (distilled); split its result
+    with core ``LTXVSeparateAVLatent`` and decode video with ``VAE Decode``,
+    audio with ``LTXVAudioVAEDecode``.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Img/Audio to Video ⚡"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "vae": ("VAE", {"tooltip": "The loader's video_vae output."}),
+                "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 768, "min": 64,
+                                  "max": nodes.MAX_RESOLUTION, "step": 32}),
+                "height": ("INT", {"default": 512, "min": 64,
+                                   "max": nodes.MAX_RESOLUTION, "step": 32}),
+                "length": ("INT", {
+                    "default": 121, "min": 9, "max": nodes.MAX_RESOLUTION,
+                    "step": 8,
+                    "tooltip": "Frame count (8k+1 tiles exactly: 9, 97, "
+                               "121...). Ignored when reference_audio is "
+                               "connected and length_from_audio is on."}),
+                "frame_rate": ("FLOAT", {
+                    "default": FPS, "min": 1.0, "max": 120.0, "step": 0.01,
+                    "tooltip": "24 is the LTX-2 convention. Use the same "
+                               "value on the sampler."}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64}),
+            },
+            "optional": {
+                "image": ("IMAGE", {
+                    "tooltip": "Init image for i2v. Leave unconnected for "
+                               "text-to-video."}),
+                "reference_audio": ("AUDIO", {
+                    "tooltip": "Reference audio for a2v / ia2v (lip sync). "
+                               "Encoded and locked as the audio stream; the "
+                               "video is generated to match it. Leave "
+                               "unconnected to generate audio from scratch."}),
+                "image_strength": ("FLOAT", {
+                    "default": I2V_STRENGTH, "min": 0.0, "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "i2v only. How much of the init image to keep "
+                               "(noise mask on the first frames). 0.7 is the "
+                               "official workflows' value."}),
+                "length_from_audio": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "With reference_audio: size the video to the "
+                               "clip's duration instead of the length widget."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
+    RETURN_NAMES = ("positive", "negative", "latent", "denoise")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Prompts plus the init AV latent for LTX-2.3: txt2video, "
+                   "img2video, audio2video or image+audio2video, all through "
+                   "the same node. Outputs feed the LTX-2.3 KSampler "
+                   "(distilled).")
+
+    @torch.inference_mode()
+    def prepare(self, clip, vae, audio_vae, prompt, negative_prompt, width,
+                height, length, frame_rate, batch_size, image=None,
+                reference_audio=None, image_strength=I2V_STRENGTH,
+                length_from_audio=True):
+        from .nodes_ltx25 import VIDEO_LATENT_CHANNELS, VIDEO_SPATIAL_RATIO, \
+            VIDEO_TEMPORAL_RATIO
+
+        fsm = getattr(audio_vae, "first_stage_model", None)
+        if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
+            raise ValueError(
+                "audio_vae is not an LTX audio VAE (missing "
+                "num_of_latents_from_frames); use the kit's "
+                "*_audio_vae.safetensors in the audio_vae slot."
+            )
+
+        # ── audio stream ──
+        if reference_audio is not None:
+            seconds = reference_audio["waveform"].shape[-1] / \
+                reference_audio["sample_rate"]
+            if length_from_audio:
+                length = _align_length(seconds * frame_rate + 1)
+                logger.info("LTX-2.3 a2v: %.2fs of audio -> %d frames @ %.2f fps",
+                            seconds, length, frame_rate)
+            audio, audio_mask = _encode_reference_audio(
+                audio_vae, reference_audio, length / frame_rate)
+        else:
+            audio = None
+            audio_mask = None
+
+        # ── video stream (+ first-frame conditioning) ──
+        length = _align_length(length)
+        t_latent = ((length - 1) // VIDEO_TEMPORAL_RATIO) + 1
+        video = torch.zeros(
+            [batch_size, VIDEO_LATENT_CHANNELS, t_latent,
+             height // VIDEO_SPATIAL_RATIO, width // VIDEO_SPATIAL_RATIO],
+            device=comfy.model_management.intermediate_device())
+        video_mask = None
+        if image is not None:
+            # core LTXVImgToVideo's mechanism: encode the (resized) image,
+            # write its latent into the first frames, and hold those frames
+            # via a per-frame noise mask of 1 - strength.
+            pixels = comfy.utils.common_upscale(
+                image.movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)
+            t = vae.encode(pixels[:, :, :, :3])
+            if t.shape[0] < batch_size:
+                t = t.repeat(batch_size, *([1] * (t.dim() - 1)))
+            video[:, :, :t.shape[2]] = t.to(video.device, video.dtype)
+            video_mask = torch.ones_like(video)
+            video_mask[:, :, :t.shape[2]] = 1.0 - image_strength
+
+        # ── audio geometry (empty or fitted reference) ──
+        if audio is None:
+            channels = int(getattr(audio_vae, "latent_channels",
+                                   fsm.latent_channels))
+            n_latents = int(fsm.num_of_latents_from_frames(length, frame_rate))
+            audio = torch.zeros(
+                [batch_size, channels, n_latents, int(fsm.latent_frequency_bins)],
+                device=video.device)
+        else:
+            target = [batch_size] + list(audio.shape[1:])
+            audio, audio_mask = _fit_audio_latent(audio, audio_mask, target)
+            if batch_size > 1:
+                audio = audio.repeat(batch_size, *([1] * (audio.dim() - 1)))
+                audio_mask = (audio_mask.repeat(batch_size, *([1] * (audio_mask.dim() - 1)))
+                              if audio_mask is not None else None)
+            audio = audio.to(video.device)
+
+        if video_mask is None:
+            video_mask = torch.ones_like(video)
+        if audio_mask is None:
+            audio_mask = torch.ones_like(audio)
+
+        latent = {
+            "samples": comfy.nested_tensor.NestedTensor((video, audio)),
+            "noise_mask": comfy.nested_tensor.NestedTensor(
+                (video_mask, audio_mask)),
+            "downscale_ratio_spacial": VIDEO_SPATIAL_RATIO,
+        }
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(
+            clip.tokenize(negative_prompt))
+        positive = _set_cond_frame_rate(positive, frame_rate)
+        negative = _set_cond_frame_rate(negative, frame_rate)
+
+        logger.info("LTX-2.3 prep: video %s, audio %s%s%s",
+                    tuple(video.shape), tuple(audio.shape),
+                    ", image held @ %.2f" % image_strength if image is not None else "",
+                    ", audio locked" if reference_audio is not None else "")
+        return (positive, negative, latent, 1.0)
+
+
 class LTXV23KSampler:
-    """KSampler for LTX-2 distilled checkpoints (euler + distilled sigmas).
+    """KSampler for LTX-2 distilled checkpoints (euler + official schedules).
 
     The stock schedulers (simple/karras/...) do not reproduce the trained
     LTX-2 distilled schedule, and a distilled model run on the wrong schedule
     looks like a broken model. This node passes the exact sigmas through -
     8 steps is the trained configuration; other step counts linearly resample
-    the same curve. It also stamps ``frame_rate`` onto the conditioning (the
-    DiT's RoPE needs it), so the core LTXVConditioning node is optional.
+    the same curve. ``schedule = refine`` switches to the official 3-step
+    stage-2 pass used after a latent x2 spatial upscale.
+
+    It also stamps ``frame_rate`` onto the conditioning (the DiT's RoPE needs
+    it) and honors the noise mask the prep node attaches (i2v held frames,
+    a2v locked audio).
     """
 
     CATEGORY = LTX23_CATEGORY
@@ -337,20 +591,29 @@ class LTXV23KSampler:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
                                  "control_after_generate": True}),
                 "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
-                                  "tooltip": "8 is the trained distilled "
-                                             "schedule."}),
+                                  "tooltip": "8 for the distilled schedule, "
+                                             "3 for refine. Other counts "
+                                             "resample the chosen curve."}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0,
                                   "step": 0.1,
                                   "tooltip": "1.0 - the distilled model is "
                                              "trained without CFG."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS,
                                  {"default": "euler"}),
+                "schedule": (list(SIGMA_SETS), {"default": "distilled (8 steps)",
+                                                "tooltip": "distilled: the "
+                                                           "trained 8-step "
+                                                           "generation pass. "
+                                                           "refine: the "
+                                                           "official 3-step "
+                                                           "pass after a "
+                                                           "latent x2 upscale."}),
                 "frame_rate": ("FLOAT", {"default": FPS, "min": 1.0, "max": 120.0,
                                          "step": 0.01,
                                          "tooltip": "Stamped onto the "
                                                     "conditioning for RoPE. "
                                                     "Keep it 24 and match the "
-                                                    "latent node."}),
+                                                    "prep node."}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
                                       "step": 0.01}),
             },
@@ -358,18 +621,19 @@ class LTXV23KSampler:
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
-    DESCRIPTION = ("Sample a joint AV latent with the LTX-2 distilled "
-                   "schedule (8 steps, cfg 1.0, euler). Split the output with "
-                   "core LTXVSeparateAVLatent, then decode video with VAE "
-                   "Decode and audio with LTXVAudioVAEDecode.")
+    DESCRIPTION = ("Sample a joint AV latent with the official LTX-2 schedules "
+                   "(distilled 8-step or refine 3-step, cfg 1.0, euler). Split "
+                   "the output with core LTXVSeparateAVLatent, then decode "
+                   "video with VAE Decode and audio with LTXVAudioVAEDecode.")
 
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
-               sampler_name, frame_rate, denoise):
+               sampler_name, schedule, frame_rate, denoise):
         positive = _set_cond_frame_rate(positive, frame_rate)
         negative = _set_cond_frame_rate(negative, frame_rate)
 
         samples = latent_image["samples"]
-        sigmas = distilled_sigma_schedule(steps, denoise).to(
+        sigmas = distilled_sigma_schedule(
+            steps, denoise, sigmas=SIGMA_SETS[schedule]).to(
             device=comfy.model_management.intermediate_device(),
             dtype=torch.float32)
         noise = comfy.sample.prepare_noise(
@@ -380,21 +644,25 @@ class LTXV23KSampler:
             sampler_name=sampler_name, scheduler="simple",
             positive=positive, negative=negative, latent_image=samples,
             sigmas=sigmas, seed=seed,
+            noise_mask=latent_image.get("noise_mask", None),
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
         )
         latent = latent_image.copy()
         latent["samples"] = out
+        latent.pop("noise_mask", None)
         return (latent,)
 
 
 NODE_CLASS_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader,
     "LTXV23EmptyLatentAV": LTXV23EmptyLatentAV,
+    "LTXV23ImgToVideo": LTXV23ImgToVideo,
     "LTXV23KSampler": LTXV23KSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader.TITLE,
     "LTXV23EmptyLatentAV": LTXV23EmptyLatentAV.TITLE,
+    "LTXV23ImgToVideo": LTXV23ImgToVideo.TITLE,
     "LTXV23KSampler": LTXV23KSampler.TITLE,
 }
