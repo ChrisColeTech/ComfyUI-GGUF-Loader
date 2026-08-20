@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-gguf-loader"
-description = "🚀 CCTech GGUF loaders for ComfyUI — UNET / CLIP quantization, dual VAE, ClipProj, Scenema Audio, MiniMax Music 3, stem separation and MiniMax H3 prompt writing."
-version = "1.4.13"
+description = "🚀 CCTech GGUF loaders for ComfyUI — UNET / CLIP quantization, dual VAE, ClipProj, Scenema Audio, MiniMax Music 3, stem separation, MiniMax H3 prompt writing and LTX-2.3 A/V."
+version = "1.5.0"
 license = {file = "LICENSE"}
 
 [project.urls]
