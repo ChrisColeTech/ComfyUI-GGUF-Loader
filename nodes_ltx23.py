@@ -295,11 +295,32 @@ def _encode_reference_audio(audio_vae, audio, duration_s):
     return latent, torch.zeros_like(latent)  # 0 = held: audio drives the video
 
 
+def _match_batch(t, n):
+    """Bring ``t`` to exactly ``n`` along dim 0 by tiling, then truncating.
+
+    Deliberately idempotent: calling it twice is the same as calling it once.
+    ``Tensor.repeat`` is not -- it multiplies -- so a value that has already
+    been expanded once must never be repeated again.
+    """
+    have = t.shape[0]
+    if have == n:
+        return t
+    if have > n:
+        return t.narrow(0, 0, n)
+    reps = -(-n // have)                      # ceil
+    return t.repeat(reps, *([1] * (t.dim() - 1))).narrow(0, 0, n)
+
+
 def _fit_audio_latent(audio, mask, target_shape):
     """Trim or zero-pad the audio latent along time to ``target_shape``.
 
     Port of core LTXVConcatAVLatent.fit_audio: a padded tail keeps mask 1 so
     the model generates it, which is what a clip shorter than the video means.
+
+    Time only. The pad is allocated at the audio's own batch rather than
+    ``target_shape[0]`` so this cannot silently expand the batch on the pad
+    path while leaving it alone on the trim path -- that asymmetry is what
+    made a following .repeat() produce batch_size**2 for short clips only.
     """
     dim, length = 2, target_shape[2]
     if audio.shape[dim] > length:
@@ -307,7 +328,8 @@ def _fit_audio_latent(audio, mask, target_shape):
         if mask is not None:
             mask = mask.narrow(dim, 0, length)
     elif audio.shape[dim] < length:
-        pad = torch.zeros(target_shape, device=audio.device, dtype=audio.dtype)
+        pad_shape = [audio.shape[0]] + list(target_shape[1:])
+        pad = torch.zeros(pad_shape, device=audio.device, dtype=audio.dtype)
         pad[:, :, :audio.shape[dim]] = audio
         if mask is not None:
             pmask = torch.ones_like(pad)
@@ -417,9 +439,7 @@ class LTXV23ImgToVideo:
         if image is not None:
             pixels = comfy.utils.common_upscale(
                 image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
-            t = vae.encode(pixels[:, :, :, :3])
-            if t.shape[0] < batch_size:
-                t = t.repeat(batch_size, *([1] * (t.dim() - 1)))
+            t = _match_batch(vae.encode(pixels[:, :, :, :3]), batch_size)
             video[:, :, :t.shape[2]] = t.to(video.device, video.dtype)
             video_mask[:, :, :t.shape[2]] = 1.0 - image_strength
 
@@ -432,11 +452,8 @@ class LTXV23ImgToVideo:
             audio_mask = torch.ones_like(audio)
         else:
             audio, audio_mask = _fit_audio_latent(audio, audio_mask, target)
-            if batch_size > 1:
-                audio = audio.repeat(batch_size, *([1] * (audio.dim() - 1)))
-                audio_mask = audio_mask.repeat(batch_size, *([1] * (audio_mask.dim() - 1)))
-            audio = audio.to(video.device)
-            audio_mask = audio_mask.to(video.device)
+            audio = _match_batch(audio, batch_size).to(video.device)
+            audio_mask = _match_batch(audio_mask, batch_size).to(video.device)
 
         latent = {
             "samples": comfy.nested_tensor.NestedTensor((video, audio)),
