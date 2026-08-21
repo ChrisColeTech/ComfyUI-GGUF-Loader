@@ -2,7 +2,7 @@
 
   LTXV23ModelsLoader   DiT + Gemma-3 TE (+ dual projection) + video VAE + audio VAE
   LTXV23ImgToVideo     prompts, init latent and noise masks for every mode
-  LTXV23KSampler       euler on the official LTX-2 distilled/refine sigmas
+  LTXV23KSampler       euler on the DMD / distilled / refine sigma schedules
 
 The conditioning path mirrors comfy_extras/nodes_lt.py rather than
 reinterpreting it, because every deviation is a way to get a plausible-looking
@@ -49,7 +49,30 @@ DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975,
 # Stage-2 refine schedule from the official workflows (after a latent x2
 # spatial upscale): 3 steps, cfg 1.0, euler.
 REFINE_SIGMAS = [0.85, 0.725, 0.4219, 0.0]
+
+# Schedules for a DMD-distilled bake (TenStrip LTX2.3_DMD_reshaped_r256 fused
+# at 1.0). DMD replaces the distill LoRA rather than stacking with it, so these
+# are alternatives to DISTILLED_SIGMAS, not refinements of it.
+#
+# DMD_SIGMAS is what 10Eros_10SNodes_I2V_DMD_v1.json actually runs: the
+# distilled curve with 0.98125 dropped and 0.78 inserted in the 0.909->0.725
+# gap. That workflow feeds it through EchoDMDSigmaRemap(interpolate), which is
+# an identity function -- interpolating at the input value returns the input --
+# so the list below is the effective schedule, no remap needed.
+DMD_SIGMAS = [1.0, 0.99375, 0.9875, 0.975,
+              0.909375, 0.78, 0.725, 0.421875, 0.0]
+# The model card's own recommendation, a smooth descent that shares no interior
+# anchors with the distilled curve.
+DMD_CARD_SIGMAS = [1.0, 0.955, 0.893, 0.812, 0.715,
+                   0.603, 0.482, 0.241, 0.121, 0.0]
+# Stage-2 upscale pass for DMD, from the same workflow.
+DMD_UPSCALE_SIGMAS = [0.92, 0.909375, 0.725, 0.421875, 0.0]
+
+# Order matters: this is the dropdown order, and the default sits first.
 SIGMA_SETS = {
+    "dmd (8 steps)": DMD_SIGMAS,
+    "dmd card (9 steps)": DMD_CARD_SIGMAS,
+    "dmd upscale (4 steps)": DMD_UPSCALE_SIGMAS,
     "distilled (8 steps)": DISTILLED_SIGMAS,
     "refine (3 steps)": REFINE_SIGMAS,
 }
@@ -463,12 +486,13 @@ class LTXV23KSampler:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
                                  "control_after_generate": True}),
                 "steps": ("INT", {"default": 8, "min": 1, "max": 10000,
-                                  "tooltip": "8 for distilled, 3 for refine."}),
+                                  "tooltip": "8 for dmd/distilled, 4 for dmd upscale, "
+                                             "3 for refine."}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1,
-                                  "tooltip": "1.0 - the distilled model is trained "
-                                             "without CFG."}),
+                                  "tooltip": "1.0 - both the DMD and distilled bakes "
+                                             "are trained without CFG."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
-                "schedule": (list(SIGMA_SETS), {"default": "distilled (8 steps)"}),
+                "schedule": (list(SIGMA_SETS), {"default": "dmd (8 steps)"}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
         }
