@@ -139,10 +139,10 @@ For an ID-LoRA talking-head pipeline (photo + reference voice → lip-synced vid
 
 **Qwen3-TTS Models Loader** + **Qwen3-TTS Custom Voice**, under `🤖 CCTech/Qwen TTS`, are a local port of the `flybirdxx/ComfyUI-Qwen-TTS` pack's `FB_Qwen3TTSCustomVoice` node (used for the reference voice in the `ltxv23_talking_head` workflow), wrapping the `qwen-tts` pip package's own `Qwen3TTSModel` directly — the model itself is a `transformers` checkpoint plus a separate codec/vocoder submodel, not this repo's GGUF-quantization territory, so there's nothing to port at the weights level.
 
-Download a `Qwen/Qwen3-TTS-12Hz-<size>-CustomVoice` repo (1.7B or 0.6B; the speech tokenizer/codec lives inside that same repo, no separate download) into `models/qwen_tts/<name>/`, e.g.:
+The models-folder layout matches `DarioFT/ComfyUI-Qwen3-TTS`'s convention rather than inventing a new one: pick a `repo_id` from the loader's dropdown (CustomVoice/VoiceDesign/Base × 1.7B/0.6B) and it downloads once into `models/Qwen3-TTS/<folder_name>/` (the speech tokenizer/codec lives inside that same repo, no separate download) — an existing HuggingFace/ModelScope cache copy is migrated in place instead of re-downloading if found. Every load after the first is fully offline. To pre-fetch by hand instead:
 
 ```
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ComfyUI/models/qwen_tts/1.7B-CustomVoice
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ComfyUI/models/Qwen3-TTS/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
 
 The loader always loads with `local_files_only=True` — no network access once the files are on disk. `speaker` is a built-in named voice baked into the checkpoint (e.g. `"Dylan"`); an unknown name raises an error listing every valid one. `instruct` is real model-native conditioning on the 1.7B checkpoint, but the 0.6B checkpoint silently drops it upstream — this node logs a warning instead of reproducing that silence. Needs the optional `qwen-tts` dependency (already in `requirements.txt`).

@@ -416,10 +416,9 @@ GGUF-quantization territory (verified via a deep read of
 the weights level, only a comfy face. Real, verified-against-source
 gotchas baked into the node:
 
-  * `Qwen3TTSModel.from_pretrained(path, local_files_only=True)` on a
-    local directory never touches the network — the speech
-    tokenizer/codec lives inside the same repo folder (`speech_tokenizer/`
-    subdir), it is not a second download;
+  * the speech tokenizer/codec lives inside the same repo folder
+    (`speech_tokenizer/` subdir), it is not a second download — confirmed
+    on disk after a real pull (see below), not just from source reading;
   * `instruct` is real model-native conditioning on the 1.7B checkpoint,
     but the package silently drops it for 0.6B
     (`tts_model_size in "0b6"` — a **substring** check, not a whitelist;
@@ -431,11 +430,41 @@ gotchas baked into the node:
     (`top_k=20, top_p=0.8, temperature=1.0`) — this node's widget
     defaults match the workflow, not the package.
 
-Verified only with mocked `folder_paths`/`Qwen3TTSModel`
-(`tools/smoke_qwen_tts.py`) and a real-environment import check against
-the portable's actual `folder_paths` + installed `qwen_tts` package (no
-model downloaded yet, so `_model_paths()` correctly returns empty) — not
-yet run end-to-end with real weights loaded.
+**Models-folder convention was rewritten mid-session** to match
+`DarioFT/ComfyUI-Qwen3-TTS` (a full comfy node pack for the same
+`qwen-tts` package, found at
+`D:\Projects\ComfyUI\ComfyUI-Qwen3-TTS-main` after the first pass had
+already invented its own `models/qwen_tts/` scheme) rather than diverging:
+`models/Qwen3-TTS/<folder_name>/`, registered via
+`folder_paths.add_model_folder_path`, a fixed 5-entry `repo_id` dropdown
+(CustomVoice/VoiceDesign/Base × 1.7B/0.6B), auto-download via
+`huggingface_hub.snapshot_download` (or ModelScope) with HF/ModelScope
+cache migration checked first. The fixed 9-name `CUSTOM_VOICE_SPEAKERS`
+dropdown and the `does not support generate_custom_voice` → plainer
+error remap are also lifted from that pack; the sampling-parameter
+surface (`top_p`/`top_k`/`temperature`/`repetition_penalty`) and the
+0.6B `instruct`-drop warning are this repo's own additions, since
+DarioFT's `Qwen3CustomVoice` node exposes neither. **Not ported**: that
+pack's "FORCE SPEAKER MAPPING FIX" deep-injection hack (`nodes.py`
+`Qwen3Loader`/`Qwen3CustomVoice`, config-object attribute surgery to
+patch in a custom `spk_id` mapping) — clearly a defensive patch for some
+specific checkpoint/config mismatch that isn't understood yet; if a
+speaker-mapping error surfaces during real testing, look there before
+inventing a fix from scratch.
+
+Verified: `tools/smoke_qwen_tts.py` (mocked `folder_paths`/
+`comfy.model_management`/`Qwen3TTSModel`, 14 checks — download-vs-reuse
+decision, from_pretrained kwargs, local_model_path's speech_tokenizer/
+validation, cache eviction, wrong-model-type remap, the instruct-drop
+check). A real `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` pull (via
+`huggingface-cli download`, `PYTHONUTF8=1` needed on Windows — the CLI's
+own deprecation-warning emoji crashes on the default cp1252 console)
+landed cleanly at
+`N:\ComfyUI_windows_portable_nvidia\ComfyUI\models\Qwen3-TTS\Qwen3-TTS-12Hz-1.7B-CustomVoice\`
+(4.3 GB, `config.json` + `speech_tokenizer/` both present at the repo
+root as expected) — confirms the folder layout end-to-end, but the node
+has not yet been run for real (`from_pretrained` + `generate_custom_voice`
+against these actual weights) inside ComfyUI itself.
 
 ## Dev-box memory corruption (expanded 2026-08-19)
 
