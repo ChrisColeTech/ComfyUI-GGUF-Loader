@@ -482,52 +482,63 @@ plain list of installed models, not a fixed list with indicators. Lesson:
 uncritically when they conflict with what the user is actually asking
 for — confirm the specific complaint, don't just port harder.
 
-## First JS frontend code: `web/ltx23_id_lora_prompt_editor.js` (2026-08-23)
+## ID-LoRA prompt editing: abandoned JS auto-fill for native wire/widget UX (2026-08-23)
 
-Everything in this repo up to this point was pure Python nodes. This is
-the first `WEB_DIRECTORY` (`__init__.py`) + `web/*.js` frontend extension,
-added because `LTXV23IDLoraPromptEditor` needed something no pure-Python
-node can do: display a value computed during that node's own execution
-(Python's `INPUT_TYPES` runs before execution and can't see another
-node's output, so there's no backend-only way to show "what the captioner
-just generated"). The JS hooks `nodeType.prototype.onExecuted` and reads
-the `ui` payload the Python node returns (`{"ui": {"visual": [...],
-"speech": [...], "sounds": [...]}, "result": (...)}`, which requires
-`OUTPUT_NODE = True` to guarantee the UI payload round-trips to the
-frontend).
+Went through three designs for "let the user review/edit a captioner's
+generated `[VISUAL]`/`[SPEECH]`/`[SOUNDS]` block before it's used" before
+landing on the right one. Worth reading in order, because each version's
+failure is what motivated the next:
 
-**First version wrote the parsed values directly into the
-`*_override` widgets, guarded by "only if that widget is still empty".
-Real bug, caught by the user testing it: it updated on the first run and
-never again.** Root cause wasn't the JS guard, it was structural: once a
-widget is auto-filled, it's non-empty, and `assemble()` has no way to
-tell "leftover auto-fill from last run" apart from "a deliberate
-override" from widget content alone — every run after the first reads
-back its own previous output and treats it as a manual override,
-ignoring whatever the (possibly changed) `source` now says. No JS-only
-fix exists for this; the ambiguity is server-side.
+1. **One node, `source` input, three `*_override` widgets auto-filled by
+   a `web/*.js` extension "only if the widget is still empty."** This
+   repo's first (and now removed) JS frontend code. Real bug, caught by
+   the user testing it: updated on the first run, never again. Root cause
+   wasn't the JS guard — it was structural: once a widget is auto-filled
+   it's non-empty, and the Python side has no way to tell "leftover
+   auto-fill from last run" apart from "a deliberate override" from
+   widget content alone. No JS-only fix exists for that; the ambiguity is
+   server-side.
+2. **Same node, but split into 3 real override widgets + 3 SEPARATE
+   read-only display widgets**, modeled on reading `ComfyUI-Custom-Scripts`'
+   `ShowText` node (`web/js/showText.js` + `py/show_text.py`) at the
+   user's request — `ShowText` is a pure display node that destroys and
+   rebuilds its widget(s) from scratch every execution, no ambiguity
+   because it has no override concept at all. Fixed the bug, but now 6
+   text areas on one node. The user's reaction was the right call: "then
+   you need to rethink this entire design" — doubling the widget count to
+   patch around an ambiguity is a sign the ambiguity shouldn't exist in
+   the first place.
+3. **Tried an explicit `lock_edits` toggle instead of the empty-widget
+   guess** (still one node, 3 widgets + 1 checkbox) — correct in theory
+   (explicit state beats inferring intent from content), but confusing in
+   practice: it read as "you need to flip a switch to make a text box
+   editable," which was never true and wasn't what the toggle actually
+   did (it controlled auto-refresh, not editability) — a framing failure,
+   not a logic failure, but real feedback that the design still needed a
+   concept the user had to be taught.
 
-**The actual fix, after reading `ComfyUI-Custom-Scripts`' `ShowText` node
-(`web/js/showText.js` + `py/show_text.py`) at the user's request**:
-`ShowText` is a *pure display* node — no override concept at all — and it
-destroys and rebuilds its display widget(s) from scratch on **every**
-execution, unconditionally, no "only if empty" logic anywhere. The
-correct design keeps display and override as two genuinely separate
-widgets: the `*_override` widgets stay exactly as originally designed
-(plain, empty-by-default, never touched by JS), and the JS instead adds
-three separate **read-only** display widgets after each run (tracked via
-`this._ccDisplayWidgets` so only those get removed/rebuilt, never the
-real override widgets), mirroring `ShowText`'s destroy-and-rebuild-fresh
-discipline exactly. This generalizes: any future "let the user see what
-got generated, and separately let them override it" node should use two
-distinct widgets per field, never one dual-purpose widget — auto-fill
-and manual-override are fundamentally incompatible on the same widget.
+**Final design, `LTXV23IDLoraAssembler` (`nodes_ltx23.py`) — no JS, no
+`WEB_DIRECTORY`, no custom node does the parsing at all**: three stock
+`RegexExtract` nodes (same lazy `(?s)\[TAG\]:\s*(.*?)\s*(?=\[[A-Z]+\]:|$)`
+pattern per tag, swap the tag name) pull the fields out upstream, feeding
+a trivial formatter node that just does
+`f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}"` — no
+`source` input, no lock, no state, nothing to explain. Overriding a field
+is just disconnecting that `RegexExtract`'s wire and typing into the
+widget that appears, which is how literally every other widget-typed
+input in ComfyUI already works — the "auto-filled but overridable"
+behavior every prior version was building custom machinery for is a
+*free, built-in* property of wire-vs-widget inputs, not something that
+needed solving at all. Lesson for any future "let the user review/edit a
+generated value" node: check whether plain wire-disconnect-to-override
+already covers it before reaching for `OUTPUT_NODE`/`ui` payloads/JS —
+those are for genuine *display* needs (showing a value with nowhere else
+to put it), not for editability, which ComfyUI gives away for free.
 
-Not yet re-verified inside a running ComfyUI frontend after this fix —
-the Python side (`_parse_id_lora_prompt`, `assemble`, unchanged by this
-fix) is verified by `tools/smoke_id_lora_prompt_editor.py` and a
-real-environment check; the corrected JS still needs an actual browser
-to confirm the display widgets appear/refresh correctly.
+Verified: `tools/smoke_id_lora_prompt_editor.py` (2 checks, pure string
+formatting, no comfy/GPU dependency — trivial by design). Not yet
+confirmed with a real captioner output + `RegexExtract` wiring inside a
+running ComfyUI, only the formatter itself.
 
 ## Dev-box memory corruption (expanded 2026-08-19)
 

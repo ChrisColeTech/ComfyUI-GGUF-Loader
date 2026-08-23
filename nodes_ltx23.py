@@ -37,7 +37,6 @@ model generates the remainder.
 """
 import logging
 import math
-import re
 from fractions import Fraction
 
 import comfy.model_management
@@ -715,93 +714,52 @@ class LTXV23AVDecode:
 
 # ── ID-LoRA prompt editing ──────────────────────────────────────────────────
 
-# Lazily matches each [TAG]: body up to the next [TAG]: or end of string, so
-# it works whether SOUNDS (the last tag) or a middle tag like SPEECH is being
-# pulled out - a greedy `(.*)$` reproduces the exact "SPEECH swallows SOUNDS
-# too" bug this pattern exists to avoid. Tolerant of a Part-1 spoken-script
-# preamble before the tags (the LM Studio/captioner node's raw two-part
-# output) since it only anchors on the tags themselves, not on position.
-_ID_LORA_TAG_RE = re.compile(
-    r"\[(VISUAL|SPEECH|SOUNDS)\]:\s*(.*?)\s*(?=\[(?:VISUAL|SPEECH|SOUNDS)\]:|$)",
-    re.IGNORECASE | re.DOTALL,
-)
+class LTXV23IDLoraAssembler:
+    """Glue visual/speech/sounds into the canonical ID-LoRA prompt string.
 
+    Deliberately does nothing else - no parsing, no auto-fill, no lock
+    toggle, no JS. Editability comes for free from ordinary ComfyUI
+    behavior: wire a stock ``RegexExtract`` node (see the pattern below)
+    into whichever input you want auto-filled from the captioner's raw
+    output, or leave it disconnected/type into it directly to override -
+    exactly like every other widget-typed input in ComfyUI already works,
+    no special mechanism needed for that.
 
-def _parse_id_lora_prompt(source):
-    fields = {"VISUAL": "", "SPEECH": "", "SOUNDS": ""}
-    for tag, body in _ID_LORA_TAG_RE.findall(source or ""):
-        fields[tag.upper()] = body.strip()
-    return fields["VISUAL"], fields["SPEECH"], fields["SOUNDS"]
+    An earlier version tried to make one node do the parsing AND the
+    editing AND the auto-fill-but-don't-clobber-edits behavior together,
+    which needed a JS extension and a lock toggle to resolve an ambiguity
+    that plain ComfyUI wire-vs-widget behavior already resolves for free.
+    Removed in favor of this: three stock ``RegexExtract`` nodes upstream
+    (same pattern, just swap the tag name) plus this trivial formatter.
 
+      (?s)\\[VISUAL\\]:\\s*(.*?)\\s*(?=\\[[A-Z]+\\]:|$)
+      (?s)\\[SPEECH\\]:\\s*(.*?)\\s*(?=\\[[A-Z]+\\]:|$)
+      (?s)\\[SOUNDS\\]:\\s*(.*?)\\s*(?=\\[[A-Z]+\\]:|$)
 
-class LTXV23IDLoraPromptEditor:
-    """Parse a generated [VISUAL]/[SPEECH]/[SOUNDS] block into three
-    editable fields, and reassemble a canonical ID-LoRA prompt string.
-
-    ``source`` is whatever the upstream captioner (e.g. LMStudioVisionPrompt)
-    produced - either its full two-part output (spoken script + tagged
-    block) or just the tagged block on its own; the parser only looks for
-    the three ``[TAG]:`` markers and ignores everything else, including a
-    Part-1 preamble.
-
-    Each ``*_override`` widget wins over the parsed value when non-empty, so
-    editing one field does not require retyping the other two, and does not
-    require re-running the captioner. The override widgets are plain,
-    always-empty-by-default inputs that the frontend never writes into -
-    the paired ``web/`` JS extension instead adds three SEPARATE read-only
-    display widgets after each run showing the resolved values (following
-    ComfyUI-Custom-Scripts' ShowText convention: destroyed and rebuilt fresh
-    every execution). Writing generated text into the override widgets
-    themselves was tried first and is deliberately not done: once
-    auto-filled, a widget is non-empty, and there is no way for this
-    function to tell "leftover auto-fill from last run" apart from "a
-    deliberate override" - it would look like edits stop taking effect
-    after the first run, because every run after that reads back its own
-    previous output as if it were a manual override.
-
-    Each field is also available as its own (post-override) output, not
-    just baked into ``tagged_prompt`` - ``speech_text`` in particular so it
-    can feed a TTS node's ``text`` input directly instead of being extracted
-    a second time from a separate Part-1 split, which would let the two
-    extractions drift (e.g. one gets edited here, the other doesn't).
+    Fan the SPEECH RegexExtract's single output to both this node's
+    ``speech`` input and a TTS node's ``text`` input directly, rather than
+    extracting it twice - one wire, one value, no drift possible.
     """
 
     CATEGORY = LTX23_CATEGORY
-    TITLE = "LTX-2.3 ID-LoRA Prompt Editor ⚡"
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("tagged_prompt", "visual_text", "speech_text", "sounds_text")
+    TITLE = "LTX-2.3 ID-LoRA Assembler ⚡"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("tagged_prompt",)
     FUNCTION = "assemble"
-    OUTPUT_NODE = True
-    DESCRIPTION = ("Parse a generated [VISUAL]/[SPEECH]/[SOUNDS] block into "
-                   "three editable fields and reassemble it.")
+    DESCRIPTION = "Combine visual/speech/sounds into the ID-LoRA prompt format."
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "source": ("STRING", {"multiline": True, "default": "",
-                    "tooltip": "The captioner's raw output - the full "
-                               "two-part text, or just the tagged block."}),
-            },
-            "optional": {
-                "visual_override": ("STRING", {"multiline": True, "default": ""}),
-                "speech_override": ("STRING", {"multiline": True, "default": ""}),
-                "sounds_override": ("STRING", {"multiline": True, "default": ""}),
+                "visual": ("STRING", {"multiline": True, "default": ""}),
+                "speech": ("STRING", {"multiline": True, "default": ""}),
+                "sounds": ("STRING", {"multiline": True, "default": ""}),
             },
         }
 
-    def assemble(self, source, visual_override="", speech_override="",
-                sounds_override=""):
-        visual, speech, sounds = _parse_id_lora_prompt(source)
-        visual = visual_override.strip() or visual
-        speech = speech_override.strip() or speech
-        sounds = sounds_override.strip() or sounds
-
-        tagged_prompt = f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}"
-        return {
-            "ui": {"visual": [visual], "speech": [speech], "sounds": [sounds]},
-            "result": (tagged_prompt, visual, speech, sounds),
-        }
+    def assemble(self, visual, speech, sounds):
+        return (f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}",)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -810,7 +768,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXV23KSampler": LTXV23KSampler,
     "LTXV23RefineSampler": LTXV23RefineSampler,
     "LTXV23AVDecode": LTXV23AVDecode,
-    "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
+    "LTXV23IDLoraAssembler": LTXV23IDLoraAssembler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -819,5 +777,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23KSampler": LTXV23KSampler.TITLE,
     "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
-    "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,
+    "LTXV23IDLoraAssembler": LTXV23IDLoraAssembler.TITLE,
 }
