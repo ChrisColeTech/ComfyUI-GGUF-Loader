@@ -93,11 +93,42 @@ def test_generate_connection_error_is_actionable():
     raise AssertionError("expected RuntimeError")
 
 
-def test_list_models_never_raises_when_unreachable():
+def test_resolve_model_explicit_wins_no_http_call():
+    with patch.object(lm.requests, "get") as get:
+        model = lm.resolve_model("http://localhost:1234/v1", "qwen2-vl-7b")
+        assert model == "qwen2-vl-7b"
+        get.assert_not_called()
+    print("[ok] resolve_model: explicit model id skips the /models lookup")
+
+
+def test_resolve_model_blank_auto_detects_first_loaded():
+    canned = {"data": [{"id": "loaded-model-a"}, {"id": "loaded-model-b"}]}
+    with patch.object(lm.requests, "get", return_value=_fake_response(canned)):
+        model = lm.resolve_model("http://localhost:1234/v1", "")
+        assert model == "loaded-model-a"
+    print("[ok] resolve_model: blank model auto-detects the first loaded one")
+
+
+def test_resolve_model_blank_unreachable_raises_actionable_error():
     with patch.object(lm.requests, "get", side_effect=lm.requests.exceptions.ConnectionError()):
-        models = lm._list_models("http://localhost:1234/v1")
-        assert models == [lm.NO_SERVER_MODEL]
-    print("[ok] _list_models: unreachable server falls back cleanly")
+        try:
+            lm.resolve_model("http://localhost:1234/v1", "")
+        except RuntimeError as e:
+            assert "could not be reached" in str(e)
+            print("[ok] resolve_model: unreachable server + blank model raises actionable error")
+            return
+    raise AssertionError("expected RuntimeError")
+
+
+def test_resolve_model_blank_no_loaded_model_raises_actionable_error():
+    with patch.object(lm.requests, "get", return_value=_fake_response({"data": []})):
+        try:
+            lm.resolve_model("http://localhost:1234/v1", "")
+        except RuntimeError as e:
+            assert "no loaded model" in str(e)
+            print("[ok] resolve_model: no loaded model raises actionable error")
+            return
+    raise AssertionError("expected RuntimeError")
 
 
 if __name__ == "__main__":
@@ -108,5 +139,8 @@ if __name__ == "__main__":
     test_extract_reply_bad_shape_raises_clean_error()
     test_generate_round_trip()
     test_generate_connection_error_is_actionable()
-    test_list_models_never_raises_when_unreachable()
+    test_resolve_model_explicit_wins_no_http_call()
+    test_resolve_model_blank_auto_detects_first_loaded()
+    test_resolve_model_blank_unreachable_raises_actionable_error()
+    test_resolve_model_blank_no_loaded_model_raises_actionable_error()
     print("[ok] all nodes_lmstudio smoke tests passed")

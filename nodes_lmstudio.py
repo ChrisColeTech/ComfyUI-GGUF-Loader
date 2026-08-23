@@ -27,22 +27,40 @@ logger = logging.getLogger(__name__)
 
 LMSTUDIO_CATEGORY = "\U0001F916 CCTech/LM Studio"
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
-NO_SERVER_MODEL = "(no server reached - type a model id)"
 
 
 def _list_models(base_url):
-    """Best-effort model list for the COMBO widget. Never raises: LM Studio
-    not being up yet is the expected state at graph-build time, not an error.
+    """Live /v1/models call. Raises on failure - callers decide how to
+    surface that, this has no silent fallback to hide behind.
     """
-    if requests is None:
-        return [NO_SERVER_MODEL]
+    resp = requests.get(f"{base_url.rstrip('/')}/models", timeout=5)
+    resp.raise_for_status()
+    return [m["id"] for m in resp.json().get("data", [])]
+
+
+def resolve_model(base_url, model):
+    """An explicit ``model`` id wins outright. Blank means "whatever LM
+    Studio currently has loaded" - a live call, not a value cached from
+    whenever the node happened to be added to the graph, so it stays correct
+    across LM Studio model switches and across whatever ``base_url`` this
+    node instance is pointed at right now.
+    """
+    if model:
+        return model
     try:
-        resp = requests.get(f"{base_url.rstrip('/')}/models", timeout=2)
-        resp.raise_for_status()
-        ids = [m["id"] for m in resp.json().get("data", [])]
-        return ids or [NO_SERVER_MODEL]
-    except Exception:
-        return [NO_SERVER_MODEL]
+        ids = _list_models(base_url)
+    except Exception as e:
+        raise RuntimeError(
+            f"model was left blank (auto-detect) but LM Studio at {base_url} "
+            f"could not be reached to look up the loaded model: {e}"
+        ) from e
+    if not ids:
+        raise RuntimeError(
+            f"model was left blank (auto-detect) but LM Studio at {base_url} "
+            f"reports no loaded model. Load one in LM Studio or type its id "
+            f"into the model field."
+        )
+    return ids[0]
 
 
 def _image_to_data_uri(image):
@@ -108,10 +126,12 @@ class LMStudioVisionPrompt:
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
                 "base_url": ("STRING", {"default": DEFAULT_BASE_URL,
                                         "tooltip": "LM Studio > Developer > Start Server."}),
-                "model": (_list_models(DEFAULT_BASE_URL), {
-                    "tooltip": "Populated from a live /v1/models call at graph "
-                               "build time. Re-add the node after loading a "
-                               "different model in LM Studio to refresh it."}),
+                "model": ("STRING", {"default": "",
+                    "tooltip": "Leave blank to auto-use whatever model is "
+                               "currently loaded in LM Studio (queried from "
+                               "base_url at run time). Type an exact model "
+                               "id (see LM Studio > Developer's model list, "
+                               "or GET {base_url}/models) to pin one."}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
@@ -130,6 +150,7 @@ class LMStudioVisionPrompt:
             raise RuntimeError("The 'requests' package is required for "
                                "LMStudioVisionPrompt but is not installed.")
 
+        model = resolve_model(base_url, model)
         payload = build_chat_payload(prompt, model, temperature, max_tokens,
                                      seed, image=image, system_prompt=system_prompt)
         url = f"{base_url.rstrip('/')}/chat/completions"
