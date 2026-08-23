@@ -204,7 +204,7 @@ class LMStudioVisionPrompt:
     """
 
     CATEGORY = LMSTUDIO_CATEGORY
-    TITLE = "LM Studio Vision Prompt \U0001F5A5️"
+    TITLE = "LM Studio Vision Prompt ⚡"
     RETURN_TYPES = ("STRING",)
     FUNCTION = "generate"
     DESCRIPTION = ("Send an optional image + prompt to a local LM Studio "
