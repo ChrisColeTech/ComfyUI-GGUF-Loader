@@ -482,9 +482,9 @@ plain list of installed models, not a fixed list with indicators. Lesson:
 uncritically when they conflict with what the user is actually asking
 for — confirm the specific complaint, don't just port harder.
 
-## ID-LoRA prompt editing: abandoned JS auto-fill for native wire/widget UX (2026-08-23)
+## ID-LoRA prompt editing: four designs before the right one (2026-08-23)
 
-Went through three designs for "let the user review/edit a captioner's
+Went through four designs for "let the user review/edit a captioner's
 generated `[VISUAL]`/`[SPEECH]`/`[SOUNDS]` block before it's used" before
 landing on the right one. Worth reading in order, because each version's
 failure is what motivated the next:
@@ -517,28 +517,68 @@ failure is what motivated the next:
    not a logic failure, but real feedback that the design still needed a
    concept the user had to be taught.
 
-**Final design, `LTXV23IDLoraAssembler` (`nodes_ltx23.py`) — no JS, no
-`WEB_DIRECTORY`, no custom node does the parsing at all**: three stock
-`RegexExtract` nodes (same lazy `(?s)\[TAG\]:\s*(.*?)\s*(?=\[[A-Z]+\]:|$)`
-pattern per tag, swap the tag name) pull the fields out upstream, feeding
-a trivial formatter node that just does
-`f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}"` — no
-`source` input, no lock, no state, nothing to explain. Overriding a field
-is just disconnecting that `RegexExtract`'s wire and typing into the
-widget that appears, which is how literally every other widget-typed
-input in ComfyUI already works — the "auto-filled but overridable"
-behavior every prior version was building custom machinery for is a
-*free, built-in* property of wire-vs-widget inputs, not something that
-needed solving at all. Lesson for any future "let the user review/edit a
-generated value" node: check whether plain wire-disconnect-to-override
-already covers it before reaching for `OUTPUT_NODE`/`ui` payloads/JS —
-those are for genuine *display* needs (showing a value with nowhere else
-to put it), not for editability, which ComfyUI gives away for free.
+4. **Dropped the node entirely for 3 stock `RegexExtract` nodes + a dumb
+   `LTXV23IDLoraAssembler` formatter**, on the theory that ComfyUI's
+   native wire-vs-widget duality (disconnect a wire → the box becomes
+   editable) already gives "auto-filled but overridable" for free. It
+   does — but that's a multi-node setup, and the ask was explicitly for
+   **one node** whose boxes you type into without wire-juggling. Rejected.
 
-Verified: `tools/smoke_id_lora_prompt_editor.py` (2 checks, pure string
-formatting, no comfy/GPU dependency — trivial by design). Not yet
-confirmed with a real captioner output + `RegexExtract` wiring inside a
-running ComfyUI, only the formatter itself.
+**Final design, `LTXV23IDLoraPromptEditor` — one node, three editable
+boxes, decision made in Python.** Preceded by a real read of the frontend
+source (`D:\Projects\ComfyUI\ComfyUI_frontend-main`, since
+`upstream/ComfyUI` ships only the built `comfyui-frontend-package` and has
+no `web/` source). What that established, and which any future
+widget-behavior work should start from rather than re-deriving:
+
+  * **Widget catalog** is `src/scripts/widgets.ts:222-242`; a STRING
+    input's *entire* option surface is `multiline`, `dynamicPrompts`,
+    `default`, `placeholder`, `forceInput`, `socketless`, `hidden`,
+    `tooltip` (`packages/object-info-parser/src/schemas/nodeDefSchema.ts:28-88`,
+    mirrored in `comfy_api/latest/_io.py:322-342` for V3). There is no
+    custom widget type to author and V3 `io` adds nothing here.
+  * **Socket+widget duality is automatic and always on**
+    (`src/services/litegraphService.ts:271-327`); the old
+    convert-widget-to-input is deprecated
+    (`src/extensions/core/widgetInputs.ts:423-439`). A *wired* widget
+    input greys out, blanks its drawn text and stops taking clicks
+    (`LGraphNode.ts:3956-3961`, `BaseWidget.ts:250-252`), and the link
+    always beats the widget value at serialization
+    (`src/utils/executionUtil.ts:93-136`). Hence `source` is
+    `forceInput: True` here — a visible box on a wired input is dead
+    weight.
+  * **Core has no auto-filled-and-editable widget.** Its only
+    populate-from-own-execution widget is `TEXT_PREVIEW`
+    (`src/extensions/core/textPreviewWidgets.ts:20-67`, behind
+    `PreviewAny`/`SaveText`), and it is hard-coded `readonly` +
+    `serialize: false` (`WidgetTextPreview.vue:42-45`). Confirmed absent,
+    not overlooked — custom logic is mandatory for this behavior.
+  * **Write-back is safe in `onExecuted`**: a multiline STRING is a DOM
+    widget whose `.value` setter routes to `options.setValue`
+    (`src/scripts/domWidget.ts:143-150,381-389`), updating both the real
+    `<textarea>` and the reactive Pinia store
+    (`useStringWidget.ts:26-43`). The "writes don't render" trap applies
+    to writes made *before* the widget registers into that store
+    (`BaseWidget.ts:146-157`) — i.e. too early in `onNodeCreated`.
+
+The state that resolves attempt 1's ambiguity lives in Python:
+`_LAST_SOURCE[unique_id]` (via the standard `UNIQUE_ID` hidden input)
+remembers the `source` last parsed for that node. Source changed →
+re-parse and overwrite the boxes; same source → keep them (this is where
+an edit survives); nothing remembered yet (fresh ComfyUI start) → fill
+only *empty* boxes, so edits saved in the workflow survive a restart. The
+JS then writes the resolved values back **unconditionally** — correct
+precisely because Python already decided, so it either echoes the user's
+own edit or shows the fresh parse. Every earlier JS-side guess was wrong
+for the same reason: widget content alone cannot distinguish "the user
+typed this" from "we typed this last run."
+
+Verified: `tools/smoke_id_lora_prompt_editor.py` (9 checks — parser
+correctness incl. SPEECH-not-swallowing-SOUNDS, plus every state-machine
+transition and per-node isolation) and a real-environment `INPUT_TYPES`
+check against the portable's comfy. **The JS write-back has no offline
+test** — it needs a browser (and a Ctrl+F5 hard refresh, since `web/` files
+are cached).
 
 ## Dev-box memory corruption (expanded 2026-08-19)
 

@@ -127,17 +127,11 @@ Sampling: `CLIPTextEncode` → **LTX-2.3 Img/Audio to Video** (one prep node: le
 
 For an ID-LoRA talking-head pipeline (photo + reference voice → lip-synced video, e.g. the `ltxv23_talking_head` gallery workflow): stack a distilled LoRA (~0.5 strength) and an ID-LoRA (~1.0 strength) onto the model with core `LoraLoaderModelOnly` ×2, and set the reference voice with core `LTXVReferenceAudio` before the sampler — both are already correctly served by stock nodes, no CCTech wrapper needed.
 
-To review and edit a captioner's generated `[VISUAL]`/`[SPEECH]`/`[SOUNDS]` block before it's used (e.g. `LMStudioVisionPrompt`'s tagged output): wire three stock `RegexExtract` nodes to pull each tag out (same lazy pattern, just swap the tag name — stop at the next `[TAG]:` marker or end of string, so a middle section like `[SPEECH]` can't swallow `[SOUNDS]` after it the way a naive greedy `(.*)$` would):
+**LTX-2.3 ID-LoRA Prompt Editor** reviews and edits a captioner's generated `[VISUAL]`/`[SPEECH]`/`[SOUNDS]` block before it's used. Wire a captioner (e.g. `LMStudioVisionPrompt`) into its `source` socket; the three multiline boxes fill with the parsed fields after a run and stay directly editable. Type over any of them and the edit survives later runs; generate a genuinely new caption and all three refresh to it. Outputs `tagged_prompt` (the reassembled `[VISUAL]: .../[SPEECH]: .../[SOUNDS]: ...` string for `CLIPTextEncode`) plus `visual_text`/`speech_text`/`sounds_text` individually — wire `speech_text` straight into a TTS node's `text` input so what you typed is exactly what gets spoken.
 
-```
-(?s)\[VISUAL\]:\s*(.*?)\s*(?=\[[A-Z]+\]:|$)
-(?s)\[SPEECH\]:\s*(.*?)\s*(?=\[[A-Z]+\]:|$)
-(?s)\[SOUNDS\]:\s*(.*?)\s*(?=\[[A-Z]+\]:|$)
-```
+The keep-the-edit-vs-refresh decision is made in Python by remembering the `source` this node last parsed (keyed by node id), not guessed from whether a box looks empty — and the paired `web/` JS then writes the resolved values back unconditionally. Comfy-core has no widget that is auto-filled *and* editable *and* edit-preserving (its only populate-from-execution widget, `TEXT_PREVIEW` behind `PreviewAny`/`SaveText`, is hard-coded read-only), so this is genuinely custom. Note the parser stops each field at the next `[TAG]:` marker rather than end-of-string, so a middle section like `[SPEECH]` can't swallow `[SOUNDS]` after it.
 
-then **LTX-2.3 ID-LoRA Assembler** glues the three back into the canonical `[VISUAL]: .../[SPEECH]: .../[SOUNDS]: ...` string for `CLIPTextEncode`. To override any one field, just disconnect that `RegexExtract`'s wire and type directly into the widget that appears — ordinary ComfyUI wire-vs-widget behavior already handles "auto-filled, but overridable" for free, no extra mechanism needed. Fan the `[SPEECH]` extractor's output to both the assembler and a TTS node's `text` input directly (one wire, one value) rather than extracting it twice, so they can't drift apart.
-
-`tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling. `tools/smoke_id_lora_prompt_editor.py` validates the assembler's formatting, no GPU required.
+`tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling. `tools/smoke_id_lora_prompt_editor.py` covers the parser and every state-machine transition (first run empty/filled, edit preserved, source changed, per-node isolation), no GPU required; the JS write-back itself needs a browser to confirm.
 
 ### LM Studio
 

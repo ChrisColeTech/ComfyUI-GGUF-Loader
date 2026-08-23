@@ -37,6 +37,7 @@ model generates the remainder.
 """
 import logging
 import math
+import re
 from fractions import Fraction
 
 import comfy.model_management
@@ -714,52 +715,104 @@ class LTXV23AVDecode:
 
 # ── ID-LoRA prompt editing ──────────────────────────────────────────────────
 
-class LTXV23IDLoraAssembler:
-    """Glue visual/speech/sounds into the canonical ID-LoRA prompt string.
+# Lazily matches each [TAG]: body up to the next [TAG]: or end of string, so
+# it works whether SOUNDS (the last tag) or a middle tag like SPEECH is being
+# pulled out - a greedy `(.*)$` makes SPEECH swallow SOUNDS too. Tolerant of
+# a Part-1 spoken-script preamble before the tags (the captioner's raw
+# two-part output) since it anchors on the tags themselves, not on position.
+_ID_LORA_TAG_RE = re.compile(
+    r"\[(VISUAL|SPEECH|SOUNDS)\]:\s*(.*?)\s*(?=\[(?:VISUAL|SPEECH|SOUNDS)\]:|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
-    Deliberately does nothing else - no parsing, no auto-fill, no lock
-    toggle, no JS. Editability comes for free from ordinary ComfyUI
-    behavior: wire a stock ``RegexExtract`` node (see the pattern below)
-    into whichever input you want auto-filled from the captioner's raw
-    output, or leave it disconnected/type into it directly to override -
-    exactly like every other widget-typed input in ComfyUI already works,
-    no special mechanism needed for that.
 
-    An earlier version tried to make one node do the parsing AND the
-    editing AND the auto-fill-but-don't-clobber-edits behavior together,
-    which needed a JS extension and a lock toggle to resolve an ambiguity
-    that plain ComfyUI wire-vs-widget behavior already resolves for free.
-    Removed in favor of this: three stock ``RegexExtract`` nodes upstream
-    (same pattern, just swap the tag name) plus this trivial formatter.
+def _parse_id_lora_prompt(source):
+    fields = {"VISUAL": "", "SPEECH": "", "SOUNDS": ""}
+    for tag, body in _ID_LORA_TAG_RE.findall(source or ""):
+        fields[tag.upper()] = body.strip()
+    return fields["VISUAL"], fields["SPEECH"], fields["SOUNDS"]
 
-      (?s)\\[VISUAL\\]:\\s*(.*?)\\s*(?=\\[[A-Z]+\\]:|$)
-      (?s)\\[SPEECH\\]:\\s*(.*?)\\s*(?=\\[[A-Z]+\\]:|$)
-      (?s)\\[SOUNDS\\]:\\s*(.*?)\\s*(?=\\[[A-Z]+\\]:|$)
 
-    Fan the SPEECH RegexExtract's single output to both this node's
-    ``speech`` input and a TTS node's ``text`` input directly, rather than
-    extracting it twice - one wire, one value, no drift possible.
+# node unique_id -> the source text that was last parsed for it. Lets
+# assemble() tell "the boxes hold the user's edit" from "the boxes hold
+# stale auto-fill" without guessing from widget content (undecidable - see
+# the class docstring) or making the user flip a switch.
+_LAST_SOURCE = {}
+
+
+class LTXV23IDLoraPromptEditor:
+    """Show a captioner's [VISUAL]/[SPEECH]/[SOUNDS] in three editable
+    boxes, and reassemble them into an ID-LoRA prompt string.
+
+    ``source`` is whatever the upstream captioner (e.g. LMStudioVisionPrompt)
+    produced - its full two-part output (spoken script, ``---``, tagged
+    block) or just the tagged block; the parser only looks for the three
+    ``[TAG]:`` markers, ignoring a Part-1 preamble. It is ``forceInput`` so
+    it renders as a socket only: a widget-backed input that is wired greys
+    out, blanks its own text and stops accepting clicks
+    (comfy frontend ``LGraphNode.updateComputedDisabled``), so a visible box
+    there would be dead weight.
+
+    The three boxes auto-fill with the parsed values after a run and stay
+    directly editable; an edit survives later runs, and a genuinely new
+    ``source`` refreshes them. That combination does not exist as a widget
+    flag in comfy-core - its only populate-from-own-execution widget,
+    TEXT_PREVIEW (PreviewAny/SaveText), is hard-coded read-only and
+    ``serialize: False`` - so the state lives here instead:
+
+      * this run's ``source`` differs from the one remembered for this node
+        -> the boxes are stale, re-parse and overwrite them;
+      * same ``source`` as last run -> the boxes are the truth, keep them
+        (this is where a manual edit survives);
+      * nothing remembered yet (fresh ComfyUI start) -> fill only empty
+        boxes, so edits saved into the workflow survive a restart.
+
+    The paired ``web/`` JS then writes the resolved values back into the
+    widgets unconditionally. That is safe precisely because the decision
+    already happened here: it either echoes the user's own edit back or
+    shows the fresh parse. Earlier versions put that decision in the JS
+    ("fill only if the widget is empty"), which cannot work - once
+    auto-filled a widget is non-empty forever, so it filled once and then
+    appeared frozen.
     """
 
     CATEGORY = LTX23_CATEGORY
-    TITLE = "LTX-2.3 ID-LoRA Assembler ⚡"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("tagged_prompt",)
+    TITLE = "LTX-2.3 ID-LoRA Prompt Editor ⚡"
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("tagged_prompt", "visual_text", "speech_text", "sounds_text")
     FUNCTION = "assemble"
-    DESCRIPTION = "Combine visual/speech/sounds into the ID-LoRA prompt format."
+    OUTPUT_NODE = True          # required for the ui payload to reach the frontend
+    DESCRIPTION = ("Edit a captioner's [VISUAL]/[SPEECH]/[SOUNDS] fields and "
+                   "reassemble them into an ID-LoRA prompt.")
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
+                "source": ("STRING", {"forceInput": True,
+                    "tooltip": "The captioner's raw output - its full "
+                               "two-part text, or just the tagged block."}),
                 "visual": ("STRING", {"multiline": True, "default": ""}),
                 "speech": ("STRING", {"multiline": True, "default": ""}),
                 "sounds": ("STRING", {"multiline": True, "default": ""}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    def assemble(self, visual, speech, sounds):
-        return (f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}",)
+    def assemble(self, source, visual, speech, sounds, unique_id=None):
+        previous = _LAST_SOURCE.get(unique_id)
+        if previous is None:
+            if not (visual.strip() or speech.strip() or sounds.strip()):
+                visual, speech, sounds = _parse_id_lora_prompt(source)
+        elif previous != source:
+            visual, speech, sounds = _parse_id_lora_prompt(source)
+        _LAST_SOURCE[unique_id] = source
+
+        tagged_prompt = f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}"
+        return {
+            "ui": {"visual": [visual], "speech": [speech], "sounds": [sounds]},
+            "result": (tagged_prompt, visual, speech, sounds),
+        }
 
 
 NODE_CLASS_MAPPINGS = {
@@ -768,7 +821,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXV23KSampler": LTXV23KSampler,
     "LTXV23RefineSampler": LTXV23RefineSampler,
     "LTXV23AVDecode": LTXV23AVDecode,
-    "LTXV23IDLoraAssembler": LTXV23IDLoraAssembler,
+    "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -777,5 +830,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23KSampler": LTXV23KSampler.TITLE,
     "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
-    "LTXV23IDLoraAssembler": LTXV23IDLoraAssembler.TITLE,
+    "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,
 }
