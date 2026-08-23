@@ -150,6 +150,18 @@ def _download_model(repo_id, source):
     return target_path
 
 
+def _installed_repo_ids():
+    """repo_ids actually present under models/Qwen3-TTS/ right now - what's
+    installed, not what's theoretically downloadable. Falls back to the
+    full known list only when nothing is installed yet, so the dropdown is
+    never empty on a fresh setup.
+    """
+    installed = [repo_id for repo_id, folder_name in QWEN3_TTS_MODELS.items()
+                if os.path.isdir(os.path.join(QWEN3_TTS_MODELS_DIR, folder_name))
+                and os.listdir(os.path.join(QWEN3_TTS_MODELS_DIR, folder_name))]
+    return installed or list(QWEN3_TTS_MODELS)
+
+
 def _resolve_attention(attention):
     if attention != "auto":
         return attention
@@ -174,10 +186,17 @@ class QwenTTSModelsLoader:
 
     @classmethod
     def INPUT_TYPES(s):
+        installed = _installed_repo_ids()
+        default = ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+                  if "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" in installed
+                  else installed[0])
         return {
             "required": {
-                "repo_id": (list(QWEN3_TTS_MODELS), {
-                    "default": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"}),
+                "repo_id": (installed, {"default": default,
+                    "tooltip": "Models found under models/Qwen3-TTS/. To add "
+                               "another variant, download it with the CLI "
+                               "into models/Qwen3-TTS/<name>/ and re-add this "
+                               "node (see README)."}),
                 "source": (["HuggingFace", "ModelScope"], {"default": "HuggingFace"}),
                 "precision": (list(_DTYPES), {"default": "bf16"}),
                 "attention": (_ATTENTION_CHOICES, {"default": "auto"}),
