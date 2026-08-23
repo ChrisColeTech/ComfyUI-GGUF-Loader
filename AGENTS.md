@@ -487,22 +487,47 @@ for — confirm the specific complaint, don't just port harder.
 Everything in this repo up to this point was pure Python nodes. This is
 the first `WEB_DIRECTORY` (`__init__.py`) + `web/*.js` frontend extension,
 added because `LTXV23IDLoraPromptEditor` needed something no pure-Python
-node can do: auto-populate an editable text widget with a value computed
-during that node's own execution (Python's `INPUT_TYPES` runs before
-execution and can't see another node's output, so there's no backend-only
-way to pre-fill a widget with "what the captioner just generated"). The
-JS hooks `nodeType.prototype.onExecuted`, reads the `ui` payload the
-Python node returns (`{"ui": {"visual": [...], "speech": [...], "sounds":
-[...]}, "result": (...)}`, which requires `OUTPUT_NODE = True` to
-guarantee the UI payload round-trips to the frontend), and writes each
-value into its matching widget **only if that widget is still empty** —
-so a user edit is never clobbered by a later run. This pattern (and the
-`OUTPUT_NODE = True` requirement) generalizes to any future "let the user
-review/edit what got generated" node; reach for it before inventing
-something else. Not yet tested inside a running ComfyUI frontend — the
-Python side (`_parse_id_lora_prompt`, `assemble`) is verified by
-`tools/smoke_id_lora_prompt_editor.py` and a real-environment check, but
-the JS auto-fill behavior itself needs an actual browser to confirm.
+node can do: display a value computed during that node's own execution
+(Python's `INPUT_TYPES` runs before execution and can't see another
+node's output, so there's no backend-only way to show "what the captioner
+just generated"). The JS hooks `nodeType.prototype.onExecuted` and reads
+the `ui` payload the Python node returns (`{"ui": {"visual": [...],
+"speech": [...], "sounds": [...]}, "result": (...)}`, which requires
+`OUTPUT_NODE = True` to guarantee the UI payload round-trips to the
+frontend).
+
+**First version wrote the parsed values directly into the
+`*_override` widgets, guarded by "only if that widget is still empty".
+Real bug, caught by the user testing it: it updated on the first run and
+never again.** Root cause wasn't the JS guard, it was structural: once a
+widget is auto-filled, it's non-empty, and `assemble()` has no way to
+tell "leftover auto-fill from last run" apart from "a deliberate
+override" from widget content alone — every run after the first reads
+back its own previous output and treats it as a manual override,
+ignoring whatever the (possibly changed) `source` now says. No JS-only
+fix exists for this; the ambiguity is server-side.
+
+**The actual fix, after reading `ComfyUI-Custom-Scripts`' `ShowText` node
+(`web/js/showText.js` + `py/show_text.py`) at the user's request**:
+`ShowText` is a *pure display* node — no override concept at all — and it
+destroys and rebuilds its display widget(s) from scratch on **every**
+execution, unconditionally, no "only if empty" logic anywhere. The
+correct design keeps display and override as two genuinely separate
+widgets: the `*_override` widgets stay exactly as originally designed
+(plain, empty-by-default, never touched by JS), and the JS instead adds
+three separate **read-only** display widgets after each run (tracked via
+`this._ccDisplayWidgets` so only those get removed/rebuilt, never the
+real override widgets), mirroring `ShowText`'s destroy-and-rebuild-fresh
+discipline exactly. This generalizes: any future "let the user see what
+got generated, and separately let them override it" node should use two
+distinct widgets per field, never one dual-purpose widget — auto-fill
+and manual-override are fundamentally incompatible on the same widget.
+
+Not yet re-verified inside a running ComfyUI frontend after this fix —
+the Python side (`_parse_id_lora_prompt`, `assemble`, unchanged by this
+fix) is verified by `tools/smoke_id_lora_prompt_editor.py` and a
+real-environment check; the corrected JS still needs an actual browser
+to confirm the display widgets appear/refresh correctly.
 
 ## Dev-box memory corruption (expanded 2026-08-19)
 

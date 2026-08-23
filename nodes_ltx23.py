@@ -746,9 +746,18 @@ class LTXV23IDLoraPromptEditor:
 
     Each ``*_override`` widget wins over the parsed value when non-empty, so
     editing one field does not require retyping the other two, and does not
-    require re-running the captioner. The paired ``web/`` JS extension
-    auto-fills the three widgets with the parsed values right after the node
-    runs, but ONLY when a widget is still empty - it never clobbers an edit.
+    require re-running the captioner. The override widgets are plain,
+    always-empty-by-default inputs that the frontend never writes into -
+    the paired ``web/`` JS extension instead adds three SEPARATE read-only
+    display widgets after each run showing the resolved values (following
+    ComfyUI-Custom-Scripts' ShowText convention: destroyed and rebuilt fresh
+    every execution). Writing generated text into the override widgets
+    themselves was tried first and is deliberately not done: once
+    auto-filled, a widget is non-empty, and there is no way for this
+    function to tell "leftover auto-fill from last run" apart from "a
+    deliberate override" - it would look like edits stop taking effect
+    after the first run, because every run after that reads back its own
+    previous output as if it were a manual override.
 
     Each field is also available as its own (post-override) output, not
     just baked into ``tagged_prompt`` - ``speech_text`` in particular so it
