@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`.
 
 | Node | Purpose |
 |---|---|
@@ -134,6 +134,20 @@ For an ID-LoRA talking-head pipeline (photo + reference voice → lip-synced vid
 **LM Studio Vision Prompt**, under `🤖 CCTech/LM Studio`, is a local drop-in for a cloud vision-prompt node such as comfy-core's `GeminiNode`: optional image + prompt + system_prompt in, one STRING out, so it slots into an existing workflow (e.g. `ltxv23_talking_head`'s photo-to-prompt step) without touching anything downstream. It talks to [LM Studio](https://lmstudio.ai/)'s local OpenAI-compatible server (`LM Studio > Developer > Start Server`; `base_url` defaults to `http://localhost:1234/v1` and is editable per node). Leave `model` blank to auto-use whatever's currently loaded in LM Studio (a live `/v1/models` call at run time, so it stays correct across model switches and across whichever `base_url` this node points at), or type an exact model id to pin one. A connection failure raises a clear "is the server running?" error rather than a bare traceback. Needs the optional `requests` dependency (`pip install requests`, already in `requirements.txt`).
 
 `tools/smoke_lmstudio.py` mocks the HTTP calls and validates payload assembly, response parsing and error handling — no GPU or running server required.
+
+### Qwen3-TTS
+
+**Qwen3-TTS Models Loader** + **Qwen3-TTS Custom Voice**, under `🤖 CCTech/Qwen TTS`, are a local port of the `flybirdxx/ComfyUI-Qwen-TTS` pack's `FB_Qwen3TTSCustomVoice` node (used for the reference voice in the `ltxv23_talking_head` workflow), wrapping the `qwen-tts` pip package's own `Qwen3TTSModel` directly — the model itself is a `transformers` checkpoint plus a separate codec/vocoder submodel, not this repo's GGUF-quantization territory, so there's nothing to port at the weights level.
+
+Download a `Qwen/Qwen3-TTS-12Hz-<size>-CustomVoice` repo (1.7B or 0.6B; the speech tokenizer/codec lives inside that same repo, no separate download) into `models/qwen_tts/<name>/`, e.g.:
+
+```
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ComfyUI/models/qwen_tts/1.7B-CustomVoice
+```
+
+The loader always loads with `local_files_only=True` — no network access once the files are on disk. `speaker` is a built-in named voice baked into the checkpoint (e.g. `"Dylan"`); an unknown name raises an error listing every valid one. `instruct` is real model-native conditioning on the 1.7B checkpoint, but the 0.6B checkpoint silently drops it upstream — this node logs a warning instead of reproducing that silence. Needs the optional `qwen-tts` dependency (already in `requirements.txt`).
+
+`tools/smoke_qwen_tts.py` stubs `folder_paths` and `qwen_tts.Qwen3TTSModel` and validates path discovery, loader kwargs/caching, and the generate node's seeding/AUDIO-dict/unload logic — no GPU or real weights required.
 
 ### MiniMax Music 3
 

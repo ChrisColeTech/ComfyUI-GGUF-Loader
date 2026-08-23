@@ -401,6 +401,42 @@ and `LTXV23AVDecode` themselves also still need a real-checkpoint GPU run
 `nodes_lmstudio.py` is the only piece with a real test today
 (`tools/smoke_lmstudio.py`, HTTP-mocked, no GPU needed).
 
+**Correction, and the TTS stage got ported too**: the user explicitly
+wants every pipeline stage ported into this repo, including ones already
+covered by a working third-party node pack — do not treat "leave X as-is"
+as settled just because an earlier multi-choice answer said so; confirm
+if in doubt (see the `feedback_port_everything` memory in the user's
+Claude memory store, not in this repo). `nodes_qwen_tts.py` ports the
+`ltxv23_talking_head` workflow's `FB_Qwen3TTSCustomVoice` node
+(`flybirdxx/ComfyUI-Qwen-TTS`) by wrapping the underlying `qwen-tts` pip
+package's own `Qwen3TTSModel` directly — the model is a `transformers`
+`PreTrainedModel` plus a separate codec/vocoder submodel, not this repo's
+GGUF-quantization territory (verified via a deep read of
+`qwen_tts/inference/qwen3_tts_model.py`), so there's nothing to port at
+the weights level, only a comfy face. Real, verified-against-source
+gotchas baked into the node:
+
+  * `Qwen3TTSModel.from_pretrained(path, local_files_only=True)` on a
+    local directory never touches the network — the speech
+    tokenizer/codec lives inside the same repo folder (`speech_tokenizer/`
+    subdir), it is not a second download;
+  * `instruct` is real model-native conditioning on the 1.7B checkpoint,
+    but the package silently drops it for 0.6B
+    (`tts_model_size in "0b6"` — a **substring** check, not a whitelist;
+    `_instruct_is_silently_dropped` in `nodes_qwen_tts.py` mirrors it
+    exactly rather than guessing at the real `tts_model_size` values,
+    which are unconfirmed);
+  * the package's own sampling defaults (`top_k=50, top_p=1.0,
+    temperature=0.9`) differ from the reference workflow's node
+    (`top_k=20, top_p=0.8, temperature=1.0`) — this node's widget
+    defaults match the workflow, not the package.
+
+Verified only with mocked `folder_paths`/`Qwen3TTSModel`
+(`tools/smoke_qwen_tts.py`) and a real-environment import check against
+the portable's actual `folder_paths` + installed `qwen_tts` package (no
+model downloaded yet, so `_model_paths()` correctly returns empty) — not
+yet run end-to-end with real weights loaded.
+
 ## Dev-box memory corruption (expanded 2026-08-19)
 
 The instability above is broader than a plain access violation and can surface

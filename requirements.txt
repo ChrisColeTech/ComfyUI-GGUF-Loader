@@ -5,3 +5,5 @@ sentencepiece
 protobuf
 # optional - LM Studio node
 requests
+# optional - Qwen3-TTS nodes
+qwen-tts
