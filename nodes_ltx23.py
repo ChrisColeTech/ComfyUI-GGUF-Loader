@@ -3,6 +3,17 @@
   LTXV23ModelsLoader   DiT + Gemma-3 TE (+ dual projection) + video VAE + audio VAE
   LTXV23ImgToVideo     prompts, init latent and noise masks for every mode
   LTXV23KSampler       euler on the DMD / distilled / refine sigma schedules
+  LTXV23RefineSampler  base pass -> spatial x2 latent upscale -> refine pass
+  LTXV23AVDecode       joint AV latent -> muxed VIDEO (video + audio VAE decode)
+
+ID-LoRA talking-head pipelines (e.g. the ``ltxv23_talking_head`` gallery
+workflow) layer a distilled LoRA + an ID-LoRA onto the model and a reference
+audio clip onto the conditioning before sampling. Both of those are already
+correctly served by stock core nodes -- ``LoraLoaderModelOnly`` (chain it
+twice: distilled strength ~0.5, then the ID-LoRA at strength ~1.0) and
+``LTXVReferenceAudio`` -- so this module does not wrap them; only the pieces
+core leaves as loose multi-node wiring (the two-stage refine sampler, and the
+final decode+mux) get a home here.
 
 The conditioning path mirrors comfy_extras/nodes_lt.py rather than
 reinterpreting it, because every deviation is a way to get a plausible-looking
@@ -25,6 +36,8 @@ A clip shorter than the video is zero-padded with mask 1 on the tail, so the
 model generates the remainder.
 """
 import logging
+import math
+from fractions import Fraction
 
 import comfy.model_management
 import comfy.nested_tensor
@@ -36,6 +49,12 @@ import folder_paths
 import node_helpers
 import nodes
 import torch
+
+try:
+    from comfy_api.latest import InputImpl as _VideoInputImpl
+    from comfy_api.latest import Types as _VideoTypes
+except ImportError:  # pragma: no cover - older comfy without the video API
+    _VideoInputImpl = _VideoTypes = None
 
 logger = logging.getLogger(__name__)
 
@@ -541,14 +560,170 @@ class LTXV23KSampler:
         return (latent,)
 
 
+# ── two-stage refine + decode ───────────────────────────────────────────────
+
+def _upsample_video_latent(latent, upscale_model, vae):
+    """Port of core LTXVLatentUpsampler, restricted to the video branch.
+
+    The upsample model only understands a single video-shaped tensor, not a
+    joint AV one, so the latent must be split before calling it and rejoined
+    after - calling it directly on the concatenated AV tensor does not error,
+    it silently treats part of the audio latent as video channels.
+    """
+    samples = latent["samples"]
+    video, audio = samples.unbind()
+
+    device = upscale_model.load_device
+    model = upscale_model.model
+    model_dtype = upscale_model.model_dtype()
+    input_dtype = video.dtype
+
+    memory_required = math.prod(video.shape) * 3000.0  # matches core's estimate
+    comfy.model_management.load_models_gpu([upscale_model], memory_required=memory_required)
+
+    video = video.to(dtype=model_dtype, device=device)
+    video = vae.first_stage_model.per_channel_statistics.un_normalize(video)
+    video = model(video)
+    video = vae.first_stage_model.per_channel_statistics.normalize(video)
+    video = video.to(dtype=input_dtype, device=comfy.model_management.intermediate_device())
+    audio = audio.to(video.device)
+
+    out = latent.copy()
+    out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
+    out.pop("noise_mask", None)  # the upsampled latent has no held frames left
+    return out
+
+
+class LTXV23RefineSampler:
+    """Base pass -> spatial x2 latent upscale -> refine pass, in one node.
+
+    Reuses LTXV23KSampler for both passes (same schedule/noise semantics,
+    verified separately) so there is exactly one place that owns the sigma
+    math. The only genuinely new logic is the upscale hop between them: see
+    ``_upsample_video_latent`` for why the joint latent has to be split and
+    rejoined around the upscale model rather than fed to it directly.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Two-Stage Sampler (base + refine) ⚡"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    DESCRIPTION = ("Base sampling pass, spatial x2 latent upscale, then a "
+                   "refine pass - the official LTX-2.3 two-stage recipe.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "upscale_model": ("LATENT_UPSCALE_MODEL",),
+                "vae": ("VAE", {"tooltip": "Video VAE - normalizes the latent "
+                                          "around the upscale model."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                 "control_after_generate": True}),
+                "base_schedule": (list(SIGMA_SETS), {"default": "dmd (8 steps)"}),
+                "base_steps": ("INT", {"default": 8, "min": 1, "max": 10000}),
+                "refine_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                        "control_after_generate": True}),
+                "refine_schedule": (list(SIGMA_SETS), {"default": "refine (3 steps)"}),
+                "refine_steps": ("INT", {"default": 3, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+            },
+        }
+
+    def sample(self, model, positive, negative, latent_image, upscale_model, vae,
+               seed, base_schedule, base_steps, refine_seed, refine_schedule,
+               refine_steps, cfg, sampler_name):
+        sampler = LTXV23KSampler()
+        base_latent, = sampler.sample(
+            model, positive, negative, latent_image, seed, base_steps, cfg,
+            sampler_name, base_schedule, denoise=1.0)
+
+        upscaled = _upsample_video_latent(base_latent, upscale_model, vae)
+        logger.info("LTX-2.3 refine: base %s -> upscaled %s",
+                    tuple(base_latent["samples"].unbind()[0].shape),
+                    tuple(upscaled["samples"].unbind()[0].shape))
+
+        refined, = sampler.sample(
+            model, positive, negative, upscaled, refine_seed, refine_steps, cfg,
+            sampler_name, refine_schedule, denoise=1.0)
+        return (refined,)
+
+
+class LTXV23AVDecode:
+    """Joint AV latent -> muxed VIDEO, in one node.
+
+    Wraps core VAEDecodeTiled (video) + LTXVAudioVAEDecode (audio) +
+    CreateVideo (mux), threading one ``fps`` through all three - the
+    plain-node version needs the same value typed into two different widgets
+    that have no wire between them, and a mismatch there is a silent
+    audio/video drift, not an error.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 AV Decode ⚡"
+    RETURN_TYPES = ("VIDEO",)
+    FUNCTION = "decode"
+    DESCRIPTION = "Decode a joint AV latent to a muxed VIDEO output."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "vae": ("VAE", {"tooltip": "Video VAE."}),
+                "audio_vae": ("VAE", {"tooltip": "Audio VAE."}),
+                "fps": ("FLOAT", {"default": FPS, "min": 1.0, "max": 120.0, "step": 0.01}),
+            },
+            "optional": {
+                "tile_size": ("INT", {"default": 768, "min": 64, "max": 4096, "step": 32}),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
+                "temporal_size": ("INT", {"default": 96, "min": 8, "max": 4096, "step": 4}),
+                "temporal_overlap": ("INT", {"default": 16, "min": 4, "max": 4096, "step": 4}),
+            },
+        }
+
+    def decode(self, latent, vae, audio_vae, fps, tile_size=768, overlap=64,
+               temporal_size=96, temporal_overlap=16):
+        if _VideoInputImpl is None:
+            raise RuntimeError(
+                "This ComfyUI is too old to expose comfy_api.latest's VIDEO "
+                "type; update ComfyUI or wire VAEDecodeTiled + "
+                "LTXVAudioVAEDecode + CreateVideo by hand.")
+
+        images, = nodes.VAEDecodeTiled().decode(
+            vae, latent, tile_size, overlap, temporal_size, temporal_overlap)
+
+        samples = latent["samples"]
+        audio_latent = samples.unbind()[-1] if samples.is_nested else samples
+        waveform = audio_vae.decode(audio_latent).movedim(-1, 1).to(audio_latent.device)
+        sample_rate = int(audio_vae.first_stage_model.output_sample_rate)
+        audio = {"waveform": waveform, "sample_rate": sample_rate}
+
+        video = _VideoInputImpl.VideoFromComponents(
+            _VideoTypes.VideoComponents(images=images, audio=audio,
+                                        frame_rate=Fraction(fps)))
+        logger.info("LTX-2.3 AV decode: %s frames @ %.2f fps, audio %s @ %d Hz",
+                    tuple(images.shape), fps, tuple(waveform.shape), sample_rate)
+        return (video,)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader,
     "LTXV23ImgToVideo": LTXV23ImgToVideo,
     "LTXV23KSampler": LTXV23KSampler,
+    "LTXV23RefineSampler": LTXV23RefineSampler,
+    "LTXV23AVDecode": LTXV23AVDecode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader.TITLE,
     "LTXV23ImgToVideo": LTXV23ImgToVideo.TITLE,
     "LTXV23KSampler": LTXV23KSampler.TITLE,
+    "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
+    "LTXV23AVDecode": LTXV23AVDecode.TITLE,
 }

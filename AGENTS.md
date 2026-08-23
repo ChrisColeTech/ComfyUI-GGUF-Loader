@@ -373,6 +373,34 @@ A node-level test (registering folder_paths manually) lives at
 Note: the dev box's Python env intermittently access-violates (0xC0000005) in
 native code during model builds; rerun before assuming code is broken.
 
+## LM Studio + LTX-2.3 talking-head port (2026-08-22)
+
+`nodes_lmstudio.py` (new module) replaces the one cloud call in the
+`ltxv23_talking_head` gallery workflow (a `GeminiNode` vision-prompt call)
+with `LMStudioVisionPrompt`, hitting a local LM Studio server's
+OpenAI-compatible `/v1/chat/completions`. Every other node in that reference
+workflow's video-generation subgraph — `CheckpointLoaderSimple`,
+`LoraLoaderModelOnly` ×2, `LTXVReferenceAudio`, `LTXVImgToVideoInplace`,
+`LTXVConcatAVLatent`/`LTXVSeparateAVLatent`, `LTXVLatentUpsampler`,
+`VAEDecodeTiled`, `LTXVAudioVAEDecode`, `CreateVideo`, samplers — is stock
+comfy-core (`cnr_id: comfy-core` in the workflow JSON), not something to port.
+Only two genuinely missing pieces got new nodes in `nodes_ltx23.py`:
+`LTXV23RefineSampler` (base pass → split → `LTXVLatentUpsampler` on the video
+branch only → rejoin → refine pass, mirroring core's exact wiring since
+calling the upscale model on the joint AV tensor directly does not error, it
+silently corrupts the audio branch) and `LTXV23AVDecode` (video+audio VAE
+decode + `CreateVideo` mux in one node, one `fps` instead of two unwired
+widgets that can silently drift).
+
+**Not yet GPU-verified**: whether stock `LoraLoaderModelOnly` patches
+correctly onto a GGUF-loaded, `GGMLTensor`-backed LTX-2.3 model from
+`LTXV23ModelsLoader`. If it does not, that becomes a follow-up
+`LTXV23LoraLoader` node rather than an assumption. `LTXV23RefineSampler`
+and `LTXV23AVDecode` themselves also still need a real-checkpoint GPU run
+(no CPU-mockable path, same as the rest of the LTX/Scenema stack) —
+`nodes_lmstudio.py` is the only piece with a real test today
+(`tools/smoke_lmstudio.py`, HTTP-mocked, no GPU needed).
+
 ## Dev-box memory corruption (expanded 2026-08-19)
 
 The instability above is broader than a plain access violation and can surface

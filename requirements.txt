@@ -3,3 +3,5 @@ gguf>=0.13.0
 # optional - tokenizer
 sentencepiece
 protobuf
+# optional - LM Studio node
+requests

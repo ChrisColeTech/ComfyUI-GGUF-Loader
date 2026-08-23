@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`.
 
 | Node | Purpose |
 |---|---|
@@ -123,9 +123,17 @@ For LTX-2.3-family A/V checkpoints split into components — built for the 10Ero
 
 The GGUF DiTs carry their transformer config as a GGUF KV — no metadata sidecar to lose — so comfy builds the real LTX-2.3 geometry (48 layers, 9-row modulation tables, 4096/2048 embeddings connectors) instead of guessing the older LTX-2 layout. GGUF and fp8 weights stay quantized; the loader outputs plain comfy **MODEL / CLIP / VAE** plus the audio VAE, so everything composes with core nodes.
 
-Sampling: `CLIPTextEncode` → **LTX-2.3 Img/Audio to Video** (one prep node: leave both optionals unconnected for txt2video, connect `image` for i2v, connect `reference_audio` for lip-synced audio-to-video — the official IA2V recipe, with the audio encoded and noise-mask-locked and the video length derived from the clip) → **LTX-2.3 KSampler (distilled)**. The sampler passes the exact LTX-2 distilled 8-step schedule (cfg 1.0, euler), stamps `frame_rate` onto the conditioning for RoPE, honors the prep node's noise masks, and offers the official 3-step `refine` schedule for a second pass after a latent ×2 upscale. Split the nested result with core `LTXVSeparateAVLatent`, then `VAE Decode` for video and `LTXVAudioVAEDecode` for audio.
+Sampling: `CLIPTextEncode` → **LTX-2.3 Img/Audio to Video** (one prep node: leave both optionals unconnected for txt2video, connect `image` for i2v, connect `reference_audio` for lip-synced audio-to-video — the official IA2V recipe, with the audio encoded and noise-mask-locked and the video length derived from the clip) → **LTX-2.3 KSampler (distilled)** or **LTX-2.3 Two-Stage Sampler (base + refine)**. Both pass the exact LTX-2 distilled schedules (cfg 1.0, euler) and stamp `frame_rate` onto the conditioning for RoPE; the two-stage sampler additionally runs the official 3-step `refine` pass after a spatial ×2 latent upscale (`LatentUpscaleModelLoader`'s output) in one node, splitting and rejoining the video/audio branches around the upscale model for you. Finish with **LTX-2.3 AV Decode** (video + audio VAE decode + mux, one `fps`) or, by hand, core `LTXVSeparateAVLatent` → `VAE Decode` + `LTXVAudioVAEDecode` → `CreateVideo`.
+
+For an ID-LoRA talking-head pipeline (photo + reference voice → lip-synced video, e.g. the `ltxv23_talking_head` gallery workflow): stack a distilled LoRA (~0.5 strength) and an ID-LoRA (~1.0 strength) onto the model with core `LoraLoaderModelOnly` ×2, and set the reference voice with core `LTXVReferenceAudio` before the sampler — both are already correctly served by stock nodes, no CCTech wrapper needed.
 
 `tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling.
+
+### LM Studio
+
+**LM Studio Vision Prompt**, under `🤖 CCTech/LM Studio`, is a local drop-in for a cloud vision-prompt node such as comfy-core's `GeminiNode`: optional image + prompt + system_prompt in, one STRING out, so it slots into an existing workflow (e.g. `ltxv23_talking_head`'s photo-to-prompt step) without touching anything downstream. It talks to [LM Studio](https://lmstudio.ai/)'s local OpenAI-compatible server (`LM Studio > Developer > Start Server`, default `http://localhost:1234/v1`) — the `model` dropdown is populated from a live `/v1/models` call when the node is added, and a connection failure raises a clear "is the server running?" error rather than a bare traceback. Needs the optional `requests` dependency (`pip install requests`, already in `requirements.txt`).
+
+`tools/smoke_lmstudio.py` mocks the HTTP calls and validates payload assembly, response parsing and error handling — no GPU or running server required.
 
 ### MiniMax Music 3
 
