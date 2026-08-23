@@ -462,9 +462,47 @@ own deprecation-warning emoji crashes on the default cp1252 console)
 landed cleanly at
 `N:\ComfyUI_windows_portable_nvidia\ComfyUI\models\Qwen3-TTS\Qwen3-TTS-12Hz-1.7B-CustomVoice\`
 (4.3 GB, `config.json` + `speech_tokenizer/` both present at the repo
-root as expected) — confirms the folder layout end-to-end, but the node
-has not yet been run for real (`from_pretrained` + `generate_custom_voice`
-against these actual weights) inside ComfyUI itself.
+root as expected) — confirms the folder layout end-to-end. **Update: the
+user confirmed real audio generation works end-to-end** through
+`QwenTTSModelsLoader` → `QwenTTSCustomVoiceGenerate` against these
+weights inside ComfyUI itself — the loader's dropdown-list-installed-only
+fix (below) landed after that first successful run.
+
+**The `repo_id` dropdown went through one more fix**: it started as the
+full fixed 5-entry `QWEN3_TTS_MODELS` list (matching DarioFT's pack
+literally), but the user correctly pushed back — a fixed list of names
+you can't tell apart from what's actually downloaded isn't "the
+convention," it's confusing. `_installed_repo_ids()` now scans
+`models/Qwen3-TTS/` and the dropdown shows only what's really on disk
+(falling back to the full list only when nothing is installed yet, so a
+fresh setup isn't stuck with an empty dropdown). Also rejected mid-fix: a
+`✓`-prefix decoration on the full list — the user explicitly wanted a
+plain list of installed models, not a fixed list with indicators. Lesson:
+"follow this pack's convention" doesn't mean copy its UI choices
+uncritically when they conflict with what the user is actually asking
+for — confirm the specific complaint, don't just port harder.
+
+## First JS frontend code: `web/ltx23_id_lora_prompt_editor.js` (2026-08-23)
+
+Everything in this repo up to this point was pure Python nodes. This is
+the first `WEB_DIRECTORY` (`__init__.py`) + `web/*.js` frontend extension,
+added because `LTXV23IDLoraPromptEditor` needed something no pure-Python
+node can do: auto-populate an editable text widget with a value computed
+during that node's own execution (Python's `INPUT_TYPES` runs before
+execution and can't see another node's output, so there's no backend-only
+way to pre-fill a widget with "what the captioner just generated"). The
+JS hooks `nodeType.prototype.onExecuted`, reads the `ui` payload the
+Python node returns (`{"ui": {"visual": [...], "speech": [...], "sounds":
+[...]}, "result": (...)}`, which requires `OUTPUT_NODE = True` to
+guarantee the UI payload round-trips to the frontend), and writes each
+value into its matching widget **only if that widget is still empty** —
+so a user edit is never clobbered by a later run. This pattern (and the
+`OUTPUT_NODE = True` requirement) generalizes to any future "let the user
+review/edit what got generated" node; reach for it before inventing
+something else. Not yet tested inside a running ComfyUI frontend — the
+Python side (`_parse_id_lora_prompt`, `assemble`) is verified by
+`tools/smoke_id_lora_prompt_editor.py` and a real-environment check, but
+the JS auto-fill behavior itself needs an actual browser to confirm.
 
 ## Dev-box memory corruption (expanded 2026-08-19)
 

@@ -37,6 +37,7 @@ model generates the remainder.
 """
 import logging
 import math
+import re
 from fractions import Fraction
 
 import comfy.model_management
@@ -712,12 +713,95 @@ class LTXV23AVDecode:
         return (video,)
 
 
+# ── ID-LoRA prompt editing ──────────────────────────────────────────────────
+
+# Lazily matches each [TAG]: body up to the next [TAG]: or end of string, so
+# it works whether SOUNDS (the last tag) or a middle tag like SPEECH is being
+# pulled out - a greedy `(.*)$` reproduces the exact "SPEECH swallows SOUNDS
+# too" bug this pattern exists to avoid. Tolerant of a Part-1 spoken-script
+# preamble before the tags (the LM Studio/captioner node's raw two-part
+# output) since it only anchors on the tags themselves, not on position.
+_ID_LORA_TAG_RE = re.compile(
+    r"\[(VISUAL|SPEECH|SOUNDS)\]:\s*(.*?)\s*(?=\[(?:VISUAL|SPEECH|SOUNDS)\]:|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_id_lora_prompt(source):
+    fields = {"VISUAL": "", "SPEECH": "", "SOUNDS": ""}
+    for tag, body in _ID_LORA_TAG_RE.findall(source or ""):
+        fields[tag.upper()] = body.strip()
+    return fields["VISUAL"], fields["SPEECH"], fields["SOUNDS"]
+
+
+class LTXV23IDLoraPromptEditor:
+    """Parse a generated [VISUAL]/[SPEECH]/[SOUNDS] block into three
+    editable fields, and reassemble a canonical ID-LoRA prompt string.
+
+    ``source`` is whatever the upstream captioner (e.g. LMStudioVisionPrompt)
+    produced - either its full two-part output (spoken script + tagged
+    block) or just the tagged block on its own; the parser only looks for
+    the three ``[TAG]:`` markers and ignores everything else, including a
+    Part-1 preamble.
+
+    Each ``*_override`` widget wins over the parsed value when non-empty, so
+    editing one field does not require retyping the other two, and does not
+    require re-running the captioner. The paired ``web/`` JS extension
+    auto-fills the three widgets with the parsed values right after the node
+    runs, but ONLY when a widget is still empty - it never clobbers an edit.
+
+    Each field is also available as its own (post-override) output, not
+    just baked into ``tagged_prompt`` - ``speech_text`` in particular so it
+    can feed a TTS node's ``text`` input directly instead of being extracted
+    a second time from a separate Part-1 split, which would let the two
+    extractions drift (e.g. one gets edited here, the other doesn't).
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 ID-LoRA Prompt Editor ⚡"
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("tagged_prompt", "visual_text", "speech_text", "sounds_text")
+    FUNCTION = "assemble"
+    OUTPUT_NODE = True
+    DESCRIPTION = ("Parse a generated [VISUAL]/[SPEECH]/[SOUNDS] block into "
+                   "three editable fields and reassemble it.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "source": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "The captioner's raw output - the full "
+                               "two-part text, or just the tagged block."}),
+            },
+            "optional": {
+                "visual_override": ("STRING", {"multiline": True, "default": ""}),
+                "speech_override": ("STRING", {"multiline": True, "default": ""}),
+                "sounds_override": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    def assemble(self, source, visual_override="", speech_override="",
+                sounds_override=""):
+        visual, speech, sounds = _parse_id_lora_prompt(source)
+        visual = visual_override.strip() or visual
+        speech = speech_override.strip() or speech
+        sounds = sounds_override.strip() or sounds
+
+        tagged_prompt = f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}"
+        return {
+            "ui": {"visual": [visual], "speech": [speech], "sounds": [sounds]},
+            "result": (tagged_prompt, visual, speech, sounds),
+        }
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader,
     "LTXV23ImgToVideo": LTXV23ImgToVideo,
     "LTXV23KSampler": LTXV23KSampler,
     "LTXV23RefineSampler": LTXV23RefineSampler,
     "LTXV23AVDecode": LTXV23AVDecode,
+    "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -726,4 +810,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23KSampler": LTXV23KSampler.TITLE,
     "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
+    "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,
 }
