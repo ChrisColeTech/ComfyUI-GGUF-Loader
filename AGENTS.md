@@ -819,3 +819,77 @@ math (both the image-only-fallback and image+control-summation paths — the
 latter is what proves an ordinary LoRA on the base `first` layer keeps
 working under the control patch), and `Krea2Img2Img`'s guard rails/latent
 shapes offline (17/17 passing, no GPU).
+
+## Krea2 Depth Map: porting a full model architecture, not just a wrapper node (2026-08-24)
+
+User asked "is that what the other repo does" re: auto-downloading a depth
+model - checked `comfyui-krea2-controlnet-main`'s own README, which says
+outright "`Krea2 Control Image Encode` is generic and does not run depth,
+canny, pose, or other preprocessors" and points at
+`Fannovel16/comfyui_controlnet_aux` instead. So a depth node is not a port
+of anything in that pack - it's new code, using whichever depth library.
+Per this repo's standing "port everything, no exceptions" rule, deep-dived
+`comfyui_controlnet_aux-main` (`node_wrappers/depth_anything_v2.py` +
+`src/custom_controlnet_aux/depth_anything_v2/`) to see what porting its
+actual Depth Anything V2 node requires, rather than defaulting to
+`transformers.AutoModelForDepthEstimation` (also already installed, and
+functionally equivalent) as a shortcut.
+
+Finding: the node wrapper is thin, but the detector underneath is a full
+from-scratch DINOv2 ViT encoder + DPT decoder reimplementation - NOT a call
+into `transformers` or any other library - spread across 9 files
+(`dinov2.py`, `dinov2_layers/{attention,block,drop_path,layer_scale,mlp,
+patch_embed,swiglu_ffn}.py`, `dpt.py`, `util/{blocks,transform}.py`),
+~1,200-1,500 lines. Both its deps (`cv2`, `einops`) are already installed
+in the ComfyUI env, so either approach needs zero new pip installs - the
+real trade-off was code volume/maintenance, not dependencies. Presented
+both options; user chose the full port ("it will be an easy port. go ahead
+and port it").
+
+Ported into one flat file, `depth_anything_v2.py`, matching this repo's
+existing flat-architecture-file convention (`melband_arch.py`,
+`seedvc_arch.py`) instead of the source's nested `dinov2_layers/`
+subpackage. Apache-2.0 in both repos, so no license conflict (checked
+`comfyui_controlnet_aux-main/LICENSE.txt` before porting anything).
+
+Deliberately trimmed dead-for-inference code paths, none of which change
+the module hierarchy or state_dict keys a checkpoint loads into:
+- `NestedTensorBlock` dropped in favor of plain `Block` - for a single
+  Tensor input (never a list, since this only ever runs one image through
+  eval-mode inference) `NestedTensorBlock.forward` dispatches straight
+  through to `Block.forward`, so they're behavior-identical here. This
+  also drops the entire xformers nested-tensor batch-grouping machinery
+  (`drop_add_residual_stochastic_depth_list`, `get_attn_bias_and_cat`,
+  `attn_bias_cache`, `add_residual`, `get_branges_scales`) - all only
+  reachable from list-of-tensors input.
+- `BlockChunk`/`_get_intermediate_layers_chunked`/`forward_features_list`
+  dropped - the source's own `DINOv2()` factory always calls with
+  `block_chunks=0`, so the chunked path is dead code for every checkpoint
+  this loads, confirmed by reading the factory before cutting it.
+- Stochastic-depth training branches in `Block.forward` dropped - only
+  reachable when `self.training` is True; this pack only ever calls
+  `.eval()` models.
+- `ConvBlock` in `dpt.py` dropped - defined in the source but never
+  referenced anywhere else in that file.
+
+Weight download reuses the exact convention `nodes_qwen_tts.py` already
+established: `os.path.join(folder_paths.models_dir, "depth_anything_v2")`,
+plain local folder (no symlink cache tricks, unlike the source pack's own
+`custom_hf_download` which supports a legacy `AUX_ANNOTATOR_CKPTS_PATH`
+config-file system this repo has no equivalent of and doesn't need).
+
+Verified by download+load, not just import-check: `_download_checkpoint`
+pulled the real `depth_anything_v2_vits.pth` from
+`depth-anything/Depth-Anything-V2-Small` on HuggingFace, and
+`model.load_state_dict(sd, strict=True)` succeeded with zero missing and
+zero unexpected keys - the strongest signal the consolidated module
+hierarchy exactly matches the original 9-file version's, since any
+renamed/reordered/dropped-by-mistake submodule would show up as a key
+mismatch here. End-to-end inference on a synthetic 256x320 image produced
+a correctly-shaped, full-range (0-255) depth map with no shape errors.
+
+New node `Krea2DepthMap` (`nodes_krea2.py`): `image` in, `ckpt_name` +
+`resolution` widgets, `IMAGE` (the depth map) out. Slots directly into
+`Krea2Img2Img`'s `control_image` input, closing the "I don't have any
+preprocessor installed" gap without requiring
+`comfyui_controlnet_aux` or any other external pack.

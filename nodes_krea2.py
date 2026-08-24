@@ -46,8 +46,11 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.sd
 import comfy.utils
+import numpy as np
 import folder_paths
 import nodes
+
+from . import depth_anything_v2
 
 logger = logging.getLogger(__name__)
 
@@ -859,14 +862,69 @@ class Krea2Img2Img:
         return (model, positive, negative, {"samples": latent}, denoise)
 
 
+class Krea2DepthMap:
+    """Estimate a depth map from an IMAGE - Depth Anything V2 (DINOv2 + DPT).
+
+    Ported from Fannovel16/comfyui_controlnet_aux (Apache-2.0)'s Depth Anything
+    V2 preprocessor node (see depth_anything_v2.py for the full architecture
+    port). Feed a source photo in, get a depth map IMAGE out - the exact input
+    Krea2ControlLoRALoader's depth-control-lora.safetensors expects on
+    Krea2Img2Img's control_image. Weights auto-download from HuggingFace on
+    first use into models/depth_anything_v2/, same pattern as this pack's
+    Qwen3-TTS loader - no extra install needed.
+    """
+
+    CATEGORY = KREA2_CATEGORY
+    TITLE = "Krea2 Depth Map ⚡"
+    SEARCH_ALIASES = ['depth anything', 'depth estimation', 'depth map', 'preprocessor',
+                       'controlnet preprocessor', 'image to depth']
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "estimate"
+    DESCRIPTION = ("Estimate a depth map from a photo (Depth Anything V2), for "
+                   "Krea2Img2Img's control_image input with the depth Control LoRA.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
+                    "default": "depth_anything_v2_vitb.pth",
+                    "tooltip": "Model size. vits (smallest/fastest) to vitg "
+                               "(largest/slowest). Downloads on first use if "
+                               "not already in models/depth_anything_v2."}),
+                "resolution": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
+            },
+        }
+
+    def estimate(self, image, ckpt_name="depth_anything_v2_vitb.pth", resolution=512):
+        detector = depth_anything_v2.DepthAnythingV2Detector(ckpt_name).to(
+            comfy.model_management.get_torch_device())
+
+        batch = image.shape[0]
+        out = None
+        for i in range(batch):
+            np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+            depth_rgb = detector.estimate(np_image, resolution=resolution)
+            depth_tensor = torch.from_numpy(depth_rgb.astype(np.float32) / 255.0)
+            if out is None:
+                out = torch.zeros(batch, *depth_tensor.shape, dtype=torch.float32)
+            out[i] = depth_tensor
+
+        del detector
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "Krea2ModelLoader": Krea2ModelLoader,
     "Krea2ControlLoRALoader": Krea2ControlLoRALoader,
+    "Krea2DepthMap": Krea2DepthMap,
     "Krea2Img2Img": Krea2Img2Img,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2ModelLoader": Krea2ModelLoader.TITLE,
     "Krea2ControlLoRALoader": Krea2ControlLoRALoader.TITLE,
+    "Krea2DepthMap": Krea2DepthMap.TITLE,
     "Krea2Img2Img": Krea2Img2Img.TITLE,
 }

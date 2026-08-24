@@ -1,6 +1,8 @@
 *.bin
 *.gguf
 *.safetensors
+*.pth
+/models/
 tools/llama.cpp*
 
 # local loader smoke-test scratch output
