@@ -724,3 +724,98 @@ Rule of thumb: an error that is *structurally impossible* for the object
 involved (missing `__dict__`, a dict that became a cell, a type that changed
 identity) is corruption, not logic. Rerun; if it does not reproduce with a
 deterministic replication of the same code path, stop hunting in the pack.
+
+## Krea2 Control (2026-08-24)
+
+Deep-dived `D:\Projects\ComfyUI\comfyui-krea2-controlnet-main` (no LICENSE
+file; nodes.py + README.md only) before writing anything. Its own convention:
+it ships **zero loader nodes** and assumes the base MODEL/VAE come from stock
+comfy loaders — its 3 nodes (`Krea2ControlLoRALoader`, `Krea2ControlApply`,
+`Krea2ControlImageEncode`) only patch a control-LoRA onto whatever MODEL you
+hand them, via comfy's native `ModelPatcher.add_patches` +
+`comfy.patcher_extension.PatcherInjection` + a `WrappersMP.DIFFUSION_MODEL`
+wrapper — no monkey-patching of the diffusion model class itself.
+
+Checked whether Krea2 needs the same from-scratch treatment `nodes_ltx23.py`
+got and confirmed it does not: `comfy/supported_models.py` has a native
+`Krea2(supported_models_base.BASE)` class (`unet_config.image_model ==
+"krea2"`), `comfy/ldm/krea2/model.py` has the real DiT, `comfy/sd.py` has
+`CLIPType.KREA2` wired to `comfy.text_encoders.krea2` (Qwen3-VL-4B), and
+`nodes.py`'s core `CLIPLoader` already lists `"krea2"` in its type dropdown.
+So unlike LTX-2.3 (comfy supports 0% of that pipeline: model, conditioning,
+sampler, and AV decode/mux all had to be built from scratch), Krea2's model /
+conditioning / sampler / decoder are ALL already correctly handled by stock
+`comfy.sd.load_diffusion_model_state_dict`, `CLIPTextEncode`, `KSampler`, and
+`VAEDecode`. Confirmed live: `UnetLoaderGGUF` in `nodes.py` already loads a
+Krea2 GGUF checkpoint with zero changes (`comfy.sd.load_diffusion_model_state_dict`
+auto-detects it); the only genuinely new thing is the Control LoRA mechanism,
+which has no comfy-native or LTX-2.3 equivalent at all.
+
+Landed on 3 nodes in `nodes_krea2.py`, after several rejected shapes mid-
+conversation:
+
+1. A combined loader that VAE-encoded the img2img source photo AND applied
+   the control-LoRA data in one call — rejected: it silently assumed
+   `control_image == source photo`, which is wrong (the control image is
+   usually a *depth map generated from* the photo by a separate preprocessor,
+   e.g. Depth Anything from `comfyui_controlnet_aux`), and it swallowed the
+   reference pack's deliberate "Apply is a required, loud-failing step"
+   safety design by merging it away.
+2. Reverting to the reference pack's exact 4-node shape (Loader + LoRALoader +
+   Encode + Apply, one-to-one) — technically correct but not this repo's
+   convention: asked "is this what we did for zimage?" and re-read
+   `nodes_zimage.py`. `ZImageImg2Img` already answers the "should
+   encode+attach live inside the prep node?" question for this repo: yes —
+   only the *loading* of control weights stays a separate node (comparable to
+   Z-Image's `ModelPatchLoader`); encode-and-attach lives inside the img2img
+   prep node itself, alongside the prompt and the init-image encode.
+
+Final shape mirrors `ZImageImg2Img` directly:
+
+- `Krea2ModelLoader` — MODEL/CLIP/VAE by name (mirrors `ZImageLoader`; no
+  `keep_loaded` cache, since `ZImageLoader` has none and nothing here needs
+  per-checkpoint surgery the way `ScenemaModelLoader` does).
+- `Krea2ControlLoRALoader` — `model` in, LoRA-patched `model` out. Stays
+  separate (unlike Z-Image's generic `ModelPatchLoader`) because the LoRA
+  patching reads the *specific* model's live weight shapes to find the
+  expanded `first` projection — it cannot be pre-loaded independent of a
+  model. Ported essentially verbatim from the reference pack (widened
+  `Krea2ControlInputProjection`, `LoRAAdapter` block patches via
+  `add_patches`, `PatcherInjection` inject/eject swapping `diffusion_model.first`
+  only for the duration of each forward call, restored in a `finally` so
+  removing the node leaves the base model untouched) — this is
+  correctness-critical low-level `ModelPatcher` plumbing, not something to
+  rederive.
+- `Krea2Img2Img` — `model, clip, vae, prompt, negative_prompt, strength,
+  width, height` + optional `image` (source photo, img2img) + optional
+  `control_image` (the depth/canny/etc. map) + prep knobs. VAE-encodes both,
+  attaches the control latent to the model, CLIP-encodes the prompt, all in
+  one call → `model, positive, negative, latent, denoise`, straight into a
+  stock `KSampler`. Raises immediately if `control_image` is given with no
+  Control LoRA loaded, or vice versa — same "never silently run a
+  half-configured model" guarantee the reference pack's separate `Apply`
+  node existed for, kept without a second required node. The empty-latent
+  (txt2img) path deliberately does NOT hardcode Krea2's channel count or
+  downscale ratio — it builds a plain 4-channel placeholder the same shape
+  stock `EmptyLatentImage` always produces, and relies on
+  `comfy.sample.fix_empty_latent_channels` (called from `common_ksampler`)
+  to correct channels/temporal-dim for whatever model is attached, exactly
+  like every other architecture already does through that same node.
+
+No `Krea2KSampler`: unlike Z-Image (which needed one for a Turbo-specific
+diffusers-vs-comfy denoise-schedule compatibility switch), nothing about
+Krea2 sampling needed reimplementing, so stock `KSampler` is enough.
+
+Verified against real weights on disk (not just import-checked): GGUF unet
+`D:\models\image-models\krea2\split\diffusion_models\Krea2_turbo_uncensored_edit-Q6_K.gguf`
+auto-detects as `Krea2` via `comfy.sd.load_diffusion_model_state_dict`; TE
+`qwen3vl_4b_fp8_scaled.safetensors` loads as `Krea2TEModel_` under
+`CLIPType.KREA2`; VAE `qwen_image_vae.safetensors` loads clean
+(`latent_dim=3`); the real `depth-control-lora.safetensors` shape-matches an
+expanded `first` projection (out=6144, image=64, control=64) and yields 224
+compatible block LoRA patches, all accepted by `add_patches`. `tools/smoke_krea2.py`
+covers the pure tensor-prep helpers, the `Krea2ControlInputProjection` forward
+math (both the image-only-fallback and image+control-summation paths — the
+latter is what proves an ordinary LoRA on the base `first` layer keeps
+working under the control patch), and `Krea2Img2Img`'s guard rails/latent
+shapes offline (17/17 passing, no GPU).

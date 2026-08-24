@@ -1,0 +1,285 @@
+"""CPU-only smoke test for nodes_krea2.py.
+
+Stubs the comfy-internal modules nodes_krea2.py imports at the top level so
+the pure tensor-prep helpers and the Krea2Img2Img control-LoRA guard rails
+can be verified without a running ComfyUI or GPU. Loading real GGUF/LoRA
+weights is covered separately (see check_krea2_real.py, run against the
+actual portable ComfyUI env - not part of this offline suite).
+
+Usage:  python tools/smoke_krea2.py
+"""
+import sys
+import types
+from pathlib import Path
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _FakePatcherInjection:
+    def __init__(self, inject=None, eject=None):
+        self.inject = inject
+        self.eject = eject
+
+
+class _FakeWrappersMP:
+    DIFFUSION_MODEL = "diffusion_model"
+
+
+class _FakeCallbacksMP:
+    ON_DETACH = "on_detach"
+    ON_CLEANUP = "on_cleanup"
+
+
+comfy = types.ModuleType("comfy")
+comfy_ldm = types.ModuleType("comfy.ldm")
+comfy_ldm_common_dit = types.ModuleType("comfy.ldm.common_dit")
+comfy_ldm_common_dit.pad_to_patch_size = lambda x, patch: x
+comfy_model_management = types.ModuleType("comfy.model_management")
+comfy_model_management.cast_to_device = lambda t, device, dtype: t.to(device=device, dtype=dtype)
+comfy_model_management.intermediate_device = lambda: torch.device("cpu")
+comfy_patcher_extension = types.ModuleType("comfy.patcher_extension")
+comfy_patcher_extension.PatcherInjection = _FakePatcherInjection
+comfy_patcher_extension.WrappersMP = _FakeWrappersMP
+comfy_patcher_extension.CallbacksMP = _FakeCallbacksMP
+comfy_sd = types.ModuleType("comfy.sd")
+comfy_utils = types.ModuleType("comfy.utils")
+comfy_utils.common_upscale = lambda samples, w, h, method, crop: torch.nn.functional.interpolate(
+    samples, size=(h, w), mode="bilinear", align_corners=False)
+comfy_utils.repeat_to_batch_size = lambda t, b: t.repeat(b, *([1] * (t.dim() - 1))) if t.shape[0] != b else t
+folder_paths = types.ModuleType("folder_paths")
+folder_paths.get_filename_list = lambda key: []
+folder_paths.get_full_path_or_raise = lambda key, name: name
+folder_paths.get_folder_paths = lambda key: []
+nodes = types.ModuleType("nodes")
+nodes.MAX_RESOLUTION = 16384
+
+sys.modules["comfy"] = comfy
+sys.modules["comfy.ldm"] = comfy_ldm
+sys.modules["comfy.ldm.common_dit"] = comfy_ldm_common_dit
+sys.modules["comfy.model_management"] = comfy_model_management
+sys.modules["comfy.patcher_extension"] = comfy_patcher_extension
+sys.modules["comfy.sd"] = comfy_sd
+sys.modules["comfy.utils"] = comfy_utils
+sys.modules["folder_paths"] = folder_paths
+sys.modules["nodes"] = nodes
+comfy.ldm = comfy_ldm
+comfy.model_management = comfy_model_management
+comfy.patcher_extension = comfy_patcher_extension
+comfy.sd = comfy_sd
+comfy.utils = comfy_utils
+
+sys.path.insert(0, str(REPO_ROOT))
+import nodes_krea2 as krea2  # noqa: E402
+
+
+class _FakeModelPatcher:
+    """Just enough of ModelPatcher for Krea2Img2Img's guard rails."""
+
+    def __init__(self, attachments=None):
+        self._attachments = dict(attachments or {})
+        self.model_options = {}
+
+    def get_attachment(self, key):
+        return self._attachments.get(key)
+
+    def clone(self):
+        return _FakeModelPatcher(self._attachments)
+
+
+# ── pure tensor-prep helpers ─────────────────────────────────────────────
+
+def test_prepare_control_image_grayscale_repeats_to_three_channels():
+    img = torch.rand(1, 8, 8, 3)
+    out = krea2._prepare_control_image(img, "grayscale", "none", False)
+    assert out.shape == (1, 8, 8, 3)
+    assert torch.allclose(out[..., 0], out[..., 1]) and torch.allclose(out[..., 1], out[..., 2])
+    print("[ok] _prepare_control_image: grayscale repeats to 3 identical channels")
+
+
+def test_prepare_control_image_minmax_normalizes_to_0_1():
+    img = torch.rand(1, 8, 8, 3) * 0.4 + 0.3  # narrow range, not touching 0 or 1
+    out = krea2._prepare_control_image(img, "rgb", "per_image_minmax", False)
+    assert out.min() >= -1e-6 and out.max() <= 1.0 + 1e-6
+    assert out.max() > 0.9  # actually stretched to fill the range
+    print("[ok] _prepare_control_image: per_image_minmax stretches to [0, 1]")
+
+
+def test_prepare_control_image_invert_flips_values():
+    img = torch.zeros(1, 4, 4, 3)
+    out = krea2._prepare_control_image(img, "rgb", "none", True)
+    assert torch.allclose(out, torch.ones_like(out))
+    print("[ok] _prepare_control_image: invert flips 0 -> 1")
+
+
+def test_prepare_control_image_single_channel_expands_to_rgb():
+    img = torch.rand(1, 4, 4, 1)
+    out = krea2._prepare_control_image(img, "rgb", "none", False)
+    assert out.shape == (1, 4, 4, 3)
+    print("[ok] _prepare_control_image: 1-channel input expands to 3")
+
+
+def test_resize_image_changes_spatial_dims():
+    img = torch.rand(1, 16, 16, 3)
+    out = krea2._resize_image(img, 32, 24)
+    assert out.shape == (1, 24, 32, 3)
+    print("[ok] _resize_image: resizes to the requested width/height")
+
+
+def test_flatten_temporal_if_needed_merges_batch_and_time():
+    x = torch.rand(2, 16, 3, 8, 8)
+    out = krea2._flatten_temporal_if_needed(x)
+    assert out.shape == (6, 16, 8, 8)
+    print("[ok] _flatten_temporal_if_needed: 5D [B,C,T,H,W] -> 4D [B*T,C,H,W]")
+
+
+def test_flatten_temporal_if_needed_passes_through_4d():
+    x = torch.rand(2, 16, 8, 8)
+    out = krea2._flatten_temporal_if_needed(x)
+    assert out is x
+    print("[ok] _flatten_temporal_if_needed: already-4D input passes through unchanged")
+
+
+def test_strip_known_prefixes():
+    assert krea2._strip_known_prefixes("model.diffusion_model.blocks.3.attn1.to_q") == "blocks.3.attn1.to_q"
+    assert krea2._strip_known_prefixes("blocks.3.attn1.to_q") == "blocks.3.attn1.to_q"
+    print("[ok] _strip_known_prefixes: strips every known checkpoint prefix layer")
+
+
+def test_target_key_from_lora_base():
+    assert krea2._target_key_from_lora_base("model.diffusion_model.blocks.3.attn1.to_q") \
+        == "diffusion_model.blocks.3.attn1.to_q.weight"
+    assert krea2._target_key_from_lora_base("first") is None
+    print("[ok] _target_key_from_lora_base: maps a block LoRA base to its ModelPatcher key")
+
+
+def test_lora_pairs_finds_matching_up_down():
+    sd = {
+        "blocks.0.attn1.to_q.lora_down.weight": torch.zeros(4, 8),
+        "blocks.0.attn1.to_q.lora_up.weight": torch.zeros(8, 4),
+        "blocks.0.attn1.to_q.lora_down.bias": torch.zeros(4),  # not a real pair, no .up match
+    }
+    pairs = list(krea2._lora_pairs(sd))
+    assert len(pairs) == 1
+    base, down_key, up_key = pairs[0]
+    assert base == "blocks.0.attn1.to_q"
+    print("[ok] _lora_pairs: finds exactly the one real down/up pair, ignores the rest")
+
+
+def test_first_shape_reads_expanded_projection():
+    proj = krea2.Krea2ControlInputProjection(torch.zeros(16, 8), image_features=4)
+    out_f, img_f, ctrl_f = krea2._first_shape(proj)
+    assert (out_f, img_f, ctrl_f) == (16, 4, 4)
+    print("[ok] _first_shape: reads out/image/control feature counts off an expanded projection")
+
+
+# ── Krea2ControlInputProjection forward ─────────────────────────────────────
+
+def test_control_projection_falls_back_to_original_first_with_no_control_tokens():
+    original = torch.nn.Linear(4, 16, bias=False)
+    with torch.no_grad():
+        original.weight.copy_(torch.arange(64, dtype=torch.float32).reshape(16, 4))
+    weight = torch.cat([original.weight, torch.zeros(16, 4)], dim=1)
+    proj = krea2.Krea2ControlInputProjection(weight, image_features=4, original_first=original)
+
+    x = torch.rand(1, 5, 4)
+    out = proj(x)
+    assert torch.allclose(out, original(x))
+    print("[ok] Krea2ControlInputProjection: no control tokens -> behaves as the original layer")
+
+
+def test_control_projection_adds_control_contribution():
+    original = torch.nn.Linear(4, 16, bias=False)
+    control_weight = torch.rand(16, 4)
+    with torch.no_grad():
+        original.weight.copy_(torch.rand(16, 4))
+    weight = torch.cat([original.weight, control_weight], dim=1)
+    proj = krea2.Krea2ControlInputProjection(weight, image_features=4, original_first=original)
+
+    x = torch.rand(1, 5, 4)
+    proj.control_tokens = torch.rand(1, 5, 4)
+    out = proj(x)
+    expected = original(x) + torch.nn.functional.linear(proj.control_tokens, control_weight, None)
+    assert torch.allclose(out, expected, atol=1e-5)
+    print("[ok] Krea2ControlInputProjection: with control tokens, image half + control half sum "
+          "(so an ordinary LoRA on the base 'first' layer still applies)")
+
+
+# ── Krea2Img2Img guard rails (the "never silently half-configured" checks) ──
+
+def test_img2img_rejects_control_image_without_loaded_lora():
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    try:
+        node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
+                     control_image=torch.rand(1, 8, 8, 3))
+        raised = False
+    except ValueError as e:
+        raised = "Krea2ControlLoRALoader" in str(e)
+    assert raised
+    print("[ok] Krea2Img2Img: control_image with no Control LoRA loaded raises, not silent")
+
+
+def test_img2img_rejects_loaded_lora_without_control_image():
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    try:
+        node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64)
+        raised = False
+    except ValueError as e:
+        raised = "control_image" in str(e)
+    assert raised
+    print("[ok] Krea2Img2Img: Control LoRA loaded with no control_image raises, not a silent partial run")
+
+
+def test_img2img_txt2img_empty_latent_shape():
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    _, _, _, latent, denoise = node.prepare(
+        model, clip, vae, "prompt", "", 0.6, 1, 64, 64)
+    assert latent["samples"].shape == (1, 4, 8, 8)
+    assert denoise == 1.0
+    print("[ok] Krea2Img2Img: txt2img (no image) -> empty latent sized off width/height, denoise=1.0")
+
+
+def test_img2img_with_image_uses_strength_as_denoise():
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    _, _, _, latent, denoise = node.prepare(
+        model, clip, vae, "prompt", "", 0.42, 1, 64, 64, image=torch.rand(1, 64, 64, 3))
+    assert denoise == 0.42
+    print("[ok] Krea2Img2Img: img2img (image given) -> denoise = strength")
+
+
+if __name__ == "__main__":
+    test_prepare_control_image_grayscale_repeats_to_three_channels()
+    test_prepare_control_image_minmax_normalizes_to_0_1()
+    test_prepare_control_image_invert_flips_values()
+    test_prepare_control_image_single_channel_expands_to_rgb()
+    test_resize_image_changes_spatial_dims()
+    test_flatten_temporal_if_needed_merges_batch_and_time()
+    test_flatten_temporal_if_needed_passes_through_4d()
+    test_strip_known_prefixes()
+    test_target_key_from_lora_base()
+    test_lora_pairs_finds_matching_up_down()
+    test_first_shape_reads_expanded_projection()
+    test_control_projection_falls_back_to_original_first_with_no_control_tokens()
+    test_control_projection_adds_control_contribution()
+    test_img2img_rejects_control_image_without_loaded_lora()
+    test_img2img_rejects_loaded_lora_without_control_image()
+    test_img2img_txt2img_empty_latent_shape()
+    test_img2img_with_image_uses_strength_as_denoise()
+    print("[ok] all nodes_krea2 smoke tests passed")
