@@ -876,6 +876,46 @@ class LTXV23SpeechBatchSelector:
         return (batch[clamped], n)
 
 
+class LTXV23IDLoraAssembler:
+    """Merge three separate visual/speech/sounds strings into the canonical
+    ID-LoRA prompt string.
+
+    The counterpart to ``LTXV23IDLoraPromptEditor``: that node parses ONE
+    combined source string apart into three editable fields; this node goes
+    the other direction, combining three ALREADY-SEPARATE strings (e.g. one
+    edited by hand, one picked from ``LTXV23SpeechBatchSelector``, one from
+    somewhere else entirely) into one formatted string. No source input, no
+    parsing, no state - a pure formatter, same job
+    ``LTXV23IDLoraPromptEditor.assemble()`` does internally, exposed on its
+    own for pipelines that already have the three pieces from elsewhere.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 ID-LoRA Assembler ⚡"
+    SEARCH_ALIASES = ["merge prompt", "combine prompt", "format prompt",
+                      "assemble prompt", "id lora prompt", "visual speech sounds"]
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("tagged_prompt",)
+    FUNCTION = "assemble"
+    DESCRIPTION = "Combine separate visual/speech/sounds strings into the ID-LoRA prompt format."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "visual": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "The [VISUAL] section text."}),
+                "speech": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "The [SPEECH] section text."}),
+                "sounds": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "The [SOUNDS] section text."}),
+            },
+        }
+
+    def assemble(self, visual, speech, sounds):
+        return (f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}",)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader,
     "LTXV23ImgToVideo": LTXV23ImgToVideo,
@@ -884,6 +924,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXV23AVDecode": LTXV23AVDecode,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
     "LTXV23SpeechBatchSelector": LTXV23SpeechBatchSelector,
+    "LTXV23IDLoraAssembler": LTXV23IDLoraAssembler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -894,4 +935,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,
     "LTXV23SpeechBatchSelector": LTXV23SpeechBatchSelector.TITLE,
+    "LTXV23IDLoraAssembler": LTXV23IDLoraAssembler.TITLE,
 }

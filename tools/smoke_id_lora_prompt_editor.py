@@ -216,6 +216,41 @@ def test_selector_count_matches_batch_length():
     print("[ok] selector: count output matches the batch length, for driving a for-each loop")
 
 
+# ── LTXV23IDLoraAssembler ────────────────────────────────────────────────────
+
+def test_assembler_combines_all_three_fields_in_order():
+    node = ltx23.LTXV23IDLoraAssembler()
+    (tagged,) = node.assemble(
+        visual="a woman in a kitchen",
+        speech="Hello there.",
+        sounds="warm, close mic, soft room tone",
+    )
+    assert tagged == (
+        "[VISUAL]: a woman in a kitchen\n"
+        "[SPEECH]: Hello there.\n"
+        "[SOUNDS]: warm, close mic, soft room tone"
+    )
+    print("[ok] assembler: combines visual/speech/sounds in the canonical order")
+
+
+def test_assembler_matches_editor_output_for_the_same_fields():
+    # Both nodes format identically - the assembler is the editor's
+    # formatting step, exposed standalone with no source/state.
+    visual, speech, sounds = ltx23._parse_id_lora_prompt(SAMPLE)
+    editor_tagged = ltx23.LTXV23IDLoraPromptEditor().assemble(
+        SAMPLE, visual, speech, sounds, unique_id="cmp")["result"][0]
+    assembler_tagged = ltx23.LTXV23IDLoraAssembler().assemble(visual, speech, sounds)[0]
+    assert editor_tagged == assembler_tagged
+    print("[ok] assembler: output matches LTXV23IDLoraPromptEditor's own formatting")
+
+
+def test_assembler_handles_blank_fields():
+    node = ltx23.LTXV23IDLoraAssembler()
+    (tagged,) = node.assemble(visual="", speech="", sounds="")
+    assert tagged == "[VISUAL]: \n[SPEECH]: \n[SOUNDS]: "
+    print("[ok] assembler: blank fields degrade cleanly, not a crash")
+
+
 if __name__ == "__main__":
     test_parse_extracts_all_three_fields()
     test_speech_does_not_swallow_sounds()
@@ -232,4 +267,7 @@ if __name__ == "__main__":
     test_selector_supports_negative_index()
     test_selector_clamps_out_of_range_index()
     test_selector_count_matches_batch_length()
+    test_assembler_combines_all_three_fields_in_order()
+    test_assembler_matches_editor_output_for_the_same_fields()
+    test_assembler_handles_blank_fields()
     print("[ok] all LTXV23IDLoraPromptEditor smoke tests passed")

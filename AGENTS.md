@@ -682,6 +682,23 @@ indexes — don't assume type strings are searchable text, and don't assume
 metadata attributes require the V3 `io.ComfyNode` API when a V1 dict-style
 class can carry them just as well via plain `getattr`.
 
+## LTXV23IDLoraAssembler: the deleted node comes back, deliberately narrower (2026-08-24)
+
+`LTXV23IDLoraAssembler` existed once already this session (attempt 4 of
+the prompt-editor redesign - see "ID-LoRA prompt editing" above) and was
+deleted when the design converged on `LTXV23IDLoraPromptEditor` doing
+everything (parse + edit + reassemble) in one node. Brought back on
+explicit request, but scoped correctly this time: `LTXV23IDLoraPromptEditor`
+handles the "one raw source in, edited fields out" case; this node handles
+"three already-separate strings in, one formatted string out" — e.g.
+combining a clip picked via `LTXV23SpeechBatchSelector` with hand-typed
+`visual`/`sounds` values, no source/parsing/state involved at all. They
+are not redundant; the first parses, the second only formats. Verified
+identical formatting output between the two (`assemble()` on both given
+the same three fields produces byte-identical strings) via
+`tools/smoke_id_lora_prompt_editor.py`, and a real-environment check
+confirms 34 nodes total register cleanly, `SEARCH_ALIASES` present.
+
 ## Dev-box memory corruption (expanded 2026-08-19)
 
 The instability above is broader than a plain access violation and can surface

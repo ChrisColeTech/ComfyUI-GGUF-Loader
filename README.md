@@ -133,6 +133,8 @@ The keep-the-edit-vs-refresh decision is made in Python by remembering the `sour
 
 A 5th output, `speech_text_batch`, splits `[SPEECH]` into one clip per non-blank line (a blank line is a separator, not an empty clip) and carries them as a real comfy list — `OUTPUT_IS_LIST = (False, False, False, False, True)` — rather than a delimited string. Pair it with **LTX-2.3 Speech Batch Selector**, which takes that list plus an `index` (negative counts from the end like Python; out-of-range clamps instead of erroring) and outputs the clip at that position plus `count` (the batch's total length, for driving a for-each loop) — `INPUT_IS_LIST = True` so it receives the whole batch in one call instead of comfy fanning out a separate call per clip.
 
+**LTX-2.3 ID-LoRA Assembler** is the Editor's formatting step exposed standalone: three plain `visual`/`speech`/`sounds` `STRING` inputs in, one formatted `[VISUAL]: .../[SPEECH]: .../[SOUNDS]: ...` string out — no `source`, no parsing, no edit-state. For when you already have the three pieces from elsewhere (e.g. a clip picked via `LTXV23SpeechBatchSelector`, or hand-typed values) and just need them combined, rather than parsed apart from a captioner's raw output.
+
 `tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling. `tools/smoke_id_lora_prompt_editor.py` covers the parser, every state-machine transition (first run empty/filled, edit preserved, source changed, per-node isolation), the batch split, and the selector's indexing/clamping — no GPU required; the JS write-back itself needs a browser to confirm.
 
 ### LM Studio
