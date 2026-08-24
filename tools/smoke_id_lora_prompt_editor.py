@@ -87,11 +87,12 @@ def test_first_run_with_empty_boxes_fills_them():
     node = ltx23.LTXV23IDLoraPromptEditor()
     nid = _fresh()
     out = node.assemble(SAMPLE, "", "", "", unique_id=nid)
-    tagged, v, s, snd = out["result"]
+    tagged, v, s, snd, batch = out["result"]
     expected = ltx23._parse_id_lora_prompt(SAMPLE)
     assert (v, s, snd) == expected
     assert tagged == f"[VISUAL]: {v}\n[SPEECH]: {s}\n[SOUNDS]: {snd}"
     assert out["ui"] == {"visual": [v], "speech": [s], "sounds": [snd]}
+    assert batch == [s]  # SAMPLE's SPEECH is a single line -> one clip
     print("[ok] first run, empty boxes: parsed from source, ui matches result")
 
 
@@ -100,7 +101,7 @@ def test_first_run_with_filled_boxes_preserves_them():
     # carries the user's saved edits in the widgets - do not clobber them.
     node = ltx23.LTXV23IDLoraPromptEditor()
     nid = _fresh()
-    _, v, s, snd = node.assemble(
+    _, v, s, snd, _ = node.assemble(
         SAMPLE, "my visual", "my speech", "my sounds", unique_id=nid)["result"]
     assert (v, s, snd) == ("my visual", "my speech", "my sounds")
     print("[ok] first run, filled boxes: saved edits survive a restart")
@@ -110,7 +111,7 @@ def test_same_source_keeps_user_edit():
     node = ltx23.LTXV23IDLoraPromptEditor()
     nid = _fresh()
     node.assemble(SAMPLE, "", "", "", unique_id=nid)          # run 1: fills
-    _, v, s, snd = node.assemble(                              # run 2: edited
+    _, v, s, snd, _ = node.assemble(                            # run 2: edited
         SAMPLE, "EDITED visual", "EDITED speech", "EDITED sounds",
         unique_id=nid)["result"]
     assert (v, s, snd) == ("EDITED visual", "EDITED speech", "EDITED sounds")
@@ -122,7 +123,7 @@ def test_changed_source_refreshes_all_three():
     nid = _fresh()
     node.assemble(SAMPLE, "", "", "", unique_id=nid)
     node.assemble(SAMPLE, "EDITED", "EDITED", "EDITED", unique_id=nid)
-    _, v, s, snd = node.assemble(                              # new caption
+    _, v, s, snd, _ = node.assemble(                            # new caption
         SAMPLE_2, "EDITED", "EDITED", "EDITED", unique_id=nid)["result"]
     assert (v, s, snd) == ltx23._parse_id_lora_prompt(SAMPLE_2)
     assert v.startswith("Wide shot") and "EDITED" not in v
@@ -134,7 +135,7 @@ def test_two_nodes_keep_independent_state():
     a, b = _fresh("a"), _fresh("b")
     node.assemble(SAMPLE, "", "", "", unique_id=a)
     # b has never run: its own empty boxes should still get filled.
-    _, v, _, _ = node.assemble(SAMPLE_2, "", "", "", unique_id=b)["result"]
+    _, v, _, _, _ = node.assemble(SAMPLE_2, "", "", "", unique_id=b)["result"]
     assert v.startswith("Wide shot")
     # a's remembered source is untouched by b's run.
     assert ltx23._LAST_SOURCE[a] == SAMPLE
@@ -144,10 +145,68 @@ def test_two_nodes_keep_independent_state():
 def test_blank_source_degrades_to_empty_fields():
     node = ltx23.LTXV23IDLoraPromptEditor()
     nid = _fresh()
-    tagged, v, s, snd = node.assemble("", "", "", "", unique_id=nid)["result"]
+    tagged, v, s, snd, batch = node.assemble("", "", "", "", unique_id=nid)["result"]
     assert (v, s, snd) == ("", "", "")
     assert tagged == "[VISUAL]: \n[SPEECH]: \n[SOUNDS]: "
+    assert batch == [""]  # never an empty list - nothing to index
     print("[ok] blank source: degrades to empty fields, not a crash")
+
+
+# ── speech_text_batch / selector ─────────────────────────────────────────────
+
+SAMPLE_MULTILINE = """A three-line delivery.
+
+---
+
+[VISUAL]: a woman speaking to camera
+
+[SPEECH]: First clip line.
+Second clip line.
+Third clip line.
+
+[SOUNDS]: calm, close mic
+"""
+
+
+def test_batch_splits_on_non_blank_lines():
+    node = ltx23.LTXV23IDLoraPromptEditor()
+    nid = _fresh()
+    _, _, _, _, batch = node.assemble(
+        SAMPLE_MULTILINE, "", "", "", unique_id=nid)["result"]
+    assert batch == ["First clip line.", "Second clip line.", "Third clip line."]
+    print("[ok] speech_text_batch: one clip per non-blank SPEECH line")
+
+
+def test_batch_ignores_blank_separator_lines():
+    node = ltx23.LTXV23IDLoraPromptEditor()
+    nid = _fresh()
+    _, _, _, _, batch = node.assemble(
+        "\n---\n[VISUAL]: x\n[SPEECH]: line a\n\nline b\n[SOUNDS]: y",
+        "", "", "", unique_id=nid)["result"]
+    assert batch == ["line a", "line b"]  # the blank line is a separator, not a clip
+    print("[ok] speech_text_batch: a blank line between clips is not itself a clip")
+
+
+def test_selector_picks_the_requested_index():
+    node = ltx23.LTXV23SpeechBatchSelector()
+    batch = ["a", "b", "c"]
+    assert node.select(batch, [1]) == ("b",)
+    print("[ok] selector: picks the requested index")
+
+
+def test_selector_supports_negative_index():
+    node = ltx23.LTXV23SpeechBatchSelector()
+    batch = ["a", "b", "c"]
+    assert node.select(batch, [-1]) == ("c",)
+    print("[ok] selector: negative index counts from the end, like Python")
+
+
+def test_selector_clamps_out_of_range_index():
+    node = ltx23.LTXV23SpeechBatchSelector()
+    batch = ["a", "b", "c"]
+    assert node.select(batch, [99]) == ("c",)
+    assert node.select(batch, [-99]) == ("a",)
+    print("[ok] selector: out-of-range index clamps instead of crashing")
 
 
 if __name__ == "__main__":
@@ -160,4 +219,9 @@ if __name__ == "__main__":
     test_changed_source_refreshes_all_three()
     test_two_nodes_keep_independent_state()
     test_blank_source_degrades_to_empty_fields()
+    test_batch_splits_on_non_blank_lines()
+    test_batch_ignores_blank_separator_lines()
+    test_selector_picks_the_requested_index()
+    test_selector_supports_negative_index()
+    test_selector_clamps_out_of_range_index()
     print("[ok] all LTXV23IDLoraPromptEditor smoke tests passed")

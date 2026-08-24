@@ -580,6 +580,38 @@ check against the portable's comfy. **The JS write-back has no offline
 test** — it needs a browser (and a Ctrl+F5 hard refresh, since `web/` files
 are cached).
 
+### speech_text_batch + LTXV23SpeechBatchSelector (2026-08-24)
+
+User reported `[SPEECH]` "losing all the line breaks" — traced both
+`_parse_id_lora_prompt` and `assemble()` with an embedded-`\n` test and
+found no stripping in either; turned out the actual ask was a 5th editor
+output, `speech_text_batch` (one clip per non-blank line of `[SPEECH]`,
+a blank line being a separator not an empty clip), plus a new node to
+index into it. Once that shipped, the "losing line breaks" complaint was
+resolved by definition — there was no separate bug to chase.
+
+Real comfy list mechanics, not a delimited-string workaround: verified
+against `upstream/ComfyUI/execution.py` directly rather than assumed.
+`OUTPUT_IS_LIST` (`merge_result_data`, `:326-345`) is a **per-output**
+tuple — a `True` slot's returned list is `extend`-ed straight into the
+graph output, so `assemble()` just returns a Python list for that slot.
+`INPUT_IS_LIST` (`get_input_data` `:159-190` +
+`_async_map_node_over_list` `:241-265`) is a **class-level** bool on the
+*consumer*: a linked input's cached upstream value is handed over
+completely unwrapped (so `LTXV23SpeechBatchSelector`'s `batch` param
+receives the real list, no extra layer), while every OTHER input
+(including plain widgets like `index`) is still wrapped in a length-1
+list regardless — hence `index[0]` to unwrap it. Getting this backwards
+(assuming `batch` arrives double-wrapped, or that `index` doesn't need
+unwrapping) is an easy, silent mistake; there is no error, just a
+selector that always returns the same clip regardless of index.
+
+`LTXV23SpeechBatchSelector.select()` clamps out-of-range `index`
+(including negative, Python-style) to the nearest valid position with a
+logged warning rather than raising — this is a UI convenience node for
+iterating through clips, not a strict data-integrity boundary, so a
+momentarily-out-of-range index while editing shouldn't hard-fail a queue.
+
 ## Dev-box memory corruption (expanded 2026-08-19)
 
 The instability above is broader than a plain access violation and can surface

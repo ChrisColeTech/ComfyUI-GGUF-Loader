@@ -778,8 +778,10 @@ class LTXV23IDLoraPromptEditor:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 ID-LoRA Prompt Editor ⚡"
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("tagged_prompt", "visual_text", "speech_text", "sounds_text")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("tagged_prompt", "visual_text", "speech_text", "sounds_text",
+                    "speech_text_batch")
+    OUTPUT_IS_LIST = (False, False, False, False, True)
     FUNCTION = "assemble"
     OUTPUT_NODE = True          # required for the ui payload to reach the frontend
     DESCRIPTION = ("Edit a captioner's [VISUAL]/[SPEECH]/[SOUNDS] fields and "
@@ -809,10 +811,58 @@ class LTXV23IDLoraPromptEditor:
         _LAST_SOURCE[unique_id] = source
 
         tagged_prompt = f"[VISUAL]: {visual}\n[SPEECH]: {speech}\n[SOUNDS]: {sounds}"
+        # One clip per non-blank line. A blank line is treated as a separator,
+        # not an empty clip - "line one\n\nline two" is 2 clips, not 3.
+        speech_batch = [line.strip() for line in speech.splitlines() if line.strip()]
+        if not speech_batch:
+            speech_batch = [""]  # never return an empty list - nothing to index
+
         return {
             "ui": {"visual": [visual], "speech": [speech], "sounds": [sounds]},
-            "result": (tagged_prompt, visual, speech, sounds),
+            "result": (tagged_prompt, visual, speech, sounds, speech_batch),
         }
+
+
+class LTXV23SpeechBatchSelector:
+    """Pick one clip out of a speech_text_batch list by index.
+
+    ``batch`` must arrive as the whole list in one call, not fanned out one
+    call per item - INPUT_IS_LIST=True (comfy's execution.py:245,
+    _async_map_node_over_list) does exactly that, at the cost of every input
+    (including ``index``) arriving wrapped in a length-1 list, unwrapped
+    below.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Speech Batch Selector ⚡"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("selected_text",)
+    FUNCTION = "select"
+    INPUT_IS_LIST = True
+    DESCRIPTION = "Pick one clip from a speech_text_batch list by index."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "batch": ("STRING", {"forceInput": True,
+                    "tooltip": "A speech_text_batch list, e.g. from the "
+                               "ID-LoRA Prompt Editor."}),
+                "index": ("INT", {"default": 0, "min": -0xffffffff, "max": 0xffffffff,
+                    "tooltip": "0-based; negative counts from the end like "
+                               "Python (-1 = last clip). Out-of-range clamps "
+                               "to the nearest valid index."}),
+            },
+        }
+
+    def select(self, batch, index):
+        index = int(index[0])
+        n = len(batch)
+        clamped = max(-n, min(index, n - 1))
+        if clamped != index:
+            logger.warning("LTX-2.3 Speech Batch Selector: index %d out of "
+                           "range for %d clip(s), clamped to %d", index, n, clamped)
+        return (batch[clamped],)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -822,6 +872,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXV23RefineSampler": LTXV23RefineSampler,
     "LTXV23AVDecode": LTXV23AVDecode,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
+    "LTXV23SpeechBatchSelector": LTXV23SpeechBatchSelector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -831,4 +882,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,
+    "LTXV23SpeechBatchSelector": LTXV23SpeechBatchSelector.TITLE,
 }
