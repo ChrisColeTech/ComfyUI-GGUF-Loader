@@ -612,6 +612,35 @@ logged warning rather than raising — this is a UI convenience node for
 iterating through clips, not a strict data-integrity boundary, so a
 momentarily-out-of-range index while editing shouldn't hard-fail a queue.
 
+## ScenemaModelLoader gained a keep_loaded cache (2026-08-24)
+
+Had zero caching until now — every `load()` call rebuilt MODEL/CLIP/VAE
+from raw state dicts regardless of whether the four filename dropdowns
+were unchanged, unlike `nodes_ltx23.py`'s `_load_ltxv_clip`/
+`_ENCODER_CACHE`, which exists for exactly this reason ("comfy re-runs
+loader nodes on every prompt edit"). Same fix, same shape: a module-level
+`_MODEL_CACHE` dict keyed on `(transformer_name, text_encoder_name,
+pipeline_name, vae_encoder_name)`, single-slot (`.clear()` before storing
+— holding more than one full DiT+TE+VAE stack isn't worth the RAM/VRAM),
+gated by a new `keep_loaded` BOOLEAN widget (default `True`) rather than
+always-on, since the user specifically asked for a toggle — an explicit
+off switch for the case a file on disk was replaced without renaming it,
+where the cache would otherwise serve stale weights under the same key.
+
+Verified: real-environment `INPUT_TYPES()` check via the synthetic-package
+import pattern (`cctech_gguf_pkg` rooted at the repo, importing this
+repo's own `nodes.py` first so `unet_gguf`/`clip_gguf` folder keys are
+registered before `ScenemaModelLoader.INPUT_TYPES()` calls
+`folder_paths.get_filename_list("unet_gguf")` — needed because
+`nodes_scenema.py` does `from .loader import ...` at module level, not
+lazily inside a function like `nodes_ltx23.py` does, so it can't be
+loaded via a bare `spec_from_file_location` the way the LTX-2.3/Qwen-TTS
+checks in this file were). Not yet GPU-verified that the cached objects
+survive a real generate → SeedVC's `unload_all_models()` → generate-again
+cycle correctly (expected to, since that only pages weights off GPU, it
+doesn't touch the Python objects this cache holds — but not confirmed
+with real weights).
+
 ## Dev-box memory corruption (expanded 2026-08-19)
 
 The instability above is broader than a plain access violation and can surface

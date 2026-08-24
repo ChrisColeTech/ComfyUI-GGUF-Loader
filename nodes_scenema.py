@@ -672,6 +672,14 @@ def _clip_filename_list():
 
 SCENEMA_CATEGORY = "🤖 CCTech/Scenema"
 
+# Keeps the most recently built (model, clip, vae) resident so re-queuing a
+# graph with unchanged loader widgets skips a full rebuild - the DiT alone is
+# 7-10 GB and the Gemma-3 text encoder ~24 GB, both reconstructed from raw
+# state dicts on every load() call today (no caching at all, unlike
+# nodes_ltx23.py's _ENCODER_CACHE, which this mirrors). Single-slot: holding
+# more than one full stack at once isn't worth the VRAM/RAM.
+_MODEL_CACHE = {}
+
 
 def _select_seedvc_identity(skip_vc, chunk_count, identity_reference,
                             first_processed, sample_rate):
@@ -715,6 +723,13 @@ class ScenemaModelLoader:
                                "Optional: needed to encode voice references only when "
                                "the pipeline file above ships without its encoder "
                                "(the full pipeline checkpoint already includes one)."}),
+                "keep_loaded": ("BOOLEAN", {"default": True,
+                    "tooltip": "Reuse the last-built model/clip/vae when these four "
+                               "filenames are unchanged, instead of rebuilding from "
+                               "disk every run (the DiT alone is 7-10 GB, the text "
+                               "encoder ~24 GB). Turn off to always force a fresh "
+                               "rebuild, e.g. after replacing a file on disk without "
+                               "renaming it."}),
             },
         }
 
@@ -725,7 +740,12 @@ class ScenemaModelLoader:
                    "encoder with GGUF support, audio VAE) as native comfy objects.")
 
     def load(self, transformer_name, text_encoder_name, pipeline_name,
-             vae_encoder_name="none"):
+             vae_encoder_name="none", keep_loaded=True):
+        key = (transformer_name, text_encoder_name, pipeline_name, vae_encoder_name)
+        if keep_loaded and key in _MODEL_CACHE:
+            logger.info("Scenema: reusing cached model/clip/vae for %s", transformer_name)
+            return _MODEL_CACHE[key]
+
         # ── transformer → comfy LTXAV MODEL (audio-only forward baked in) ──
         t_path = folder_paths.get_full_path("unet", transformer_name) \
             or folder_paths.get_full_path_or_raise("unet", transformer_name)
@@ -840,7 +860,11 @@ class ScenemaModelLoader:
                 "to use voice references.")
         del vae_sd, p_sd, p_meta
 
-        return (model, clip, vae)
+        result = (model, clip, vae)
+        if keep_loaded:
+            _MODEL_CACHE.clear()
+            _MODEL_CACHE[key] = result
+        return result
 
 class ScenemaVAEEncode:
     """Encode reference audio to an audio latent for voice cloning (A2V).
