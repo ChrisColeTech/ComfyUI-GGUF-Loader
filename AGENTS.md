@@ -893,3 +893,32 @@ New node `Krea2DepthMap` (`nodes_krea2.py`): `image` in, `ckpt_name` +
 `Krea2Img2Img`'s `control_image` input, closing the "I don't have any
 preprocessor installed" gap without requiring
 `comfyui_controlnet_aux` or any other external pack.
+
+## Krea2Img2Img's two guard rails were wrongly made symmetric (2026-08-24)
+
+User hit `ValueError: control_image was given, but model has no Krea2
+Control LoRA loaded` from a real workflow and asked why it wasn't just
+ignored. Right call - the two directions of the original guard rail were
+NOT actually equal-risk, and treating them as a symmetric pair was a
+mistake:
+
+- Control LoRA loaded, no `control_image` -> genuinely dangerous. The
+  model has a wrapper installed (from `Krea2ControlLoRALoader`) that
+  expects a control latent in `transformer_options` at sample time; if it's
+  missing, the forward pass fails (or worse) deep inside sampling instead
+  of at graph-build time. Correctly raises immediately - kept as-is.
+- `control_image` given, no Control LoRA loaded -> NOT dangerous. There is
+  no widened input projection installed at all, so there's nothing to
+  attach the control latent to and no half-configured model state to worry
+  about. Raising here just forces users to physically disconnect
+  `control_image` every time they want to toggle the LoRA loader off,
+  which is exactly the "not easy" friction this whole feature was built to
+  avoid.
+
+Fixed: this direction now logs a warning and sets `control_image = None`
+instead of raising, so a preprocessor chain (e.g. `Krea2DepthMap`) can stay
+wired into the graph permanently while the Control LoRA loader is toggled
+on/off. `tools/smoke_krea2.py`'s
+`test_img2img_rejects_control_image_without_loaded_lora` renamed to
+`test_img2img_ignores_control_image_without_loaded_lora` and updated to
+assert the call succeeds instead of raising (17/17 still passing).

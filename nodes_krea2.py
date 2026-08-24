@@ -754,10 +754,12 @@ class Krea2Img2Img:
     """Prompts, init latent, and optional control image for Krea2 - one node.
 
     Leave image unconnected for txt2img. Leave control_image unconnected for
-    plain img2img/txt2img with no LoRA-guided control. If a Krea2 Control
-    LoRA is loaded (via Krea2ControlLoRALoader), control_image is required -
-    this raises instead of silently sampling a half-configured model, same
-    guarantee the original pack's separate Apply node existed for.
+    plain img2img/txt2img with no LoRA-guided control - if no Control LoRA is
+    loaded, a connected control_image is simply ignored (with a warning),
+    since there's nothing to attach it to. If a Krea2 Control LoRA IS loaded
+    (via Krea2ControlLoRALoader), control_image becomes required - that
+    direction raises instead of silently sampling a half-configured model,
+    the same guarantee the original pack's separate Apply node existed for.
 
     Feed the outputs straight into a stock KSampler.
     """
@@ -816,9 +818,14 @@ class Krea2Img2Img:
                 control_invert=False, control_batch_mode="independent_images"):
         has_control_lora = model.get_attachment(WRAPPER_KEY) is not None
         if control_image is not None and not has_control_lora:
-            raise ValueError(
-                "control_image was given, but model has no Krea2 Control LoRA loaded. "
-                "Connect Krea2ControlLoRALoader before Krea2Img2Img.")
+            # Nothing to attach it to - no widened input projection is
+            # installed - so there's no half-configured state to worry
+            # about. Ignore it rather than force control_image to be
+            # disconnected just to toggle the LoRA loader on/off.
+            logger.warning(
+                "Krea2Img2Img: control_image was given, but model has no Krea2 "
+                "Control LoRA loaded - ignoring control_image.")
+            control_image = None
         if control_image is None and has_control_lora:
             raise ValueError(
                 "model has a Krea2 Control LoRA loaded, but no control_image was given. "

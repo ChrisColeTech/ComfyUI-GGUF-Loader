@@ -213,20 +213,20 @@ def test_control_projection_adds_control_contribution():
 
 # ── Krea2Img2Img guard rails (the "never silently half-configured" checks) ──
 
-def test_img2img_rejects_control_image_without_loaded_lora():
+def test_img2img_ignores_control_image_without_loaded_lora():
+    # No widened input projection is installed, so there's nothing to attach
+    # control_image to and no half-configured state - it's safe to ignore
+    # (with a warning), not an error. Unlike the reverse case (LoRA loaded,
+    # no control_image), which IS a real half-configured-model risk.
     node = krea2.Krea2Img2Img()
     model = _FakeModelPatcher()
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
     vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
-    try:
-        node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
-                     control_image=torch.rand(1, 8, 8, 3))
-        raised = False
-    except ValueError as e:
-        raised = "Krea2ControlLoRALoader" in str(e)
-    assert raised
-    print("[ok] Krea2Img2Img: control_image with no Control LoRA loaded raises, not silent")
+    result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
+                          control_image=torch.rand(1, 8, 8, 3))
+    assert result is not None
+    print("[ok] Krea2Img2Img: control_image with no Control LoRA loaded is ignored, not an error")
 
 
 def test_img2img_rejects_loaded_lora_without_control_image():
@@ -283,7 +283,7 @@ if __name__ == "__main__":
     test_first_shape_reads_expanded_projection()
     test_control_projection_falls_back_to_original_first_with_no_control_tokens()
     test_control_projection_adds_control_contribution()
-    test_img2img_rejects_control_image_without_loaded_lora()
+    test_img2img_ignores_control_image_without_loaded_lora()
     test_img2img_rejects_loaded_lora_without_control_image()
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
