@@ -12,6 +12,7 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,7 @@ comfy_ldm_common_dit.pad_to_patch_size = lambda x, patch: x
 comfy_model_management = types.ModuleType("comfy.model_management")
 comfy_model_management.cast_to_device = lambda t, device, dtype: t.to(device=device, dtype=dtype)
 comfy_model_management.intermediate_device = lambda: torch.device("cpu")
+comfy_model_management.get_torch_device = lambda: torch.device("cpu")
 comfy_patcher_extension = types.ModuleType("comfy.patcher_extension")
 comfy_patcher_extension.PatcherInjection = _FakePatcherInjection
 comfy_patcher_extension.WrappersMP = _FakeWrappersMP
@@ -85,9 +87,13 @@ class _FakeModelPatcher:
     def __init__(self, attachments=None):
         self._attachments = dict(attachments or {})
         self.model_options = {}
+        self.model = types.SimpleNamespace()  # no get_model_object/process_latent_in
 
     def get_attachment(self, key):
         return self._attachments.get(key)
+
+    def get_model_object(self, key):
+        raise AttributeError(key)
 
     def clone(self):
         return _FakeModelPatcher(self._attachments)
@@ -241,7 +247,83 @@ def test_img2img_rejects_loaded_lora_without_control_image():
     except ValueError as e:
         raised = "control_image" in str(e)
     assert raised
-    print("[ok] Krea2Img2Img: Control LoRA loaded with no control_image raises, not a silent partial run")
+    print("[ok] Krea2Img2Img: Control LoRA loaded, auto_depth mode, no image or control_image -> raises")
+
+
+def test_img2img_manual_mode_requires_control_image():
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    try:
+        node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
+                     image=torch.rand(1, 32, 32, 3), control_mode="manual")
+        raised = False
+    except ValueError as e:
+        raised = "manual" in str(e) and "control_image" in str(e)
+    assert raised
+    print("[ok] Krea2Img2Img: Control LoRA loaded, manual mode, image given but no "
+          "control_image -> raises (manual mode never auto-derives)")
+
+
+def test_img2img_auto_depth_derives_control_image_from_image():
+    # Auto-derivation goes through depth_anything_v2.DepthAnythingV2Detector,
+    # which needs real downloaded weights - not appropriate for an offline
+    # smoke test. Swap in a fake detector to verify the wiring/control flow
+    # (default control_mode="auto_depth", no control_image needed) without
+    # touching the real model.
+    class _FakeDetector:
+        def __init__(self, ckpt_name):
+            self.ckpt_name = ckpt_name
+
+        def to(self, device):
+            return self
+
+        def estimate(self, np_image, resolution=512):
+            return np.zeros_like(np_image)
+
+    original = krea2.depth_anything_v2.DepthAnythingV2Detector
+    krea2.depth_anything_v2.DepthAnythingV2Detector = _FakeDetector
+    try:
+        node = krea2.Krea2Img2Img()
+        model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
+        clip = types.SimpleNamespace(
+            encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+        vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+        result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
+                              image=torch.rand(1, 32, 32, 3))
+        assert result is not None
+    finally:
+        krea2.depth_anything_v2.DepthAnythingV2Detector = original
+    print("[ok] Krea2Img2Img: auto_depth mode (default) derives control_image from "
+          "image automatically - one photo, one slot")
+
+
+def test_img2img_explicit_control_image_overrides_auto_depth():
+    # Even in the default auto_depth mode, an explicitly-connected
+    # control_image must win over auto-derivation (e.g. a hand-picked depth
+    # map). Prove the detector is never touched when control_image is given.
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("DepthAnythingV2Detector must not be constructed "
+                             "when control_image is explicitly connected")
+
+    original = krea2.depth_anything_v2.DepthAnythingV2Detector
+    krea2.depth_anything_v2.DepthAnythingV2Detector = _fail_if_called
+    try:
+        node = krea2.Krea2Img2Img()
+        model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
+        clip = types.SimpleNamespace(
+            encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+        vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+        result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
+                              image=torch.rand(1, 32, 32, 3),
+                              control_image=torch.rand(1, 32, 32, 3))
+        assert result is not None
+    finally:
+        krea2.depth_anything_v2.DepthAnythingV2Detector = original
+    print("[ok] Krea2Img2Img: an explicitly-connected control_image overrides "
+          "auto_depth derivation")
 
 
 def test_img2img_txt2img_empty_latent_shape():
@@ -285,6 +367,9 @@ if __name__ == "__main__":
     test_control_projection_adds_control_contribution()
     test_img2img_ignores_control_image_without_loaded_lora()
     test_img2img_rejects_loaded_lora_without_control_image()
+    test_img2img_manual_mode_requires_control_image()
+    test_img2img_auto_depth_derives_control_image_from_image()
+    test_img2img_explicit_control_image_overrides_auto_depth()
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
     print("[ok] all nodes_krea2 smoke tests passed")

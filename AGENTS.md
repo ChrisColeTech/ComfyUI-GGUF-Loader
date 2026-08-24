@@ -922,3 +922,55 @@ on/off. `tools/smoke_krea2.py`'s
 `test_img2img_rejects_control_image_without_loaded_lora` renamed to
 `test_img2img_ignores_control_image_without_loaded_lora` and updated to
 assert the call succeeds instead of raising (17/17 still passing).
+
+## Krea2Img2Img: control_mode, folding depth derivation into the img2img node (2026-08-24)
+
+User's own summary of the confusion, verbatim: "that wasnt exactly my
+quatsion, i didnt sat 2 nodes, i said 2 slots" - i.e. even with the
+mechanics explained, wiring the same source photo into two different input
+slots (`Krea2DepthMap.image` for structure, `Krea2Img2Img.image` for the
+img2img starting latent) to do one thing (depth-guided generation from one
+photo) was genuinely bad UX, not just under-explained.
+
+Then, a direct and correct challenge: "because you didnt display some type
+of selector or something, how do you know what type of lora is loaded? or
+what type of control image is selected?" Answer is honest, not a design
+flaw to patch around: nothing in a `.safetensors` LoRA file says whether
+it's a depth/canny/pose/etc. LoRA - there is no metadata field for it, so
+the pack genuinely cannot detect it. The fix isn't detection (impossible);
+it's an explicit selector for the one decision this pack *can* make on its
+own (derive a depth map automatically) vs. everything else (which needs a
+human to say what it is).
+
+Added `control_mode` (`["auto_depth", "manual"]`, default `auto_depth`) to
+`Krea2Img2Img`:
+- `auto_depth` - if a Control LoRA is loaded and `control_image` isn't
+  explicitly connected, runs the same `depth_anything_v2.DepthAnythingV2Detector`
+  `Krea2DepthMap` uses, internally, on `image` - so the depth-LoRA case
+  (the one this pack can fully support in software) collapses to one photo,
+  one slot, no second node.
+- `manual` - no automatic derivation at all; `control_image` must be
+  supplied by hand, for canny/pose/lineart/normal or any other Control LoRA
+  type this pack has no automatic preprocessor for.
+- An explicitly-connected `control_image` always overrides `auto_depth`
+  in either mode - a hand-picked depth map, or `Krea2DepthMap`'s own
+  output routed in manually, still works exactly as before.
+
+`Krea2DepthMap` stays as a standalone node (not removed) for anyone who
+wants to inspect the depth map directly, feed it into something else, or
+build the graph by hand instead of relying on auto_depth.
+
+`depth_ckpt_name` (same combo as `Krea2DepthMap.ckpt_name`) added
+alongside `control_mode` so auto_depth's model size is configurable without
+needing the standalone node.
+
+Added 3 tests to `tools/smoke_krea2.py`
+(`test_img2img_manual_mode_requires_control_image`,
+`test_img2img_auto_depth_derives_control_image_from_image`,
+`test_img2img_explicit_control_image_overrides_auto_depth`), the latter two
+monkeypatching `krea2.depth_anything_v2.DepthAnythingV2Detector` with a
+fake (real weights/inference not appropriate for an offline smoke test -
+covered separately against real weights, same as the rest of this feature).
+`_FakeModelPatcher` gained a `.model` attribute and a `get_model_object`
+that raises, since these tests now reach `_process_control_latent_for_model`
+instead of stopping at the earlier guard-rail checks. 21/21 passing.

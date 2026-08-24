@@ -757,9 +757,21 @@ class Krea2Img2Img:
     plain img2img/txt2img with no LoRA-guided control - if no Control LoRA is
     loaded, a connected control_image is simply ignored (with a warning),
     since there's nothing to attach it to. If a Krea2 Control LoRA IS loaded
-    (via Krea2ControlLoRALoader), control_image becomes required - that
-    direction raises instead of silently sampling a half-configured model,
-    the same guarantee the original pack's separate Apply node existed for.
+    (via Krea2ControlLoRALoader) and neither control_image nor a usable
+    image is available, this raises instead of silently sampling a
+    half-configured model, the same guarantee the original pack's separate
+    Apply node existed for.
+
+    control_mode picks how the control signal is produced, since nothing in
+    a LoRA file says what type it is (depth vs canny vs pose, ...):
+      "auto_depth" (default) - derive a depth map from `image` automatically
+        (Depth Anything V2, same as Krea2DepthMap) - correct for a depth
+        Control LoRA, so one photo plugged into `image` is enough.
+      "manual" - do no automatic derivation; control_image must be supplied
+        by hand (a canny/pose/etc. map, or a hand-picked depth map) - use
+        this for any Control LoRA that isn't the depth one.
+    Connecting control_image explicitly always overrides auto-derivation,
+    in either mode.
 
     Feed the outputs straight into a stock KSampler.
     """
@@ -793,13 +805,22 @@ class Krea2Img2Img:
                 "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
             },
             "optional": {
-                "image": ("IMAGE", {"tooltip": "Init image for img2img. Leave unconnected "
-                                               "for txt2img."}),
+                "image": ("IMAGE", {"tooltip": "Init image for img2img, and (in auto_depth "
+                                               "mode) the source photo depth is derived from. "
+                                               "Leave unconnected for txt2img."}),
+                "control_mode": (["auto_depth", "manual"], {"default": "auto_depth",
+                    "tooltip": "auto_depth: derive a depth map from `image` automatically - "
+                               "correct for the depth Control LoRA. manual: no automatic "
+                               "derivation, connect control_image yourself - use this for "
+                               "any other Control LoRA type (canny/pose/lineart/normal)."}),
+                "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
+                    "default": "depth_anything_v2_vitb.pth",
+                    "tooltip": "auto_depth mode only. Model size for the automatic depth "
+                               "estimation. Downloads on first use if not already in "
+                               "models/depth_anything_v2."}),
                 "control_image": ("IMAGE", {
-                    "tooltip": "Control map for the loaded Control LoRA - e.g. a depth "
-                               "map (from a preprocessor such as Depth Anything) for "
-                               "the depth LoRA. NOT your source photo directly unless "
-                               "the LoRA expects rgb (canny/pose/lineart/normal)."}),
+                    "tooltip": "Manual control map - a depth/canny/pose/etc. map. Overrides "
+                               "auto_depth when connected. Required in manual mode."}),
                 "control_channel_mode": (["grayscale", "rgb"], {"default": "grayscale",
                     "tooltip": "grayscale for depth; rgb for canny/pose/lineart/normal."}),
                 "control_normalize": (["per_image_minmax", "none"], {"default": "per_image_minmax",
@@ -813,7 +834,8 @@ class Krea2Img2Img:
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
-                width, height, image=None, control_image=None,
+                width, height, image=None, control_mode="auto_depth",
+                depth_ckpt_name="depth_anything_v2_vitb.pth", control_image=None,
                 control_channel_mode="grayscale", control_normalize="per_image_minmax",
                 control_invert=False, control_batch_mode="independent_images"):
         has_control_lora = model.get_attachment(WRAPPER_KEY) is not None
@@ -826,11 +848,30 @@ class Krea2Img2Img:
                 "Krea2Img2Img: control_image was given, but model has no Krea2 "
                 "Control LoRA loaded - ignoring control_image.")
             control_image = None
-        if control_image is None and has_control_lora:
-            raise ValueError(
-                "model has a Krea2 Control LoRA loaded, but no control_image was given. "
-                "Sampling would fail with a missing control latent - connect one, or "
-                "remove Krea2ControlLoRALoader.")
+
+        if has_control_lora and control_image is None:
+            if control_mode == "auto_depth" and image is not None:
+                logger.info("Krea2: auto-deriving depth map from image (control_mode=auto_depth)")
+                detector = depth_anything_v2.DepthAnythingV2Detector(depth_ckpt_name).to(
+                    comfy.model_management.get_torch_device())
+                depth_batch = []
+                for i in range(image.shape[0]):
+                    np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+                    depth_rgb = detector.estimate(np_image, resolution=512)
+                    depth_batch.append(torch.from_numpy(depth_rgb.astype(np.float32) / 255.0))
+                control_image = torch.stack(depth_batch, dim=0)
+                del detector
+            elif control_mode == "auto_depth":
+                raise ValueError(
+                    "model has a Krea2 Control LoRA loaded and control_mode is auto_depth, "
+                    "but no image was given to derive a depth map from. Connect image, or "
+                    "connect control_image directly, or remove Krea2ControlLoRALoader.")
+            else:
+                raise ValueError(
+                    "model has a Krea2 Control LoRA loaded and control_mode is manual, but "
+                    "no control_image was given. Sampling would fail with a missing control "
+                    "latent - connect control_image, switch control_mode to auto_depth (depth "
+                    "LoRA only), or remove Krea2ControlLoRALoader.")
 
         if image is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own
