@@ -831,12 +831,16 @@ class LTXV23SpeechBatchSelector:
     _async_map_node_over_list) does exactly that, at the cost of every input
     (including ``index``) arriving wrapped in a length-1 list, unwrapped
     below.
+
+    ``count`` is the batch's total length - wire it into a loop node's
+    iteration-count input to drive a for-each over the batch (e.g. bump
+    ``index`` from 0 to ``count - 1`` across iterations).
     """
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 Speech Batch Selector ⚡"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("selected_text",)
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("selected_text", "count")
     FUNCTION = "select"
     INPUT_IS_LIST = True
     DESCRIPTION = "Pick one clip from a speech_text_batch list by index."
@@ -862,7 +866,7 @@ class LTXV23SpeechBatchSelector:
         if clamped != index:
             logger.warning("LTX-2.3 Speech Batch Selector: index %d out of "
                            "range for %d clip(s), clamped to %d", index, n, clamped)
-        return (batch[clamped],)
+        return (batch[clamped], n)
 
 
 NODE_CLASS_MAPPINGS = {

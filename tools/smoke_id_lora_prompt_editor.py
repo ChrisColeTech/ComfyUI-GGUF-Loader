@@ -190,23 +190,30 @@ def test_batch_ignores_blank_separator_lines():
 def test_selector_picks_the_requested_index():
     node = ltx23.LTXV23SpeechBatchSelector()
     batch = ["a", "b", "c"]
-    assert node.select(batch, [1]) == ("b",)
+    assert node.select(batch, [1]) == ("b", 3)
     print("[ok] selector: picks the requested index")
 
 
 def test_selector_supports_negative_index():
     node = ltx23.LTXV23SpeechBatchSelector()
     batch = ["a", "b", "c"]
-    assert node.select(batch, [-1]) == ("c",)
+    assert node.select(batch, [-1]) == ("c", 3)
     print("[ok] selector: negative index counts from the end, like Python")
 
 
 def test_selector_clamps_out_of_range_index():
     node = ltx23.LTXV23SpeechBatchSelector()
     batch = ["a", "b", "c"]
-    assert node.select(batch, [99]) == ("c",)
-    assert node.select(batch, [-99]) == ("a",)
+    assert node.select(batch, [99]) == ("c", 3)
+    assert node.select(batch, [-99]) == ("a", 3)
     print("[ok] selector: out-of-range index clamps instead of crashing")
+
+
+def test_selector_count_matches_batch_length():
+    node = ltx23.LTXV23SpeechBatchSelector()
+    _, count = node.select(["x", "y", "z", "w"], [0])
+    assert count == 4
+    print("[ok] selector: count output matches the batch length, for driving a for-each loop")
 
 
 if __name__ == "__main__":
@@ -224,4 +231,5 @@ if __name__ == "__main__":
     test_selector_picks_the_requested_index()
     test_selector_supports_negative_index()
     test_selector_clamps_out_of_range_index()
+    test_selector_count_matches_batch_length()
     print("[ok] all LTXV23IDLoraPromptEditor smoke tests passed")
