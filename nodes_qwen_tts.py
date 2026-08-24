@@ -180,6 +180,7 @@ class QwenTTSModelsLoader:
 
     CATEGORY = QWEN_TTS_CATEGORY
     TITLE = "Qwen3-TTS Models Loader ⚡"
+    SEARCH_ALIASES = ['load model', 'tts model', 'model loader', 'text to speech loader']
     RETURN_TYPES = ("QWEN_TTS_MODEL",)
     FUNCTION = "load"
     DESCRIPTION = "Load a Qwen3-TTS checkpoint (downloads on first use)."
@@ -267,6 +268,7 @@ class QwenTTSCustomVoiceGenerate:
 
     CATEGORY = QWEN_TTS_CATEGORY
     TITLE = "Qwen3-TTS Custom Voice ⚡"
+    SEARCH_ALIASES = ['generate audio', 'text to speech', 'tts', 'voice generation', 'speak text']
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     DESCRIPTION = ("Generate speech with a Qwen3-TTS CustomVoice model's "

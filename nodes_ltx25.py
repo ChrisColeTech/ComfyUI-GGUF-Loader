@@ -99,6 +99,7 @@ class LTXV25EmptyLatentAVBatch:
 
     CATEGORY = LTX25_CATEGORY
     TITLE = "Empty LTX-2.5 AV Latent (Batch) ⚡"
+    SEARCH_ALIASES = ['empty latent', 'new latent', 'create latent', 'blank latent', 'audio latent', 'video latent', 'batch latent']
 
     @classmethod
     def INPUT_TYPES(s):

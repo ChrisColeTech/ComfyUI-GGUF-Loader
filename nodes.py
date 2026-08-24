@@ -328,6 +328,7 @@ class UnetLoaderGGUF:
     FUNCTION = "load_unet"
     CATEGORY = "🤖 CCTech/GGUF"
     TITLE = "UNET Loader (GGUF) ⚡"
+    SEARCH_ALIASES = ['load model', 'model loader', 'gguf', 'unet loader', 'diffusion model loader', 'quantized model']
 
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
         ops = GGMLOps()
@@ -379,6 +380,7 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
             }
         }
     TITLE = "UNET Loader (GGUF/Advanced) ⚡"
+    SEARCH_ALIASES = ['load model', 'model loader', 'gguf', 'unet loader', 'diffusion model loader', 'quantized model', 'advanced']
 
 class CLIPLoaderGGUF:
     @classmethod
@@ -394,6 +396,7 @@ class CLIPLoaderGGUF:
     FUNCTION = "load_clip"
     CATEGORY = "🤖 CCTech/GGUF"
     TITLE = "CLIP Loader (GGUF) ⚡"
+    SEARCH_ALIASES = ['load clip', 'text encoder', 'clip loader', 'gguf', 'quantized clip']
 
     @classmethod
     def get_filename_list(s):
@@ -486,6 +489,7 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
         }
 
     TITLE = "Dual CLIP Loader (GGUF) ⚡"
+    SEARCH_ALIASES = ['load clip', 'dual clip', 'text encoder', 'clip loader', 'gguf']
 
     def load_clip(self, clip_name1, clip_name2, type):
         clip_path1 = self._resolve_clip_path(clip_name1)
@@ -560,6 +564,7 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
         return {"required": required}
 
     TITLE = "Triple CLIP Loader (GGUF) ⚡"
+    SEARCH_ALIASES = ['load clip', 'triple clip', 'text encoder', 'clip loader', 'gguf']
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
         clip_path1 = self._resolve_clip_path(clip_name1)
@@ -585,6 +590,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
         return {"required": required}
 
     TITLE = "Quadruple CLIP Loader (GGUF) ⚡"
+    SEARCH_ALIASES = ['load clip', 'quadruple clip', 'text encoder', 'clip loader', 'gguf']
 
     def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
         clip_path1 = self._resolve_clip_path(clip_name1)

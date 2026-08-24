@@ -701,6 +701,7 @@ class ScenemaModelLoader:
 
     CATEGORY = SCENEMA_CATEGORY
     TITLE = "Scenema Models Loader ⚡"
+    SEARCH_ALIASES = ['load model', 'model loader', 'load vae', 'audio vae', 'load clip']
 
     @classmethod
     def INPUT_TYPES(s):
@@ -876,6 +877,7 @@ class ScenemaVAEEncode:
 
     CATEGORY = SCENEMA_CATEGORY
     TITLE = "Scenema VAE Encode (voice reference) ⚡"
+    SEARCH_ALIASES = ['encode audio', 'voice reference', 'audio to latent', 'encode latent']
 
     @classmethod
     def INPUT_TYPES(s):
@@ -930,6 +932,7 @@ class ScenemaAudioGenerate:
 
     CATEGORY = SCENEMA_CATEGORY
     TITLE = "Scenema Audio Generate ⚡"
+    SEARCH_ALIASES = ['generate audio', 'text to speech', 'tts', 'voice clone', 'speak text']
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1171,6 +1174,7 @@ class ScenemaAudioVoiceClone:
 
     CATEGORY = SCENEMA_CATEGORY
     TITLE = "Scenema Audio Voice Clone ⚡"
+    SEARCH_ALIASES = ['voice conversion', 'voice clone', 'revoice', 'identity transfer']
 
     @classmethod
     def INPUT_TYPES(s):

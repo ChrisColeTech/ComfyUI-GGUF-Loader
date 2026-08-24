@@ -131,6 +131,7 @@ def _decode_audio(vae, samples, tiled, tile_size, overlap):
 class MiniMaxMusic3ModelsLoader:
     CATEGORY = MUSIC_CATEGORY
     TITLE = "MiniMax Music 3 Models Loader ⚡"
+    SEARCH_ALIASES = ['load model', 'model loader', 'music model', 'load vae', 'load clip']
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -186,6 +187,7 @@ class MiniMaxMusic3ModelsLoader:
 class MiniMaxMusic3AudioGenerate:
     CATEGORY = MUSIC_CATEGORY
     TITLE = "MiniMax Music 3 Audio Generate ⚡"
+    SEARCH_ALIASES = ['generate audio', 'text to music', 'music generation', 'generate music']
 
     @classmethod
     def INPUT_TYPES(cls):

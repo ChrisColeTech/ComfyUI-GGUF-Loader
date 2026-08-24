@@ -196,6 +196,7 @@ class MiniMaxH3PromptWriter:
 
     CATEGORY = H3_CATEGORY
     TITLE = "MiniMax H3 Prompt Writer ⚡"
+    SEARCH_ALIASES = ['write prompt', 'generate prompt', 'prompt writer', 'llm prompt']
 
     @classmethod
     def INPUT_TYPES(s):
@@ -325,6 +326,7 @@ class MiniMaxH3PromptFormat:
 
     CATEGORY = H3_CATEGORY
     TITLE = "MiniMax H3 Prompt Format ⚡"
+    SEARCH_ALIASES = ['format prompt', 'prompt template', 'prompt formatter']
 
     @classmethod
     def INPUT_TYPES(s):
@@ -403,6 +405,7 @@ class MiniMaxH3EmptyLatentAVBatch:
 
     CATEGORY = H3_CATEGORY
     TITLE = "Empty MiniMax H3 AV Latent (Batch) ⚡"
+    SEARCH_ALIASES = ['empty latent', 'new latent', 'create latent', 'blank latent', 'audio latent', 'video latent', 'batch latent']
 
     @classmethod
     def INPUT_TYPES(s):
@@ -453,6 +456,7 @@ class MiniMaxH3BatchPatch:
 
     CATEGORY = H3_CATEGORY
     TITLE = "MiniMax H3 Batch Patch ⚡"
+    SEARCH_ALIASES = ['batch patch', 'batch size fix', 'fix batch']
 
     @classmethod
     def INPUT_TYPES(s):

@@ -160,6 +160,7 @@ class AudioStemSplit:
 
     CATEGORY = CATEGORY
     TITLE = "Audio Stem Split ⚡"
+    SEARCH_ALIASES = ['split audio', 'vocal removal', 'stem separation', 'isolate vocals', 'extract instrumental']
 
     @classmethod
     def INPUT_TYPES(s):

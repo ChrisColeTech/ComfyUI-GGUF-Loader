@@ -55,6 +55,7 @@ class DualVAELoader:
     FUNCTION = "load_vaes"
     CATEGORY = "🤖 CCTech/GGUF"
     TITLE = "Dual VAE Loader (video + audio) ⚡"
+    SEARCH_ALIASES = ['load vae', 'dual vae', 'video vae', 'audio vae', 'vae loader']
     DESCRIPTION = ("Load a video VAE and an audio VAE in one node. For MiniMax "
                    "H3: minimax_h3_video_vae_* on the first, "
                    "minimax_h3_audio_vae_* on the second.")
@@ -104,6 +105,7 @@ class ClipProjLoader(CLIPLoaderGGUF):
     FUNCTION = "load_clip_projected"
     CATEGORY = "🤖 CCTech/GGUF"
     TITLE = "Text Encoder + ClipProj Loader ⚡"
+    SEARCH_ALIASES = ['load clip', 'text encoder', 'clip loader', 'clip projection', 'clipproj']
     DESCRIPTION = ("Load a small text encoder and project it into a large one's "
                    "space, so a 4B or 8B Qwen3-VL can stand in for the 32B "
                    "MiniMax H3 expects. Matrices go in models/clip_projections/.")

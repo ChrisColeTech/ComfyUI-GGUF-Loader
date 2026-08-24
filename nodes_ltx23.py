@@ -236,6 +236,7 @@ class LTXV23ModelsLoader:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 Models Loader ⚡"
+    SEARCH_ALIASES = ['load model', 'model loader', 'load vae', 'audio vae', 'video vae', 'load clip', 'text encoder']
     RETURN_TYPES = ("MODEL", "CLIP", "VAE", "VAE")
     RETURN_NAMES = ("model", "clip", "vae", "audio_vae")
     FUNCTION = "load"
@@ -376,6 +377,7 @@ class LTXV23ImgToVideo:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 Img/Audio to Video ⚡"
+    SEARCH_ALIASES = ['image to video', 'audio to video', 'img2vid', 'empty latent', 'video conditioning', 'text to video']
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
     RETURN_NAMES = ("positive", "negative", "latent")
     FUNCTION = "prepare"
@@ -507,6 +509,7 @@ class LTXV23KSampler:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 KSampler (distilled) ⚡"
+    SEARCH_ALIASES = ['sampler', 'sample', 'generate', 'denoise', 'diffuse', 'txt2img', 'img2img']
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
     DESCRIPTION = ("Sample a joint AV latent on the official LTX-2 schedules "
@@ -607,6 +610,7 @@ class LTXV23RefineSampler:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 Two-Stage Sampler (base + refine) ⚡"
+    SEARCH_ALIASES = ['sampler', 'sample', 'generate', 'denoise', 'diffuse', 'refine latent', 'upscale latent', 'enlarge latent']
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
     DESCRIPTION = ("Base sampling pass, spatial x2 latent upscale, then a "
@@ -667,6 +671,7 @@ class LTXV23AVDecode:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 AV Decode ⚡"
+    SEARCH_ALIASES = ['decode', 'decode latent', 'latent to video', 'latent to audio', 'video decode', 'audio decode']
     RETURN_TYPES = ("VIDEO",)
     FUNCTION = "decode"
     DESCRIPTION = "Decode a joint AV latent to a muxed VIDEO output."
@@ -778,6 +783,7 @@ class LTXV23IDLoraPromptEditor:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 ID-LoRA Prompt Editor ⚡"
+    SEARCH_ALIASES = ['edit prompt', 'prompt editor', 'visual speech sounds', 'id lora prompt', 'prompt writer']
     RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = ("tagged_prompt", "visual_text", "speech_text", "sounds_text",
                     "speech_text_batch")
@@ -839,6 +845,7 @@ class LTXV23SpeechBatchSelector:
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 Speech Batch Selector ⚡"
+    SEARCH_ALIASES = ['select from batch', 'pick clip', 'batch subset', 'index selector', 'choose from list']
     RETURN_TYPES = ("STRING", "INT")
     RETURN_NAMES = ("selected_text", "count")
     FUNCTION = "select"

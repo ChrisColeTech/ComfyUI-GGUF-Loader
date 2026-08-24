@@ -641,6 +641,47 @@ cycle correctly (expected to, since that only pages weights off GPU, it
 doesn't touch the Python objects this cache holds — but not confirmed
 with real weights).
 
+## SEARCH_ALIASES added to every node (2026-08-24)
+
+User's real repro: searching "latent" in ComfyUI found none of our nodes.
+Traced this to actual source, not guessed: comfy's plain-text node search
+(`ComfyUI_frontend-main/src/services/nodeSearchService.ts:16-24`) only
+indexes `['name', 'display_name', 'search_aliases']` via Fuse.js — it does
+**not** search input/output type strings unless you invoke the separate
+`o:`/`i:` type filter. `search_aliases` comes from a plain class attribute,
+`SEARCH_ALIASES`, read generically off any node class regardless of V1/V3
+API (`N:\...\ComfyUI\server.py:793`:
+`info['search_aliases'] = getattr(obj_class, 'SEARCH_ALIASES', [])`) —
+core ships this generously (`nodes.py` has ~35 `SEARCH_ALIASES` entries,
+e.g. `KSampler`: `["sampler", "sample", "generate", "denoise", "diffuse",
+"txt2img", "img2img"]`). **None of this repo's 33 nodes had it at all.**
+Only 2 (`LTXV25EmptyLatentAVBatch`, `MiniMaxH3EmptyLatentAVBatch`) happen
+to have "Latent" in their title, so a "latent" search only ever found
+those two — every other LATENT-touching node (samplers, `LTXV23AVDecode`,
+`ScenemaVAEEncode`, `ZImageImg2Img`, `LTXV23ImgToVideo`) was invisible to
+it despite having perfectly correct `RETURN_TYPES`/`INPUT_TYPES`.
+
+Added `SEARCH_ALIASES` to all 33 nodes, one line each right after `TITLE`,
+matching core's own list style/length (3-8 short phrases, lowercase,
+covering the node's actual verbs and the types it touches — not just
+"latent" but "generate", "load model", "decode", etc. per node).
+Verified via a real-environment check (not just compiling): 0/33 missing
+the attribute after the fix, and a simulated "latent" query against
+`name + display_name + search_aliases` (matching the frontend's exact
+`nodeFuseSearch` key list) now returns 7 nodes instead of 2.
+
+**Same gap existed in the sibling repos this session already touched**
+(`D:\Projects\ComfyUI-Line-counter`, `D:\Projects\ComfyUI-Get-Random-File`)
+— fixed there too, same convention, no `TITLE` attribute to anchor on in
+those repos so `SEARCH_ALIASES` was inserted as the first class-level
+line instead.
+
+Before assuming a "why doesn't X show up" report is a code bug (or isn't
+one), check `nodeSearchService.ts` for what the search UI actually
+indexes — don't assume type strings are searchable text, and don't assume
+metadata attributes require the V3 `io.ComfyNode` API when a V1 dict-style
+class can carry them just as well via plain `getattr`.
+
 ## Dev-box memory corruption (expanded 2026-08-19)
 
 The instability above is broader than a plain access violation and can surface

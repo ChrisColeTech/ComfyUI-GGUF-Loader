@@ -90,6 +90,7 @@ def _attach_controlnet(model, model_patch, vae, image, strength):
 
 class ZImageLoader:
     TITLE = "Z-Image Loader ⚡"
+    SEARCH_ALIASES = ['load model', 'model loader', 'load vae', 'load clip']
     CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     RETURN_NAMES = ("model", "clip", "vae")
@@ -148,6 +149,7 @@ class ZImageLoader:
 
 class ZImageImg2Img:
     TITLE = "Z-Image img2img ⚡"
+    SEARCH_ALIASES = ['image to image', 'img2img', 'encode image', 'image to latent']
     CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
@@ -249,6 +251,7 @@ class ZImageKSampler:
     """
 
     TITLE = "Z-Image KSampler ⚡"
+    SEARCH_ALIASES = ['sampler', 'sample', 'generate', 'denoise', 'diffuse', 'txt2img', 'img2img']
     CATEGORY = ZIMAGE_CATEGORY
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"

@@ -205,6 +205,7 @@ class LMStudioVisionPrompt:
 
     CATEGORY = LMSTUDIO_CATEGORY
     TITLE = "LM Studio Vision Prompt ⚡"
+    SEARCH_ALIASES = ['llm', 'vision prompt', 'caption image', 'local llm', 'chat completion', 'image to text', 'image captioning']
     RETURN_TYPES = ("STRING",)
     FUNCTION = "generate"
     DESCRIPTION = ("Send an optional image + prompt to a local LM Studio "
