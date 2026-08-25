@@ -1044,3 +1044,34 @@ and both attachment paths via fakes (`_FakeControlNet`,
 which needs real model weights to construct) - real-weight verification
 done separately via a real-environment check script against the actual
 portable install.
+
+## Fix: Qwen-Image-Fun ControlNet mis-routed to ModelPatchLoader (2026-08-25)
+
+User tried a real file, `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors`,
+and hit `UnboundLocalError: cannot access local variable 'model'` inside
+core's own `ModelPatchLoader.load_model_patch()`. Root cause: my own
+`is_diffsynth_or_fun` detection in `QwenImageControlNetLoader.load()` was
+wrong, not a missing-format gap. I'd copied the key signature
+`comfy/controlnet.py:801` checks for Qwen-Image-Fun
+(`'control_blocks.0.after_proj.weight' in sd and 'control_img_in.weight' in sd`)
+into the *MODEL_PATCH* branch, but that signature is actually the trigger
+for `comfy.controlnet.py`'s own `load_controlnet_qwen_fun()`, which builds a
+real `QwenFunControlNet` (a `ControlNet` subclass) - a CONDITIONING
+attachment, same family as InstantX/Union, not a MODEL_PATCH at all. "Fun"
+sounds like it should be a DiffSynth-style patch (Z-Image's Fun ControlNet
+IS one), but Qwen-Image's own Fun ControlNet isn't - the name is misleading
+across the two families.
+
+Fixed: `is_diffsynth_or_fun` renamed `is_diffsynth_patch`, checking ONLY
+`'controlnet_blocks.0.y_rms.weight' in sd` (the real DiffSynth block-wise
+signature). Everything else - including the Fun signature - falls through
+to `comfy.controlnet.load_controlnet_state_dict()`, which already has its
+own correct internal dispatch for InstantX/Union/Fun. Updated every
+docstring/comment/README passage that claimed Fun attaches to MODEL.
+
+Verified against the real file after the fix: loads as
+`kind="controlnet"`, payload `QwenFunControlNet` wrapping a real
+`QwenImageFunControlNetModel` - confirmed via the actual node class, not
+just re-reading the key signature. Re-ran the earlier 4-file real-weights
+check too (3 DiffSynth patches + InstantX/Union) to confirm no regression
+- all still classify the same as before.

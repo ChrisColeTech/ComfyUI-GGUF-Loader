@@ -11,17 +11,18 @@ projection port - nothing in comfy or any other pack implements that
 mechanism), Qwen-Image ControlNet is fully native to ComfyUI core across
 every format in circulation:
 
-  - InstantX/Union checkpoints (real diffusers-style ControlNet weights) are
-    auto-detected and built by comfy.controlnet.load_controlnet_state_dict()
+  - InstantX/Union AND Qwen-Image-Fun checkpoints (real diffusers-style
+    ControlNet weights - both are actual ControlNet architectures, not model
+    patches, despite "Fun" sounding like the DiffSynth-style patches below)
+    are auto-detected and built by comfy.controlnet.load_controlnet_state_dict()
     into a real ControlNet object - the exact same object stock
     ControlNetLoader + ControlNetApplyAdvanced produce and consume. This
     attaches to CONDITIONING, like any classic ControlNet.
-  - DiffSynth block-wise patches (canny/depth/inpaint) and the Qwen-Image-Fun
-    ControlNet are auto-detected and built by comfy_extras.nodes_model_patch's
-    ModelPatchLoader into a MODEL_PATCH object, applied via
-    comfy_extras.nodes_model_patch.DiffSynthCnetPatch - the same mechanism
-    already used for Z-Image's ControlNet in nodes_zimage.py. This attaches
-    to MODEL, not conditioning.
+  - DiffSynth block-wise patches (canny/depth/inpaint) are auto-detected and
+    built by comfy_extras.nodes_model_patch's ModelPatchLoader into a
+    MODEL_PATCH object, applied via comfy_extras.nodes_model_patch.
+    DiffSynthCnetPatch - the same mechanism already used for Z-Image's
+    ControlNet in nodes_zimage.py. This attaches to MODEL, not conditioning.
 
 So there is no algorithm to port here - QwenImageControlNetLoader is a thin
 dispatcher (reusing core's own detection + core's own model classes, not
@@ -84,11 +85,11 @@ class QwenImageControl:
 
     kind == "controlnet": payload is a real comfy.controlnet.ControlNet,
         attaches to CONDITIONING (positive/negative), like any classic
-        ControlNet (InstantX/Union checkpoints).
+        ControlNet (InstantX/Union AND Qwen-Image-Fun checkpoints - despite
+        the name, Fun is a real ControlNet architecture, not a model patch).
     kind == "model_patch": payload is a MODEL_PATCH (ModelPatcher wrapping a
-        QwenImageBlockWiseControlNet or QwenImageFunControlNetModel),
-        attaches to MODEL via DiffSynthCnetPatch (DiffSynth canny/depth/
-        inpaint patches, and the Qwen-Image-Fun ControlNet).
+        QwenImageBlockWiseControlNet), attaches to MODEL via
+        DiffSynthCnetPatch (DiffSynth canny/depth/inpaint patches only).
     """
 
     def __init__(self, kind, payload):
@@ -199,24 +200,28 @@ class QwenImageControlNetLoader:
         path = _resolve_control_path(control_name)
         sd, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
 
-        is_diffsynth_or_fun = (
-            "controlnet_blocks.0.y_rms.weight" in sd
-            or ("control_blocks.0.after_proj.weight" in sd and "control_img_in.weight" in sd))
+        # Only the block-wise DiffSynth patch format is a MODEL_PATCH. The
+        # Qwen-Image-Fun ControlNet ('control_blocks.0.after_proj.weight' +
+        # 'control_img_in.weight') is a real ControlNet too - comfy.controlnet's
+        # own load_controlnet_state_dict() already dispatches that signature to
+        # load_controlnet_qwen_fun() internally, so it's handled by the same
+        # branch as InstantX/Union below, not by ModelPatchLoader.
+        is_diffsynth_patch = "controlnet_blocks.0.y_rms.weight" in sd
 
-        if is_diffsynth_or_fun:
+        if is_diffsynth_patch:
             from comfy_extras.nodes_model_patch import ModelPatchLoader
             model_patch, = ModelPatchLoader().load_model_patch(control_name)
             logger.info("Qwen-Image ControlNet: '%s' loaded as a MODEL_PATCH "
-                       "(DiffSynth/Fun - attaches to MODEL).", control_name)
+                       "(DiffSynth - attaches to MODEL).", control_name)
             return (QwenImageControl("model_patch", model_patch),)
 
         control = comfy.controlnet.load_controlnet_state_dict(dict(sd))
         if control is None:
             raise RuntimeError(
                 f"'{control_name}' was not recognized as a supported Qwen-Image "
-                "ControlNet or DiffSynth/Fun control patch format.")
+                "ControlNet or DiffSynth control patch format.")
         logger.info("Qwen-Image ControlNet: '%s' loaded as a ControlNet "
-                   "(InstantX/Union - attaches to CONDITIONING).", control_name)
+                   "(InstantX/Union/Fun - attaches to CONDITIONING).", control_name)
         return (QwenImageControl("controlnet", control),)
 
 
