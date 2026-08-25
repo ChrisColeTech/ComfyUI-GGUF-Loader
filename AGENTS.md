@@ -1371,3 +1371,109 @@ combined smoke tests across the two files pass. Real-environment check
 confirmed both nodes register with the real `comfy.samplers.KSampler.SAMPLERS`/
 `SCHEDULERS` lists, and the sigma math itself was verified against a real
 loaded Krea2 GGUF model (see numbers above) - not just fakes.
+
+## Flux Klein: foundation + Identity Feature Transfer port (2026-08-25)
+
+New file `nodes_flux_klein.py`. Category `🤖 CCTech/Flux Klein`. FLUX.2
+Klein needed zero bespoke loading logic - `comfy/supported_models.py`
+already detects `unet_config.image_model == "flux2"` natively, same
+situation as Krea2/Qwen-Image, so `FluxKleinModelLoader` is the same thin
+GGUF-aware MODEL/CLIP/VAE loader shape as `Krea2ModelLoader`/
+`QwenImageModelLoader` (`clip_type=comfy.sd.CLIPType.FLUX2`, confirmed
+present in core's `CLIPLoader` dropdown).
+
+`FluxKleinImg2Img`'s empty txt2img latent uses Flux.2's REAL shape -
+`[batch_size, 128, height // 16, width // 16]` (confirmed via
+`comfy_extras/nodes_flux.py`'s `EmptyFlux2LatentImage`) - not this repo's
+usual generic 4-channel/8-downscale placeholder, since
+`comfy.sample.fix_empty_latent_channels` only auto-corrects channel
+count, not spatial downscale ratio, unless `downscale_ratio_spacial` is
+explicitly passed (it isn't, in this repo's plain `{"samples": latent}`
+convention). Deliberately does NOT take multi-reference images itself -
+kept in its own node to match the real example workflow
+(`positive conditioning -> Multi ReferenceLatent -> sampler`) and avoid
+an 8-image-slot node.
+
+`Flux2KleinMultiReferenceLatent` is a direct, faithful port of the source
+pack's `multi_reference_latent.py` (MIT, capitan01R,
+https://github.com/capitan01R/ComfyUI-Flux2Klein-Enhancer): one required
++ 7 optional `LATENT` inputs, splits each input's batch into individual
+references, stamps `reference_latents` (overwrite, not append) +
+`reference_latents_method="index"` onto BOTH positive and negative
+conditioning (matches the real `Klein Controlnet.json` example
+workflow's own reference-conditioning subgraph, which chains onto both).
+`"index"` is a real branch inside comfy's own `Flux._forward`
+(`comfy/ldm/flux/model.py:365-387`, shared Flux/Kontext/Klein code) - not
+something this pack invented.
+
+`Flux2KleinIdentityFeatureTransfer` is a near-verbatim port of the source
+pack's flagship `IdentityFeatureTransferFinal`
+(`identity_feature_transfer.py:789-1291`). Uses ONLY stock `ModelPatcher`
+hooks - `model.clone()` then always
+`m.set_model_attn1_output_patch(output_patch)`, and
+`m.set_model_attn1_patch(reference_source_mask_patch)` only when
+`mask_behavior="zero_unmasked_tokens"` and at least one `subject_mask_N`
+is wired. Both fire generically from comfy's own
+`comfy/ldm/flux/layers.py` `DoubleStreamBlock.forward`/
+`SingleStreamBlock.forward` - shared Flux/Kontext/Klein code, confirmed
+real methods on `comfy.model_patcher.ModelPatcher` before relying on
+them. Reads four `extra_options` keys comfy's own model forward pass
+already populates every call - `reference_image_num_tokens`,
+`block_index`, `block_type`, `img_slice` - zero independent Klein-
+internals computation needed, direct port of the read logic. All
+`INPUT_TYPES` ported as-is: `preset` (HARD_LOCK/MID_LOCK/SOFT_LOCK/
+custom), `enabled`, `reference_index`/`reference_indices`,
+`similarity_floor`, `softmax_temperature`, `mask_threshold`,
+`double_blocks`/`single_blocks` schedule strings, optional `sigmas`
+(per-step strength decay via an equal-energy schedule ratio),
+`debug`, `mask_behavior`, `subject_mask_1..8`.
+
+KNOWN CAVEAT ported as-is, not fixed speculatively: default schedules/
+presets hardcode block counts (8 double / 24 single) as magic numbers
+tuned for the Klein 9B layout - never read from the live model. Harmless
+clamp on a different-sized variant (e.g. 4B `klein-base`), but a preset
+could apply strength to the wrong semantic blocks there - documented in
+the node's docstring/README to use `preset="custom"` for non-9B
+checkpoints, same honesty standard as everything else this session.
+
+Explicitly NOT ported: `Flux2KleinKSamplerExperimental` (confirmed to
+reimplement Euler sampling by hand instead of going through
+`comfy.samplers`/`CFGGuider`, which means it silently bypasses comfy's
+`sampler_post_cfg_function` pipeline - within the source pack itself this
+makes it strictly less compatible than stock `KSampler`, since it'd break
+that pack's own Color Anchor/Identity Guidance nodes) and the source
+pack's own superseded `IdentityFeatureTransfer`/`Advanced`/`V3` (kept
+there only for that pack's backward compatibility). Klein uses stock
+`KSampler` - no custom sampler needed here, unlike Qwen-Image/Krea2.
+
+`tools/smoke_flux_klein.py`: 14/14, no GPU. `FluxKleinImg2Img` latent
+shape/denoise/batch-repeat tests, `Flux2KleinMultiReferenceLatent`
+batch-splitting/ordering/overwrite/dual-conditioning tests, and 7 new
+`Flux2KleinIdentityFeatureTransfer` tests - hook registration under
+enabled/disabled and focus_only/zero_unmasked_tokens+mask, schedule
+parsing (`_parse_schedule`, `_parse_ref_indices`), and the actual
+similarity-pull math verified end-to-end on a synthetic attention tensor
+(text token + generated tokens + reference tokens along a shared axis,
+confirming only the generated-token range moves and only toward whichever
+reference token shares its centered direction).
+
+Real-environment check (synthetic-package trick against
+`N:\ComfyUI_windows_portable_nvidia\`): all 4 new nodes register with
+correct `INPUT_TYPES`/`RETURN_TYPES` (48 total registered nodes, up from
+44); `CLIPType.FLUX2` and native `Flux2` in `comfy.supported_models`
+confirmed; `set_model_attn1_patch`/`set_model_attn1_output_patch`
+confirmed as real `ModelPatcher` methods; loaded the user's real
+`D:\models\image-models\flux2-klein\split\flux-2-klein-9b-Q5_K_M.gguf`
+end-to-end through `UnetLoaderGGUF`'s own loading path, confirmed
+auto-detection as `Flux2` model class, and ran
+`Flux2KleinIdentityFeatureTransfer.apply()` against the real loaded
+`GGUFModelPatcher` - clones correctly, registers `attn1_output_patch` in
+`model_options["transformer_options"]["patches"]`.
+
+Not yet ported (tracked as remaining Klein work): `Flux2KleinColorAnchor`,
+`Flux2KleinEnhancer`+`Flux2KleinDetailController`, `Flux2KleinTextEnhancer`,
+`Flux2KleinSectionedEncoder` (needs verifying
+`clip.tokenizer.qwen3_8b.tokenizer`/`.qwen3_4b.tokenizer` against this
+repo's actual loaded Klein CLIP before porting), `Flux2KleinMaskRefController`,
+`Flux2KleinRefLatentController`+`Flux2KleinTextRefBalance`+
+`Flux2KleinRefLatentWeight`, `IdentityGuidance`.
