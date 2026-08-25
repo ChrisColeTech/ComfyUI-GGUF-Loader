@@ -1260,3 +1260,49 @@ needed a real conditioning-list return (`[[tensor, {}]]`), unlike the
 passing. Real-environment check confirms `edit_reference` registers;
 total node count unchanged at 42 (both additions were on existing node
 classes, no new node this time).
+
+## Krea2ControlLoRALoader: auto-dispatch instead of two loader nodes (2026-08-25)
+
+User pushed back on the "use a different loader node for the canny LoRA"
+guidance from the previous entry: real error report
+(`RuntimeError: Could not find expanded Krea2 first projection weight`),
+followed by "so lets backup, youre telling me our controlnet lora loader
+doesnt work with this type of controlnet? that actually dos sound like you
+need to patch the loader properly." Fair, and it's exactly the same shape
+of problem `QwenImageControlNetLoader` already solved for Qwen-Image's two
+ControlNet formats (auto-detect from file content, one node, no manual
+"which loader do I need" decision) - `Krea2ControlLoRALoader` should do the
+same instead of making the user pick between it and stock
+`LoraLoaderModelOnly` by hand.
+
+Extracted the existing shape-matching logic (previously buried inline
+inside `_make_control_projection`, which raised immediately if not found)
+into a standalone, non-raising detector, `_lora_expanded_first_weight_key`.
+`Krea2ControlLoRALoader.load_lora` now calls it first: found -> existing
+widened-projection path unchanged (still calls `_make_control_projection`,
+which still raises on failure - that raise is now unreachable in practice
+since `load_lora` never reaches it without a positive detection first, but
+left in place since `_make_control_projection` is still called elsewhere
+implicitly). Not found -> applies the file as an ordinary LoRA via
+`comfy.sd.load_lora_for_models(model, None, state_dict, strength, 0.0)` -
+the exact call stock `LoraLoaderModelOnly` makes internally (verified this
+call works against the real canny file two sessions-turns ago) - no
+wrapper, no injection, since a plain LoRA patch needs neither.
+
+This means `Krea2Img2Img`'s existing `has_control_lora` check
+(`model.get_attachment(WRAPPER_KEY) is not None`) now does exactly the
+right thing automatically for both cases with zero changes to that node:
+the plain-LoRA path never sets `WRAPPER_KEY`, so `control_image`/
+`control_mode` correctly stay inert (ignored-with-warning, per the earlier
+guard rail) and `edit_reference` (which never depended on `WRAPPER_KEY` at
+all) keeps working exactly as it already did.
+
+Verified against both real files through the SAME loader instance/class,
+not just re-checking each separately: depth LoRA -> `WRAPPER_KEY` attached
+(confirmed True), canny LoRA -> `WRAPPER_KEY` absent (confirmed False), no
+error either way. `tools/smoke_krea2.py` gained
+`test_lora_expanded_first_weight_key_detects_widened_projection` and
+`test_lora_expanded_first_weight_key_returns_none_for_ordinary_lora`
+(26/26 total). Docs updated to drop the "load canny with stock
+LoraLoaderModelOnly instead" guidance from the previous entry - it's no
+longer necessary, `Krea2ControlLoRALoader` handles it now.

@@ -409,11 +409,27 @@ def _first_shape(first):
     return int(weight_shape[0]), int(weight_shape[1]), int(weight_shape[1])
 
 
+def _lora_expanded_first_weight_key(model_patcher, state_dict):
+    """Detection only, never raises: the expanded first-layer weight key if
+    state_dict shape-matches the live model's widened first projection, else
+    None. Used to auto-detect a widened-projection Control LoRA vs an
+    ordinary in-context LoRA (no expanded projection at all) before deciding
+    which mechanism to apply the file with.
+    """
+    try:
+        first = _get_first_module(model_patcher)
+        out_features, image_features, control_features = _first_shape(first)
+    except Exception:
+        return None
+    expected_in = image_features + control_features
+    return _find_first_weight_key(state_dict, out_features, expected_in)
+
+
 def _make_control_projection(model_patcher, state_dict):
     first = _get_first_module(model_patcher)
     out_features, image_features, control_features = _first_shape(first)
     expected_in = image_features + control_features
-    weight_key = _find_first_weight_key(state_dict, out_features, expected_in)
+    weight_key = _lora_expanded_first_weight_key(model_patcher, state_dict)
     if weight_key is None:
         raise RuntimeError(
             f"Could not find expanded Krea2 first projection weight with shape "
@@ -673,25 +689,41 @@ class Krea2ModelLoader:
 
 
 class Krea2ControlLoRALoader:
-    """Load a Krea2 Control LoRA (e.g. depth-control-lora.safetensors) onto a MODEL.
+    """Load a Krea2 LoRA (e.g. depth-control-lora.safetensors,
+    krea2_canny-v0.1.safetensors) onto a MODEL - auto-detects which of two
+    unrelated mechanisms the file actually needs, so you don't have to know
+    in advance (same auto-detect-and-dispatch approach as
+    QwenImageControlNetLoader, which does the same thing for Qwen-Image's
+    own two ControlNet formats):
 
-    Ported from comfyui-krea2-controlnet-main's Krea2ControlLoRALoader. Widens
-    the DiT's first input projection using the expanded weight shipped in the
-    LoRA file, patches the attention-block LoRA weights through the normal
-    ModelPatcher machinery, and registers the sampling wrapper + injection
-    that swap the widened projection in only for the duration of each forward
-    call. Connect Krea2Img2Img's control_image after this - sampling raises
-    if a Control LoRA is loaded with no control latent attached.
+      Widened-projection Control LoRA (e.g. the depth one) - detected by
+      shape-matching an expanded `first` layer weight against the live
+      model. Ported from comfyui-krea2-controlnet-main's
+      Krea2ControlLoRALoader: widens the DiT's first input projection,
+      patches the attention-block LoRA weights through the normal
+      ModelPatcher machinery, and registers the sampling wrapper +
+      injection that swap the widened projection in only for the duration
+      of each forward call. Connect Krea2Img2Img's control_image after
+      this - sampling raises if loaded with no control latent attached.
+
+      Ordinary in-context LoRA (e.g. krea2_canny-v0.1.safetensors - no
+      expanded projection at all, confirmed by inspecting its tensor
+      keys) - applied as a normal LoRA via comfy.sd.load_lora_for_models,
+      the same call stock LoraLoaderModelOnly makes. No wrapper, no
+      injection needed - it's a plain weight patch. Connect
+      Krea2Img2Img's edit_reference after this instead of control_image.
     """
 
     CATEGORY = KREA2_CATEGORY
     TITLE = "Krea2 Control LoRA Loader ⚡"
     SEARCH_ALIASES = ['load lora', 'controlnet loader', 'control lora', 'depth control',
-                       'krea2 controlnet', 'apply controlnet']
+                       'krea2 controlnet', 'apply controlnet', 'in-context lora', 'edit lora']
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_lora"
-    DESCRIPTION = ("Load a Krea2 Control LoRA (depth/canny/pose/etc.) from "
-                   "models/loras and patch it onto the model.")
+    DESCRIPTION = ("Load a Krea2 LoRA (depth/canny/pose/edit/etc.) from models/loras "
+                   "and patch it onto the model - auto-detects whether it's a "
+                   "widened-projection Control LoRA (control_image) or an ordinary "
+                   "in-context LoRA (edit_reference).")
 
     def __init__(self):
         self.loaded_lora = None
@@ -702,10 +734,10 @@ class Krea2ControlLoRALoader:
             "required": {
                 "model": ("MODEL",),
                 "lora_name": (folder_paths.get_filename_list("loras"), {
-                    "tooltip": "The Krea2 Control LoRA file, from models/loras. The "
-                               "control type (depth, canny, pose, ...) is determined "
-                               "entirely by this file - match control_image on "
-                               "Krea2Img2Img to what it was trained on."}),
+                    "tooltip": "Any Krea2 LoRA file, from models/loras. Auto-detects "
+                               "whether it's a widened-projection Control LoRA (use "
+                               "Krea2Img2Img's control_image after this) or an ordinary "
+                               "in-context LoRA (use edit_reference instead)."}),
                 "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
             }
         }
@@ -727,6 +759,19 @@ class Krea2ControlLoRALoader:
         if state_dict is None:
             state_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
             self.loaded_lora = (lora_path, state_dict)
+
+        if _lora_expanded_first_weight_key(model, state_dict) is None:
+            # No widened first-layer projection at all - this is an ordinary
+            # in-context LoRA (e.g. krea2_canny-v0.1.safetensors), not a
+            # widened-projection Control LoRA. Apply it the same way stock
+            # LoraLoaderModelOnly would - no wrapper/injection needed, since
+            # there's no runtime control-token swap to perform.
+            new_model, _ = comfy.sd.load_lora_for_models(model, None, state_dict, strength, 0.0)
+            logger.info(
+                "Krea2ControlLoRALoader: '%s' has no widened first-layer projection - "
+                "applied as an ordinary in-context LoRA. Use Krea2Img2Img's "
+                "edit_reference input for this one, not control_image.", lora_name)
+            return (new_model,)
 
         new_model = model.clone()
         control_projection = _make_control_projection(new_model, state_dict)

@@ -209,6 +209,35 @@ def test_first_shape_reads_expanded_projection():
     print("[ok] _first_shape: reads out/image/control feature counts off an expanded projection")
 
 
+def test_lora_expanded_first_weight_key_detects_widened_projection():
+    class _FirstModule:
+        weight = torch.zeros(16, 8)  # base first layer: out=16, in=8 -> expects a (16, 16) widened weight
+
+    class _ModelWithFirst(_FakeModelPatcher):
+        def get_model_object(self, key):
+            return _FirstModule()
+
+    model = _ModelWithFirst()
+    sd = {"first.weight": torch.zeros(16, 16)}
+    key = krea2._lora_expanded_first_weight_key(model, sd)
+    assert key == "first.weight"
+    print("[ok] _lora_expanded_first_weight_key: detects a real widened-projection weight "
+          "(the depth LoRA's case)")
+
+
+def test_lora_expanded_first_weight_key_returns_none_for_ordinary_lora():
+    # get_model_object always raises on the plain fake - detection returns
+    # None gracefully, same as an ordinary in-context LoRA with no first key
+    # at all (the canny LoRA's case).
+    model = _FakeModelPatcher()
+    sd = {"blocks.0.attn.wq.lora_down.weight": torch.zeros(4, 4)}
+    key = krea2._lora_expanded_first_weight_key(model, sd)
+    assert key is None
+    print("[ok] _lora_expanded_first_weight_key: returns None for an ordinary LoRA with no "
+          "expanded projection (the canny LoRA's case) - lets Krea2ControlLoRALoader "
+          "auto-dispatch to the plain-LoRA path instead of raising")
+
+
 # ── Krea2ControlInputProjection forward ─────────────────────────────────────
 
 def test_control_projection_falls_back_to_original_first_with_no_control_tokens():
@@ -423,6 +452,8 @@ if __name__ == "__main__":
     test_target_key_from_lora_base()
     test_lora_pairs_finds_matching_up_down()
     test_first_shape_reads_expanded_projection()
+    test_lora_expanded_first_weight_key_detects_widened_projection()
+    test_lora_expanded_first_weight_key_returns_none_for_ordinary_lora()
     test_control_projection_falls_back_to_original_first_with_no_control_tokens()
     test_control_projection_adds_control_contribution()
     test_img2img_ignores_control_image_without_loaded_lora()
