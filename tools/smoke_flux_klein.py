@@ -154,6 +154,34 @@ def test_img2img_reference_image_auto_depth_uses_depth_helper():
           "the depth helper before attaching reference_latents")
 
 
+def test_img2img_reference_image_auto_canny_dispatches_to_shared_node():
+    # auto_canny needs no model download (plain cv2.Canny) - exercise it
+    # for real, confirming FluxKleinImg2Img's control_mode dispatch table
+    # actually routes to the shared preprocessors.Canny node.
+    node = fk.FluxKleinImg2Img()
+    model = object()
+    _, positive, negative, _, _ = node.prepare(
+        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
+        reference_image=torch.rand(1, 64, 64, 3), control_mode="auto_canny")
+    assert "reference_latents" in positive[0][1]
+    assert "reference_latents" in negative[0][1]
+    print("[ok] FluxKleinImg2Img: control_mode=auto_canny dispatches to the shared Canny "
+          "preprocessor node and attaches reference_latents")
+
+
+def test_control_mode_dispatch_table_covers_every_non_depth_preprocessor():
+    from cctech_gguf_pkg.nodes import preprocessors as pp
+    expected_nodes = {
+        pp.Canny, pp.NormalMapBAE, pp.NormalMapDSINE, pp.SoftEdgeHED,
+        pp.SoftEdgePiDiNet, pp.MLSDLines, pp.Lineart, pp.LineartAnime,
+        pp.MangaLine, pp.OpenPose,
+    }
+    assert set(fk._CONTROL_MODE_NODES.values()) == expected_nodes
+    assert "auto_depth" in fk._CONTROL_MODES and "manual" in fk._CONTROL_MODES
+    print("[ok] FluxKleinImg2Img: control_mode dispatch table covers every "
+          "CCTech/Preprocessors node (auto_depth handled separately, manual is raw)")
+
+
 def test_img2img_no_reference_image_leaves_conditioning_unchanged():
     node = fk.FluxKleinImg2Img()
     model = object()
@@ -575,6 +603,8 @@ if __name__ == "__main__":
     test_img2img_batch_size_repeats_txt2img_latent()
     test_img2img_reference_image_manual_attaches_to_both_conditionings()
     test_img2img_reference_image_auto_depth_uses_depth_helper()
+    test_img2img_reference_image_auto_canny_dispatches_to_shared_node()
+    test_control_mode_dispatch_table_covers_every_non_depth_preprocessor()
     test_img2img_no_reference_image_leaves_conditioning_unchanged()
     test_depth_map_node_delegates_to_depth_helper()
     test_multi_reference_latent_splits_batch_into_individual_refs()

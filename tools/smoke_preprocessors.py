@@ -172,11 +172,47 @@ def test_manga_line_delegates_to_detector():
     print("[ok] MangaLine: builds MangaLineDetector, returns a float32 IMAGE batch")
 
 
+def test_openpose_delegates_to_detector_and_unpacks_tuple():
+    # OpenPoseDetector.estimate() returns (canvas, pose_dict) - unlike every
+    # other ported detector's single-ndarray return - confirm the node
+    # unpacks it correctly and discards the keypoint dict for the IMAGE-only
+    # output contract this pack's preprocessor nodes share.
+    calls = []
+
+    class _FakeOpenPoseDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def to(self, device):
+            return self
+
+        def estimate(self, np_image, resolution=512, include_body=True,
+                     include_hand=True, include_face=True):
+            calls.append((np_image.shape, include_body, include_hand, include_face))
+            return np_image, {"people": []}
+
+    original = pp.openpose.OpenPoseDetector
+    pp.openpose.OpenPoseDetector = _FakeOpenPoseDetector
+    try:
+        node = pp.OpenPose()
+        out, = node.estimate(torch.rand(2, 16, 16, 3), detect_body=True,
+                             detect_hand=False, detect_face=True)
+    finally:
+        pp.openpose.OpenPoseDetector = original
+
+    assert out.shape == (2, 16, 16, 3)
+    assert out.dtype == torch.float32
+    assert len(calls) == 2  # once per image in the batch
+    assert all(c[1:] == (True, False, True) for c in calls)  # detect_* flags threaded through
+    print("[ok] OpenPose: builds OpenPoseDetector, unpacks the (canvas, pose_dict) tuple, "
+          "returns a float32 IMAGE batch, threads detect_body/hand/face through")
+
+
 def test_all_preprocessor_nodes_registered():
     expected = {
         "DepthMap", "NormalMapBAE", "NormalMapDSINE", "SoftEdgeHED",
         "SoftEdgePiDiNet", "MLSDLines", "Lineart", "LineartAnime",
-        "MangaLine", "Canny",
+        "MangaLine", "OpenPose", "Canny",
     }
     assert expected.issubset(pp.NODE_CLASS_MAPPINGS.keys()), (
         expected - pp.NODE_CLASS_MAPPINGS.keys())
@@ -197,5 +233,6 @@ if __name__ == "__main__":
     test_lineart_delegates_to_detector()
     test_lineart_anime_delegates_to_detector()
     test_manga_line_delegates_to_detector()
+    test_openpose_delegates_to_detector_and_unpacks_tuple()
     test_all_preprocessor_nodes_registered()
     print("[ok] all nodes/preprocessors smoke tests passed")

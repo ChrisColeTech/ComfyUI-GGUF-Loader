@@ -30,7 +30,7 @@ import torch
 import comfy.model_management
 
 from ..vendor import (depth_anything_v2, dsine, hed, lineart, lineart_anime,
-                      manga_line, mlsd, normal_bae, pidinet)
+                      manga_line, mlsd, normal_bae, openpose, pidinet)
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +413,59 @@ class MangaLine:
         return (out,)
 
 
+class OpenPose:
+    """Estimate body/hand/face keypoints from an IMAGE, rendered as an
+    OpenPose-style skeleton - the classic (pre-DWPose) three-CNN detector.
+
+    Ported from Fannovel16/comfyui_controlnet_aux (Apache-2.0)'s OpenPose
+    preprocessor node (see vendor/openpose.py). NOTE: the underlying body/
+    hand/face architecture and checkpoints trace back to Carnegie Mellon
+    University's OpenPose license - ACADEMIC OR NON-PROFIT ORGANIZATION
+    NONCOMMERCIAL RESEARCH USE ONLY. See vendor/openpose.py's header for
+    the full text. Weights auto-download from HuggingFace on first use
+    into models/openpose/.
+    """
+
+    CATEGORY = PREPROCESSORS_CATEGORY
+    TITLE = "OpenPose ⚡"
+    SEARCH_ALIASES = ['openpose', 'pose estimation', 'body pose', 'hand pose',
+                       'face pose', 'preprocessor', 'controlnet preprocessor',
+                       'image to pose']
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "estimate"
+    DESCRIPTION = ("Estimate body/hand/face keypoints from a photo, rendered as "
+                   "an OpenPose skeleton, for any pipeline's control_image/"
+                   "reference_image input. Non-commercial research-use license - "
+                   "see node docstring.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "resolution": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
+                "detect_body": ("BOOLEAN", {"default": True}),
+                "detect_hand": ("BOOLEAN", {"default": True}),
+                "detect_face": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    def estimate(self, image, resolution=512, detect_body=True, detect_hand=True, detect_face=True):
+        detector = openpose.OpenPoseDetector().to(comfy.model_management.get_torch_device())
+        out = None
+        for i in range(image.shape[0]):
+            np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+            canvas, _pose_dict = detector.estimate(
+                np_image, resolution=resolution, include_body=detect_body,
+                include_hand=detect_hand, include_face=detect_face)
+            canvas_tensor = torch.from_numpy(canvas.astype(np.float32) / 255.0)
+            if out is None:
+                out = torch.zeros(image.shape[0], *canvas_tensor.shape, dtype=torch.float32)
+            out[i] = canvas_tensor
+        del detector
+        return (out,)
+
+
 class Canny:
     """Canny edge detection - plain cv2.Canny, no model, no download.
 
@@ -454,6 +507,7 @@ NODE_CLASS_MAPPINGS = {
     "Lineart": Lineart,
     "LineartAnime": LineartAnime,
     "MangaLine": MangaLine,
+    "OpenPose": OpenPose,
     "Canny": Canny,
 }
 
@@ -467,5 +521,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Lineart": Lineart.TITLE,
     "LineartAnime": LineartAnime.TITLE,
     "MangaLine": MangaLine.TITLE,
+    "OpenPose": OpenPose.TITLE,
     "Canny": Canny.TITLE,
 }

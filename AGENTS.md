@@ -1738,21 +1738,52 @@ HuggingFace download + real inference on a real image) confirmed output
 shape/dtype for all 8 newly-ported detectors, not just Depth Anything
 V2/Canny.
 
-**OpenPose (classic, 3-CNN body/hand/face) ported but NOT registered as
-a node.** `vendor/openpose.py` exists, compiles clean, and its port
-agent verified the same device-derivation discipline across all three
-sub-networks (`_Body`/`_Hand`/`_Face`) - but `open_pose/LICENSE` in the
-source pack turned out to be CMU's actual OpenPose license: "ACADEMIC OR
-NON-PROFIT ORGANIZATION NONCOMMERCIAL RESEARCH USE ONLY," explicitly
+**OpenPose (classic, 3-CNN body/hand/face)**: `vendor/openpose.py`
+compiles clean, and its port agent verified the same device-derivation
+discipline across all three sub-networks (`_Body`/`_Hand`/`_Face`).
+`open_pose/LICENSE` in the source pack is CMU's actual OpenPose license -
+"ACADEMIC OR NON-PROFIT ORGANIZATION NONCOMMERCIAL RESEARCH USE ONLY,"
 forbidding sublicensing/transferring/"provid[ing] third parties access
-to" the software. That's a materially different, much more restrictive
+to" the software - a materially different, much more restrictive
 situation than every other license in this batch (Apache-2.0/MIT, one
-soft PiDiNet research-use note) - shipping this AS A REGISTERED NODE IN
-A PUBLICLY DISTRIBUTED REPO is a real legal question, not an engineering
-one, and not mine to decide unilaterally. Left the file in `vendor/`
-(not imported by `nodes/preprocessors.py`, not in any
-`NODE_CLASS_MAPPINGS`) pending the user's explicit decision - it does
-nothing and ships to no one until wired in.
+soft PiDiNet research-use note). Initially held back from registration
+pending a legal question I didn't think was mine to decide unilaterally;
+user's call: this pack shipping the code is no different from
+`comfyui_controlnet_aux` itself shipping the identical code under its
+own Apache-2.0 wrapper (the wrapper's license and the underlying
+architecture/weights' license are separate things, same situation every
+OpenPose-shipping ComfyUI pack is in) - registered as the `OpenPose`
+node, license text quoted in full in `vendor/openpose.py`'s header, the
+node's own docstring, and README with the same "read this before
+commercial use" framing as PiDiNet's softer note.
+
+**Klein's `control_mode` now covers every non-depth preprocessor too**
+(user caught this was still missing after the batch above shipped):
+`FluxKleinImg2Img`'s `control_mode` grew from `["manual", "auto_depth"]`
+to include one `auto_*` entry per `nodes/preprocessors.py` node
+(`auto_canny`, `auto_normal_bae`, `auto_normal_dsine`,
+`auto_soft_edge_hed`, `auto_soft_edge_pidinet`, `auto_mlsd`,
+`auto_lineart`, `auto_lineart_anime`, `auto_manga_line`,
+`auto_openpose`) via a `_CONTROL_MODE_NODES` dispatch dict mapping mode
+string -> preprocessor node CLASS (not a duplicated detector call) -
+`prepare()` does `getattr(node_cls(), node_cls.FUNCTION)(reference_image)`
+generically, reusing each node's own tested `estimate()`/`detect()`
+method (including OpenPose's, which returns a `(canvas, pose_dict)`
+tuple - the dispatch takes only the canvas via the same unpacking
+`OpenPose.estimate()` itself already does). Krea2Img2Img/QwenImageImg2Img
+deliberately did NOT get this same treatment - their `control_mode` is
+tied to a specific loaded Control LoRA/DiffSynth patch (depth/canny
+only), so e.g. `auto_normal_bae` there would be mechanically wireable
+but silently useless. Klein's reference_latents mechanism has no such
+constraint. `tools/smoke_flux_klein.py` gained 2 tests (36/36 total): a
+real `auto_canny` end-to-end run (no model needed) confirming the
+dispatch actually attaches `reference_latents`, and a completeness check
+that `_CONTROL_MODE_NODES` covers every preprocessor node except the two
+handled outside the dict (`manual`=raw, `auto_depth`=its own
+`depth_ckpt_name`-parameterized path). Real-environment check:
+confirmed `control_mode=auto_openpose` against a REAL loaded Klein VAE +
+CLIP + the real OpenPose detector - `reference_latents` attached with
+the correct encoded shape (70 total registered nodes, up from 69).
 
 Not ported (per the approved plan, explicitly deferred): DWPose (the
 modern pose preprocessor - real extra scope, `onnxruntime`, two-stage

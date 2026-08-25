@@ -53,7 +53,30 @@ import node_helpers
 import nodes
 
 from ..vendor import depth_anything_v2
+from . import preprocessors as pp
 from .preprocessors import DepthMap, _depth_anything_batch
+
+# control_mode -> the shared preprocessor node that produces it, for every
+# mode except "manual" (raw) and "auto_depth" (special-cased below, it's
+# the one mode with its own exposed depth_ckpt_name knob). Klein's
+# reference_latents mechanism is generic - unlike Krea2/Qwen-Image, where
+# control_mode is constrained by which Control LoRA/patch is actually
+# loaded, ANY of these is mechanically valid here. Only auto_depth is
+# confirmed meaningful to Klein's own training (the real example workflow);
+# the rest are unverified but mechanically identical - see class docstring.
+_CONTROL_MODE_NODES = {
+    "auto_canny": pp.Canny,
+    "auto_normal_bae": pp.NormalMapBAE,
+    "auto_normal_dsine": pp.NormalMapDSINE,
+    "auto_soft_edge_hed": pp.SoftEdgeHED,
+    "auto_soft_edge_pidinet": pp.SoftEdgePiDiNet,
+    "auto_mlsd": pp.MLSDLines,
+    "auto_lineart": pp.Lineart,
+    "auto_lineart_anime": pp.LineartAnime,
+    "auto_manga_line": pp.MangaLine,
+    "auto_openpose": pp.OpenPose,
+}
+_CONTROL_MODES = ["manual", "auto_depth"] + list(_CONTROL_MODE_NODES.keys())
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +176,16 @@ class FluxKleinImg2Img:
     is: `manual` attaches it raw, `auto_depth` runs it through this pack's
     already-ported Depth Anything V2 first (same detector as Flux2 Klein
     Depth Map / Krea2Img2Img's auto_depth) to reproduce that exact
-    structural-reference trick.
+    structural-reference trick. Every other `🤖 CCTech/Preprocessors` node
+    (normal maps, soft edges, MLSD, lineart variants, OpenPose) is also
+    available as a control_mode option, since Klein's reference_latents
+    mechanism is generic - unlike Krea2/Qwen-Image, nothing here is
+    constrained to a specific loaded Control LoRA/patch. Only auto_depth is
+    CONFIRMED meaningful to Klein's own training (the real example
+    workflow); the rest are mechanically identical but unverified. Each
+    auto_* mode uses that preprocessor node's own default settings - for
+    custom settings, run the standalone node yourself and use
+    control_mode=manual instead.
 
     `image` (img2img partial-denoise starting point) and `reference_image`
     (conditioning-only reference) are independent and answer different
@@ -213,11 +245,18 @@ class FluxKleinImg2Img:
                                                "for a pure reference-driven edit, leave `image` "
                                                "unconnected (txt2img latent) and connect only "
                                                "this."}),
-                "control_mode": (["manual", "auto_depth"], {"default": "manual",
+                "control_mode": (_CONTROL_MODES, {"default": "manual",
                     "tooltip": "manual: attach reference_image raw. auto_depth: run it through "
-                               "Depth Anything V2 first and attach the depth map instead - "
-                               "reproduces the real example workflow's structural-reference "
-                               "trick (AIO_Preprocessor -> MiDaS depth -> reference_latents)."}),
+                               "Depth Anything V2 first - reproduces the real example workflow's "
+                               "structural-reference trick (AIO_Preprocessor -> MiDaS depth -> "
+                               "reference_latents), the one mode confirmed meaningful to Klein's "
+                               "own training. auto_canny/auto_normal_*/auto_soft_edge_*/auto_mlsd/"
+                               "auto_lineart*/auto_manga_line/auto_openpose: run reference_image "
+                               "through that CCTech/Preprocessors node first (its own default "
+                               "settings - use the standalone node + control_mode=manual for "
+                               "custom settings). Mechanically valid for Klein's generic "
+                               "reference_latents mechanism, but unverified beyond auto_depth - "
+                               "see class docstring."}),
                 "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
                     "default": "depth_anything_v2_vitb.pth",
                     "tooltip": "auto_depth mode only. Model size for the automatic depth "
@@ -255,6 +294,12 @@ class FluxKleinImg2Img:
                 logger.info("Flux Klein: auto-deriving depth map from reference_image "
                             "(control_mode=auto_depth)")
                 ref_pixels = _depth_anything_batch(reference_image, depth_ckpt_name)
+            elif control_mode in _CONTROL_MODE_NODES:
+                logger.info("Flux Klein: auto-deriving reference_image via %s "
+                            "(control_mode=%s)", _CONTROL_MODE_NODES[control_mode].TITLE,
+                            control_mode)
+                node_cls = _CONTROL_MODE_NODES[control_mode]
+                ref_pixels, = getattr(node_cls(), node_cls.FUNCTION)(reference_image)
             ref_pixels = _resize_image(ref_pixels, width, height)
             ref_latent = vae.encode(ref_pixels[:, :, :, :3])
             values = {"reference_latents": [ref_latent]}
