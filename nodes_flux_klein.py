@@ -42,6 +42,7 @@ import logging
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -51,6 +52,8 @@ import comfy.utils
 import folder_paths
 import node_helpers
 import nodes
+
+from . import depth_anything_v2
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,30 @@ def _clip_filename_list():
     files = folder_paths.get_filename_list("clip")
     files += [f for f in folder_paths.get_filename_list("clip_gguf") if f not in files]
     return sorted(files)
+
+
+def _resize_image(image, width, height, upscale_method="lanczos", crop="center"):
+    samples = image[..., :3].clamp(0.0, 1.0).movedim(-1, 1)
+    resized = comfy.utils.common_upscale(samples, width, height, upscale_method, crop)
+    return resized.movedim(1, -1).clamp(0.0, 1.0)
+
+
+def _depth_anything_batch(image, ckpt_name, resolution=512):
+    """Run Depth Anything V2 over an IMAGE batch, returning a depth-map
+    IMAGE batch of the same shape. Same detector this pack's Krea2 Depth
+    Map / Krea2Img2Img control_mode="auto_depth" already use."""
+    detector = depth_anything_v2.DepthAnythingV2Detector(ckpt_name).to(
+        comfy.model_management.get_torch_device())
+    out = None
+    for i in range(image.shape[0]):
+        np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+        depth_rgb = detector.estimate(np_image, resolution=resolution)
+        depth_tensor = torch.from_numpy(depth_rgb.astype(np.float32) / 255.0)
+        if out is None:
+            out = torch.zeros(image.shape[0], *depth_tensor.shape, dtype=torch.float32)
+        out[i] = depth_tensor
+    del detector
+    return out
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────
@@ -128,15 +155,31 @@ class FluxKleinModelLoader:
 
 
 class FluxKleinImg2Img:
-    """Prompts and init latent for FLUX.2 Klein - one node.
+    """Prompts, init latent, and one reference image for FLUX.2 Klein.
 
-    Leave image unconnected for txt2img. Does NOT handle multi-reference
-    images itself (see Flux2KleinMultiReferenceLatent) - Klein's real
-    multi-reference workflow is `positive conditioning -> Multi
-    ReferenceLatent -> sampler`, matching the reference example workflow's
-    own structure, so this node stays a plain prompt/img2img prep step and
-    reference attachment lives in its own node instead of needing 8 image
-    input slots here.
+    Leave image unconnected for txt2img. `reference_image` is Klein's real
+    editing mechanism - confirmed against the actual shipped example
+    workflow ("Image Edit (Flux.2 Klein 9B Distilled)"): it starts from a
+    pure-noise EmptyFlux2LatentImage (NOT an img2img partial denoise of the
+    edited photo) and drives the edit entirely off two VAE-encoded
+    reference images attached to positive AND negative conditioning as
+    reference_latents, plus a text instruction (e.g. "change the pose of
+    the subject in image2 to the pose in image1"). One of those two
+    references in the example is the RAW photo; the other is that photo's
+    DEPTH MAP (via the source workflow's AIO_Preprocessor set to
+    MiDaS-DepthMapPreprocessor) - control_mode picks which `reference_image`
+    is: `manual` attaches it raw, `auto_depth` runs it through this pack's
+    already-ported Depth Anything V2 first (same detector as Flux2 Klein
+    Depth Map / Krea2Img2Img's auto_depth) to reproduce that exact
+    structural-reference trick.
+
+    `image` (img2img partial-denoise starting point) and `reference_image`
+    (conditioning-only reference) are independent and answer different
+    questions - what to start denoising from vs. what identity/structure to
+    reference - matching this pack's edit_reference convention on Krea2Img2Img/
+    QwenImageImg2Img. For 3+ references, use Flux2KleinMultiReferenceLatent
+    downstream instead (it OVERWRITES reference_latents, so re-supply this
+    node's reference_image there too rather than mixing both mechanisms).
 
     The empty-latent (txt2img) path uses Flux.2's REAL shape - confirmed
     via comfy_extras/nodes_flux.py's EmptyFlux2LatentImage:
@@ -154,13 +197,14 @@ class FluxKleinImg2Img:
 
     CATEGORY = FLUX_KLEIN_CATEGORY
     TITLE = "Flux Klein img2img ⚡"
-    SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img', 'encode image']
+    SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img', 'encode image',
+                       'reference image', 'edit reference', 'pose transfer']
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
     FUNCTION = "prepare"
-    DESCRIPTION = ("Prompts and init latent for FLUX.2 Klein. Leave image "
-                   "unconnected for txt2img. Feed the outputs straight into "
-                   "a stock KSampler.")
+    DESCRIPTION = ("Prompts, init latent, and one reference image for FLUX.2 "
+                   "Klein. Leave image unconnected for txt2img. Feed the "
+                   "outputs straight into a stock KSampler.")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -181,11 +225,28 @@ class FluxKleinImg2Img:
             "optional": {
                 "image": ("IMAGE", {"tooltip": "Init image for img2img. Leave unconnected "
                                                "for txt2img."}),
+                "reference_image": ("IMAGE", {"tooltip": "Klein's real edit mechanism: encoded "
+                                               "and attached to positive+negative conditioning "
+                                               "as reference_latents. Independent of `image` - "
+                                               "for a pure reference-driven edit, leave `image` "
+                                               "unconnected (txt2img latent) and connect only "
+                                               "this."}),
+                "control_mode": (["manual", "auto_depth"], {"default": "manual",
+                    "tooltip": "manual: attach reference_image raw. auto_depth: run it through "
+                               "Depth Anything V2 first and attach the depth map instead - "
+                               "reproduces the real example workflow's structural-reference "
+                               "trick (AIO_Preprocessor -> MiDaS depth -> reference_latents)."}),
+                "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
+                    "default": "depth_anything_v2_vitb.pth",
+                    "tooltip": "auto_depth mode only. Model size for the automatic depth "
+                               "estimation. Downloads on first use if not already in "
+                               "models/depth_anything_v2."}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
-                width, height, image=None):
+                width, height, image=None, reference_image=None, control_mode="manual",
+                depth_ckpt_name="depth_anything_v2_vitb.pth"):
         if image is None:
             # Flux.2's real empty-latent shape - see class docstring for why
             # this can't use the generic /8-downscale placeholder.
@@ -205,7 +266,61 @@ class FluxKleinImg2Img:
 
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+
+        if reference_image is not None:
+            ref_pixels = reference_image
+            if control_mode == "auto_depth":
+                logger.info("Flux Klein: auto-deriving depth map from reference_image "
+                            "(control_mode=auto_depth)")
+                ref_pixels = _depth_anything_batch(reference_image, depth_ckpt_name)
+            ref_pixels = _resize_image(ref_pixels, width, height)
+            ref_latent = vae.encode(ref_pixels[:, :, :, :3])
+            values = {"reference_latents": [ref_latent]}
+            positive = node_helpers.conditioning_set_values(positive, values, append=True)
+            negative = node_helpers.conditioning_set_values(negative, values, append=True)
+            logger.info("Flux Klein: reference_image (%s) attached to positive+negative "
+                        "conditioning as reference_latents", control_mode)
+
         return (model, positive, negative, {"samples": latent}, denoise)
+
+
+class Flux2KleinDepthMap:
+    """Estimate a depth map from an IMAGE - Depth Anything V2 (DINOv2 + DPT).
+
+    Standalone building block, same detector `FluxKleinImg2Img`'s
+    control_mode="auto_depth" uses internally, exposed as its own node
+    (matching Krea2 Depth Map / Qwen-Image Canny's convention of explicit,
+    wire-it-yourself preprocessor nodes rather than hidden auto-derivation)
+    for feeding a depth map into Flux2KleinMultiReferenceLatent, a Mask Ref
+    Controller, or anywhere else a Klein reference image is wanted.
+    """
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Depth Map ⚡"
+    SEARCH_ALIASES = ['depth anything', 'depth estimation', 'depth map', 'preprocessor',
+                       'controlnet preprocessor', 'image to depth']
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "estimate"
+    DESCRIPTION = ("Estimate a depth map from a photo (Depth Anything V2), for "
+                   "feeding into Flux Klein img2img's reference_image or "
+                   "Flux2 Klein Multi Reference Latent.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
+                    "default": "depth_anything_v2_vitb.pth",
+                    "tooltip": "Model size. vits (smallest/fastest) to vitg "
+                               "(largest/slowest). Downloads on first use if "
+                               "not already in models/depth_anything_v2."}),
+                "resolution": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
+            },
+        }
+
+    def estimate(self, image, ckpt_name="depth_anything_v2_vitb.pth", resolution=512):
+        return (_depth_anything_batch(image, ckpt_name, resolution),)
 
 
 class Flux2KleinMultiReferenceLatent:
@@ -1733,6 +1848,7 @@ class Flux2KleinIdentityGuidance:
 NODE_CLASS_MAPPINGS = {
     "FluxKleinModelLoader": FluxKleinModelLoader,
     "FluxKleinImg2Img": FluxKleinImg2Img,
+    "Flux2KleinDepthMap": Flux2KleinDepthMap,
     "Flux2KleinMultiReferenceLatent": Flux2KleinMultiReferenceLatent,
     "Flux2KleinIdentityFeatureTransfer": Flux2KleinIdentityFeatureTransfer,
     "Flux2KleinColorAnchor": Flux2KleinColorAnchor,
@@ -1750,6 +1866,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxKleinModelLoader": FluxKleinModelLoader.TITLE,
     "FluxKleinImg2Img": FluxKleinImg2Img.TITLE,
+    "Flux2KleinDepthMap": Flux2KleinDepthMap.TITLE,
     "Flux2KleinMultiReferenceLatent": Flux2KleinMultiReferenceLatent.TITLE,
     "Flux2KleinIdentityFeatureTransfer": Flux2KleinIdentityFeatureTransfer.TITLE,
     "Flux2KleinColorAnchor": Flux2KleinColorAnchor.TITLE,

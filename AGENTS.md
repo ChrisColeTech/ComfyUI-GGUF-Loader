@@ -1549,3 +1549,75 @@ ComfyUI-Flux2Klein-Enhancer achieved except the two deliberate
 exclusions (`Flux2KleinKSamplerExperimental`, the source's own
 superseded Identity Feature Transfer V1/Advanced/V3) - both documented
 in the module docstring and README with the reasoning.
+
+## Fix: FluxKleinImg2Img was missing Klein's real reference mechanism (2026-08-25)
+
+User correction, and it was right: I'd read the shipped example workflow
+(`N:\...\Klein Controlnet.json`) for Parts B/C but mis-scoped what to
+port from it - I only ported the multi-reference chaining pattern
+(`Flux2KleinMultiReferenceLatent`) and left `FluxKleinImg2Img` with just
+a single plain `image` (img2img partial-denoise) input, no second
+reference/control slot at all. User: "i dont even have a second slot
+here to attach the control image or second ref image."
+
+Traced the actual node graph inside the workflow JSON (not just its node
+type list, which I'd looked at before and mis-summarized) to get this
+right: the "Image Edit (Flux.2 Klein 9B Distilled)" subgraph starts from
+a PURE-NOISE `EmptyFlux2LatentImage` - not an img2img denoise of the
+edited photo at all - and drives the whole edit off two VAE-encoded
+reference images attached to positive AND negative conditioning as
+`reference_latents`, plus a text instruction (real saved prompt: "change
+the pose of the subject in the image2 to the pose in the image1"). Of
+the two references, one is the RAW photo; the other is fed through
+`AIO_Preprocessor` (set to `MiDaS-DepthMapPreprocessor`) BEFORE being
+VAE-encoded - i.e. depth-as-reference, not depth-as-ControlNet. Confirmed
+via `json.load` + walking `data["nodes"]`/`data["links"]` and the
+subgraph `data["definitions"]["subgraphs"]` (this workflow uses
+ComfyUI's subgraph feature - the top-level node list alone doesn't show
+what's inside "Image Edit"/"Reference Conditioning").
+
+Fix, in `nodes_flux_klein.py`: added `reference_image` (IMAGE, optional)
++ `control_mode` (`["manual", "auto_depth"]`, default `manual`) +
+`depth_ckpt_name` to `FluxKleinImg2Img.INPUT_TYPES`/`.prepare()`. `manual`
+attaches `reference_image` raw; `auto_depth` runs it through Depth
+Anything V2 first (new `_depth_anything_batch()` helper, same detector
+class Krea2Img2Img's `control_mode="auto_depth"` already uses) before
+VAE-encoding, reproducing the AIO_Preprocessor step. Both attach via
+`node_helpers.conditioning_set_values(..., {"reference_latents": [...]},
+append=True)` on BOTH positive and negative - same mechanism as Krea2/
+Qwen-Image's `edit_reference`, and matches what the real example workflow
+does with stock `ReferenceLatent` nodes (append, no explicit
+`reference_latents_method`, unlike `Flux2KleinMultiReferenceLatent`'s
+own `"index"` overwrite convention - deliberately different, since this
+single-reference path is meant to compose with plain chained
+`ReferenceLatent`/stock nodes, not just this pack's own multi-reference
+node).
+
+Also added `Flux2KleinDepthMap` (new node): the same Depth Anything V2
+detector as a standalone IMAGE->IMAGE node, mirroring `Krea2 Depth Map`'s
+existing convention (explicit, user-wired preprocessing nodes rather than
+hidden auto-derivation) - user's explicit choice via AskUserQuestion over
+redesigning `Flux2KleinMultiReferenceLatent`'s LATENT inputs into
+IMAGE+VAE+per-reference control_mode (a breaking signature change to an
+already-shipped node), so the LATENT-based multi-reference node is
+unchanged; `Flux2KleinDepthMap` composes with it via
+`Flux2KleinDepthMap -> VAEEncode -> Flux2KleinMultiReferenceLatent`.
+
+`tools/smoke_flux_klein.py` gained 5 tests (32/32 total): reference_image
+manual/auto_depth/absent behavior on `FluxKleinImg2Img` (monkeypatching
+`fk._depth_anything_batch` to avoid a real model download in the offline
+suite), and `Flux2KleinDepthMap` delegating to the shared helper with the
+right ckpt_name/resolution. Needed one new smoke-harness fake:
+`folder_paths.models_dir` (depth_anything_v2.py reads it at import time
+for its model-cache directory constant) - same fix `smoke_krea2.py`
+already had.
+
+Real-environment check: `FluxKleinImg2Img`'s new optional inputs and
+`Flux2KleinDepthMap` both register correctly (59 total nodes, up from
+58); ran `FluxKleinImg2Img.prepare()` against a REAL loaded Klein VAE
+(`flux2-vae.safetensors`) and REAL loaded Klein CLIP
+(`qwen3-4b-fp8_mixed.safetensors`, `CLIPType.FLUX2`) with
+`control_mode="manual"` and confirmed `reference_latents` actually lands
+in both positive and negative conditioning with the correct encoded
+shape (`[1, 128, 16, 16]` for a 256x256 reference at Flux.2's real VAE
+downscale ratio) - not just registration, the real encode+attach path.

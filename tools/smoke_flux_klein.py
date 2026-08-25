@@ -29,6 +29,7 @@ folder_paths = types.ModuleType("folder_paths")
 folder_paths.get_filename_list = lambda key: []
 folder_paths.get_full_path_or_raise = lambda key, name: name
 folder_paths.get_folder_paths = lambda key: []
+folder_paths.models_dir = str(REPO_ROOT / "models")
 nodes = types.ModuleType("nodes")
 nodes.MAX_RESOLUTION = 16384
 
@@ -113,6 +114,66 @@ def test_img2img_batch_size_repeats_txt2img_latent():
         model, _clip(), _vae(), "prompt", "", 0.6, 3, 128, 128)
     assert latent["samples"].shape == (3, 128, 8, 8)
     print("[ok] FluxKleinImg2Img: batch_size repeats the empty latent correctly")
+
+
+def test_img2img_reference_image_manual_attaches_to_both_conditionings():
+    node = fk.FluxKleinImg2Img()
+    model = object()
+    _, positive, negative, _, _ = node.prepare(
+        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
+        reference_image=torch.rand(1, 64, 64, 3), control_mode="manual")
+    assert "reference_latents" in positive[0][1]
+    assert "reference_latents" in negative[0][1]
+    print("[ok] FluxKleinImg2Img: reference_image (manual) attaches reference_latents "
+          "to positive AND negative conditioning")
+
+
+def test_img2img_reference_image_auto_depth_uses_depth_helper():
+    node = fk.FluxKleinImg2Img()
+    model = object()
+    calls = []
+    original = fk._depth_anything_batch
+    fk._depth_anything_batch = lambda image, ckpt_name, resolution=512: (
+        calls.append((tuple(image.shape), ckpt_name)) or torch.rand(1, 64, 64, 3))
+    try:
+        _, positive, _, _, _ = node.prepare(
+            model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
+            reference_image=torch.rand(1, 64, 64, 3), control_mode="auto_depth")
+    finally:
+        fk._depth_anything_batch = original
+    assert len(calls) == 1
+    assert "reference_latents" in positive[0][1]
+    print("[ok] FluxKleinImg2Img: control_mode=auto_depth runs reference_image through "
+          "the depth helper before attaching reference_latents")
+
+
+def test_img2img_no_reference_image_leaves_conditioning_unchanged():
+    node = fk.FluxKleinImg2Img()
+    model = object()
+    _, positive, negative, _, _ = node.prepare(
+        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64)
+    assert "reference_latents" not in positive[0][1]
+    assert "reference_latents" not in negative[0][1]
+    print("[ok] FluxKleinImg2Img: no reference_image -> no reference_latents attached")
+
+
+# ── Flux2KleinDepthMap ───────────────────────────────────────────────────
+
+def test_depth_map_node_delegates_to_depth_helper():
+    node = fk.Flux2KleinDepthMap()
+    calls = []
+    original = fk._depth_anything_batch
+    fk._depth_anything_batch = lambda image, ckpt_name, resolution=512: (
+        calls.append((tuple(image.shape), ckpt_name, resolution)) or torch.zeros_like(image))
+    try:
+        out, = node.estimate(torch.rand(2, 32, 32, 3), ckpt_name="depth_anything_v2_vits.pth",
+                             resolution=256)
+    finally:
+        fk._depth_anything_batch = original
+    assert calls == [((2, 32, 32, 3), "depth_anything_v2_vits.pth", 256)]
+    assert out.shape == (2, 32, 32, 3)
+    print("[ok] Flux2KleinDepthMap: delegates to the shared depth helper with the given "
+          "ckpt_name/resolution")
 
 
 # ── Flux2KleinMultiReferenceLatent ──────────────────────────────────────
@@ -500,6 +561,10 @@ if __name__ == "__main__":
     test_img2img_txt2img_uses_flux2_real_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
     test_img2img_batch_size_repeats_txt2img_latent()
+    test_img2img_reference_image_manual_attaches_to_both_conditionings()
+    test_img2img_reference_image_auto_depth_uses_depth_helper()
+    test_img2img_no_reference_image_leaves_conditioning_unchanged()
+    test_depth_map_node_delegates_to_depth_helper()
     test_multi_reference_latent_splits_batch_into_individual_refs()
     test_multi_reference_latent_combines_multiple_inputs_in_order()
     test_multi_reference_latent_applies_to_both_positive_and_negative()
