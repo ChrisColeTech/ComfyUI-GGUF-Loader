@@ -41,6 +41,7 @@ import comfy.model_management
 import comfy.sd
 import comfy.utils
 import folder_paths
+import node_helpers
 import nodes
 
 from . import depth_anything_v2
@@ -243,6 +244,39 @@ class QwenImageControlNetLoader:
         return (QwenImageControl("controlnet", control),)
 
 
+class QwenImageCanny:
+    """Canny edge detection - plain cv2.Canny, no model, no download.
+
+    Feed a source photo in, get an edge-map IMAGE out - a canny DiffSynth/
+    Union/Fun checkpoint's expected control_image input on QwenImageImg2Img.
+    Same logic QwenImageImg2Img's control_mode="auto_canny" uses internally,
+    exposed standalone so you can preview it and reuse it elsewhere -
+    matching Krea2DepthMap's role for depth.
+    """
+
+    CATEGORY = QWEN_IMAGE_CATEGORY
+    TITLE = "Qwen-Image Canny ⚡"
+    SEARCH_ALIASES = ['canny', 'edge detection', 'preprocessor',
+                       'controlnet preprocessor', 'image to canny', 'edge map']
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "detect"
+    DESCRIPTION = ("Canny edge detection for a canny Qwen-Image ControlNet's "
+                   "control_image input. No model, no download.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "low_threshold": ("INT", {"default": 100, "min": 0, "max": 255}),
+                "high_threshold": ("INT", {"default": 200, "min": 0, "max": 255}),
+            },
+        }
+
+    def detect(self, image, low_threshold=100, high_threshold=200):
+        return (_auto_canny_control_image(image, low_threshold, high_threshold),)
+
+
 class QwenImageImg2Img:
     """Prompts, init latent, and optional control attach for Qwen-Image - one node.
 
@@ -269,6 +303,17 @@ class QwenImageImg2Img:
     in any mode. control_image is required even for an inpaint checkpoint;
     connect `mask` alongside it to refine which region gets inpainted -
     mask alone isn't enough, there's no photo-only way to auto-derive one.
+
+    edit_reference is a separate thing from image/control_image: it's for
+    Qwen-Image-Edit checkpoints specifically, which have a real, distinct
+    forward-pass input (`ref_latents` in comfy.ldm.qwen_image.model.py's
+    DiT) for "the photo to edit" - not img2img, not ControlNet. Without it,
+    an Edit checkpoint runs as a plain generator using weights fine-tuned
+    for editing, not a real edit. No custom sampler involved - this is
+    conditioning, same mechanism as `control`: VAE-encode the photo and
+    attach it to positive conditioning as `reference_latents`, the same
+    thing stock comfy's `ReferenceLatent` node does, applied to positive
+    only.
 
     Feed the outputs straight into a stock KSampler.
     """
@@ -323,13 +368,19 @@ class QwenImageImg2Img:
                 "mask": ("MASK", {"tooltip": "For an inpaint checkpoint - the region to "
                                             "inpaint. Not derivable automatically."}),
                 "control_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                "edit_reference": ("IMAGE", {"tooltip": "For Qwen-Image-Edit checkpoints: the "
+                                             "photo to edit. Encoded and attached to positive "
+                                             "conditioning as the model's real edit-reference "
+                                             "input (reference_latents) - separate from img2img's "
+                                             "`image` and ControlNet's `control_image`. Leave "
+                                             "unconnected for a non-Edit checkpoint."}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
                 width, height, image=None, qwen_control=None, control_mode="manual",
                 depth_ckpt_name="depth_anything_v2_vitb.pth", control_image=None,
-                mask=None, control_strength=1.0):
+                mask=None, control_strength=1.0, edit_reference=None):
         if control_image is not None and qwen_control is None:
             logger.warning(
                 "QwenImageImg2Img: control_image was given, but no qwen_control was "
@@ -384,6 +435,16 @@ class QwenImageImg2Img:
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
 
+        if edit_reference is not None:
+            ref_pixels = comfy.utils.common_upscale(
+                edit_reference.movedim(-1, 1), width, height, "lanczos", "disabled"
+            ).movedim(1, -1)[:, :, :, :3]
+            ref_latent = vae.encode(ref_pixels)
+            positive = node_helpers.conditioning_set_values(
+                positive, {"reference_latents": [ref_latent]}, append=True)
+            logger.info("Qwen-Image: edit_reference attached to positive conditioning "
+                        "(reference_latents) - real edit-model conditioning, not ControlNet")
+
         if qwen_control is not None:
             control_pixels = comfy.utils.common_upscale(
                 control_image.movedim(-1, 1), width, height, "lanczos", "disabled"
@@ -418,11 +479,13 @@ class QwenImageImg2Img:
 NODE_CLASS_MAPPINGS = {
     "QwenImageModelLoader": QwenImageModelLoader,
     "QwenImageControlNetLoader": QwenImageControlNetLoader,
+    "QwenImageCanny": QwenImageCanny,
     "QwenImageImg2Img": QwenImageImg2Img,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImageModelLoader": QwenImageModelLoader.TITLE,
     "QwenImageControlNetLoader": QwenImageControlNetLoader.TITLE,
+    "QwenImageCanny": QwenImageCanny.TITLE,
     "QwenImageImg2Img": QwenImageImg2Img.TITLE,
 }

@@ -56,6 +56,29 @@ comfy_extras = types.ModuleType("comfy_extras")
 comfy_extras_nodes_model_patch = types.ModuleType("comfy_extras.nodes_model_patch")
 comfy_extras_nodes_model_patch.DiffSynthCnetPatch = _FakeDiffSynthCnetPatch
 
+# node_helpers imports `from comfy.cli_args import args` at module level in
+# the real ComfyUI, too heavy to import directly offline - stub with a 1:1
+# reimplementation of the real conditioning_set_values (node_helpers.py).
+node_helpers = types.ModuleType("node_helpers")
+
+
+def _conditioning_set_values(conditioning, values={}, append=False):
+    c = []
+    for t in conditioning:
+        n = [t[0], t[1].copy()]
+        for k in values:
+            val = values[k]
+            if append:
+                old_val = n[1].get(k, None)
+                if old_val is not None:
+                    val = old_val + val
+            n[1][k] = val
+        c.append(n)
+    return c
+
+
+node_helpers.conditioning_set_values = _conditioning_set_values
+
 sys.modules["comfy"] = comfy
 sys.modules["comfy.controlnet"] = comfy_controlnet
 sys.modules["comfy.model_management"] = comfy_model_management
@@ -65,6 +88,7 @@ sys.modules["folder_paths"] = folder_paths
 sys.modules["nodes"] = nodes
 sys.modules["comfy_extras"] = comfy_extras
 sys.modules["comfy_extras.nodes_model_patch"] = comfy_extras_nodes_model_patch
+sys.modules["node_helpers"] = node_helpers
 comfy.controlnet = comfy_controlnet
 comfy.model_management = comfy_model_management
 comfy.sd = comfy_sd
@@ -216,6 +240,25 @@ def test_img2img_controlnet_control_attaches_to_conditioning():
     print("[ok] QwenImageImg2Img: kind='controlnet' attaches via CONDITIONING, MODEL left untouched")
 
 
+def test_canny_node_produces_edge_map_matching_input_shape():
+    node = qi.QwenImageCanny()
+    (out,) = node.detect(torch.rand(1, 32, 32, 3))
+    assert out.shape == (1, 32, 32, 3)
+    print("[ok] QwenImageCanny: output shape matches input")
+
+
+def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():
+    node = qi.QwenImageImg2Img()
+    model = _FakeModelPatcher()
+    _, positive, negative, _, _ = node.prepare(
+        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
+        edit_reference=torch.rand(1, 64, 64, 3))
+    assert "reference_latents" in positive[0][1]
+    assert "reference_latents" not in negative[0][1]
+    print("[ok] QwenImageImg2Img: edit_reference attaches reference_latents to "
+          "positive conditioning only")
+
+
 if __name__ == "__main__":
     test_apply_controlnet_stamps_control_key_on_every_conditioning_item()
     test_apply_controlnet_sets_hint_and_strength()
@@ -225,4 +268,6 @@ if __name__ == "__main__":
     test_img2img_with_image_uses_strength_as_denoise()
     test_img2img_model_patch_control_attaches_to_model()
     test_img2img_controlnet_control_attaches_to_conditioning()
+    test_canny_node_produces_edge_map_matching_input_shape()
+    test_img2img_edit_reference_attaches_reference_latents_to_positive_only()
     print("[ok] all nodes_qwen_image smoke tests passed")

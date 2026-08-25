@@ -1120,3 +1120,78 @@ respectively); the plain `sys.path.insert` + `import nodes_qwen_image`
 import was replaced with the same synthetic-package trick already used in
 `tools/smoke_krea2.py`, since `from . import depth_anything_v2` is a
 relative import that only resolves inside a real package context.
+
+## Qwen-Image: standalone Canny node + edit_reference (reference_latents) (2026-08-25)
+
+Two real gaps, both surfaced by the user while live-testing a real
+workflow (`Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors` +
+`qwen-image-edit-Lightning-4steps` LoRA +
+`Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors`, prompt "make her
+dress blue and give her a halo") - neither a guess, both confirmed against
+real comfy source before shipping. Went through plan mode for this one
+since the scope grew mid-investigation (started as "add a canny node,"
+became "also wire up Edit").
+
+**Gap 1 - depth had a standalone node, canny didn't.** User caught this
+directly: `Krea2DepthMap` is a standalone, previewable node reusable for
+any model (already documented as such), but canny preprocessing
+(`_auto_canny_control_image`) only existed inline inside
+`QwenImageImg2Img`'s `control_mode="auto_canny"` branch - no way to see or
+reuse it standalone. Fixed: added `QwenImageCanny`, mirroring
+`Krea2DepthMap`'s exact shape, calling the same existing helper (no
+duplication - `QwenImageImg2Img`'s `auto_canny` branch still calls
+`_auto_canny_control_image` directly too, same "independent calls to
+shared logic" pattern `Krea2DepthMap`/`Krea2Img2Img.auto_depth` already
+both use).
+
+**Gap 2 - Qwen-Image-Edit's real edit mechanism was never wired up.** User
+asked directly: "did you say you did not wire up edit in the diffusion
+loop? do we need a custom sampler again?" Answered by actually reading
+`comfy/ldm/qwen_image/model.py`'s DiT `_forward()` (not guessing): it takes
+a distinct `ref_latents` parameter (line 442), genuinely separate from
+both the img2img latent (`x`) and ControlNet's `control` parameter - when
+present, reference-image tokens get concatenated onto the sequence before
+the block loop runs. `QwenImageImg2Img` never supplied this at all, so an
+Edit checkpoint (fine-tuned specifically for editing) was running as a
+plain generator - explaining "not garbage, but not working like a proper
+canny model" even after the canny-wiring fix from the previous session
+entry.
+
+Confirmed the fix is conditioning, not a sampler change - read
+`comfy_extras/nodes_edit_model.py`'s stock `ReferenceLatent` node in full:
+it just VAE-encodes a photo into a `LATENT` and calls
+`node_helpers.conditioning_set_values(conditioning, {"reference_latents":
+[latent["samples"]]}, append=True)`. Comfy's generic `extra_conds`/
+`apply_model` machinery already reads `reference_latents` out of
+conditioning and threads it into the real `ref_latents` forward parameter -
+`KSampler` stays completely architecture-agnostic, same as everywhere else
+in this pack. Added `edit_reference` (optional IMAGE) to
+`QwenImageImg2Img`, doing exactly that, applied to `positive` conditioning
+only (matches `ReferenceLatent`'s typical single-conditioning-stream
+usage - edit intent is a positive-conditioning concept). Added
+`import node_helpers` - same module, same call pattern `nodes_ltx23.py`
+already uses for `frame_rate`.
+
+Kept `edit_reference` a separate input from `image` (img2img starting
+latent) and `control_image` (structural guidance) rather than overloading
+one of them - the three answer genuinely different questions and a real
+Qwen-Image-Edit + ControlNet workflow could plausibly want all three
+connected to different things (or the same photo) simultaneously.
+
+`tools/smoke_qwen_image.py`: added `test_canny_node_produces_edge_map_matching_input_shape`
+and `test_img2img_edit_reference_attaches_reference_latents_to_positive_only`.
+The latter needed stubbing `node_helpers` in the offline harness - checked
+its real source first (`node_helpers.py` imports `from comfy.cli_args
+import args` at module level, too heavy to import directly offline) and
+stubbed a faithful 1:1 copy of the real 15-line `conditioning_set_values`
+rather than a simplified fake, so the test exercises the actual logic, not
+a stand-in for it. 10/10 passing. Real-environment check confirmed
+`QwenImageCanny` registers correctly and `QwenImageImg2Img`'s optional
+list now includes `edit_reference`; total registered node count went
+41 -> 42 (one new node class).
+
+Left for the user to confirm since it needs real GPU inference (not
+possible in this dev environment): whether Edit checkpoint output now
+actually preserves the source photo's identity while following the
+prompt's edit instruction, with the canny ControlNet's structural guidance
+applied on top.
