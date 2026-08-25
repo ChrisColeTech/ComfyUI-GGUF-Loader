@@ -876,12 +876,14 @@ class Krea2Img2Img:
                                                "auto_canny modes) the source photo the control "
                                                "image is derived from. Leave unconnected for "
                                                "txt2img."}),
-                "control_mode": (["auto_depth", "auto_canny", "manual"], {"default": "auto_depth",
+                "control_mode": (["auto_depth", "auto_canny", "manual", "none"], {"default": "auto_depth",
                     "tooltip": "auto_depth/auto_canny: derive the control image from `image` "
                                "automatically - pick whichever matches the loaded Control LoRA. "
                                "manual: no automatic derivation, connect control_image yourself "
                                "- use this for any Control LoRA the two auto modes don't cover "
-                               "(pose/lineart/normal)."}),
+                               "(pose/lineart/normal). none: skip control attachment entirely "
+                               "even if a Control LoRA is loaded - for toggling control off "
+                               "without rewiring or removing the loader."}),
                 "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
                     "default": "depth_anything_v2_vitb.pth",
                     "tooltip": "auto_depth mode only. Model size for the automatic depth "
@@ -927,7 +929,7 @@ class Krea2Img2Img:
                 "Control LoRA loaded - ignoring control_image.")
             control_image = None
 
-        if has_control_lora and control_image is None:
+        if has_control_lora and control_image is None and control_mode != "none":
             if control_mode == "auto_depth" and image is not None:
                 logger.info("Krea2: auto-deriving depth map from image (control_mode=auto_depth)")
                 control_image = _depth_anything_batch(image, depth_ckpt_name)
@@ -945,6 +947,9 @@ class Krea2Img2Img:
                     "no control_image was given. Sampling would fail with a missing control "
                     "latent - connect control_image, switch control_mode to auto_depth/"
                     "auto_canny, or remove Krea2ControlLoRALoader.")
+        elif has_control_lora and control_mode == "none":
+            logger.info("Krea2: control_mode=none - skipping control attachment even though "
+                        "a Control LoRA is loaded.")
 
         if image is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own

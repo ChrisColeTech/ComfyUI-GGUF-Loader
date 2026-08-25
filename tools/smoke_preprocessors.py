@@ -1,5 +1,11 @@
 """CPU-only smoke test for nodes/preprocessors.py.
 
+This module now only backs two historically-named nodes (Krea2DepthMap,
+Flux2KleinDepthMap, QwenImageCanny) - the advanced preprocessor set
+(normal maps, soft edges, MLSD, lineart variants, OpenPose) moved to the
+standalone ComfyUI-ControlNet-Nodes package. See that package's own
+tools/smoke_preprocessors.py for coverage of those.
+
 Stubs the comfy-internal modules preprocessors.py imports at the top level
 so DepthMap/Canny's shape/dtype contracts can be verified without a running
 ComfyUI or GPU. Depth Anything V2's real architecture (vendor/depth_anything_v2.py)
@@ -99,140 +105,18 @@ def test_canny_solid_color_image_has_no_edges():
     print("[ok] Canny: a solid-color image (no edges) produces an all-zero edge map")
 
 
-# ── Batch 1/2 detector-backed nodes (NormalBAE, DSINE, HED, PiDiNet, MLSD,
-# Lineart, Lineart Anime, Manga Line) - each follows the identical shape:
-# node.estimate() builds <vendor_module>.<X>Detector(...), moves it to the
-# comfy device, and calls the shared _estimate_batch() helper. Fake the
-# Detector class per-test to confirm the node wires it up and returns the
-# right IMAGE batch shape/dtype, without downloading real weights.
-
-class _FakeSimpleDetector:
-    """Matches every ported detector's .to(device)/.estimate(...) contract,
-    echoing the input straight back so shape/dtype can be asserted."""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def to(self, device):
-        return self
-
-    def estimate(self, np_image, resolution=512, **kwargs):
-        return np_image
-
-
-def _check_detector_backed_node(node, vendor_module, detector_attr, node_kwargs=None):
-    original = getattr(vendor_module, detector_attr)
-    setattr(vendor_module, detector_attr, _FakeSimpleDetector)
-    try:
-        out, = node.estimate(torch.rand(2, 16, 16, 3), **(node_kwargs or {}))
-    finally:
-        setattr(vendor_module, detector_attr, original)
-    assert out.shape == (2, 16, 16, 3)
-    assert out.dtype == torch.float32
-    return out
-
-
-def test_normal_map_bae_delegates_to_detector():
-    _check_detector_backed_node(pp.NormalMapBAE(), pp.normal_bae, "NormalBAEDetector")
-    print("[ok] NormalMapBAE: builds NormalBAEDetector, returns a float32 IMAGE batch")
-
-
-def test_normal_map_dsine_delegates_to_detector():
-    _check_detector_backed_node(pp.NormalMapDSINE(), pp.dsine, "DSINEDetector")
-    print("[ok] NormalMapDSINE: builds DSINEDetector, returns a float32 IMAGE batch")
-
-
-def test_soft_edge_hed_delegates_to_detector():
-    _check_detector_backed_node(pp.SoftEdgeHED(), pp.hed, "HEDDetector")
-    print("[ok] SoftEdgeHED: builds HEDDetector, returns a float32 IMAGE batch")
-
-
-def test_soft_edge_pidinet_delegates_to_detector():
-    _check_detector_backed_node(pp.SoftEdgePiDiNet(), pp.pidinet, "PiDiNetDetector")
-    print("[ok] SoftEdgePiDiNet: builds PiDiNetDetector, returns a float32 IMAGE batch")
-
-
-def test_mlsd_lines_delegates_to_detector():
-    _check_detector_backed_node(pp.MLSDLines(), pp.mlsd, "MLSDDetector")
-    print("[ok] MLSDLines: builds MLSDDetector, returns a float32 IMAGE batch")
-
-
-def test_lineart_delegates_to_detector():
-    _check_detector_backed_node(pp.Lineart(), pp.lineart, "LineartDetector")
-    print("[ok] Lineart: builds LineartDetector, returns a float32 IMAGE batch")
-
-
-def test_lineart_anime_delegates_to_detector():
-    _check_detector_backed_node(pp.LineartAnime(), pp.lineart_anime, "LineartAnimeDetector")
-    print("[ok] LineartAnime: builds LineartAnimeDetector, returns a float32 IMAGE batch")
-
-
-def test_manga_line_delegates_to_detector():
-    _check_detector_backed_node(pp.MangaLine(), pp.manga_line, "MangaLineDetector")
-    print("[ok] MangaLine: builds MangaLineDetector, returns a float32 IMAGE batch")
-
-
-def test_openpose_delegates_to_detector_and_unpacks_tuple():
-    # OpenPoseDetector.estimate() returns (canvas, pose_dict) - unlike every
-    # other ported detector's single-ndarray return - confirm the node
-    # unpacks it correctly and discards the keypoint dict for the IMAGE-only
-    # output contract this pack's preprocessor nodes share.
-    calls = []
-
-    class _FakeOpenPoseDetector:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def to(self, device):
-            return self
-
-        def estimate(self, np_image, resolution=512, include_body=True,
-                     include_hand=True, include_face=True):
-            calls.append((np_image.shape, include_body, include_hand, include_face))
-            return np_image, {"people": []}
-
-    original = pp.openpose.OpenPoseDetector
-    pp.openpose.OpenPoseDetector = _FakeOpenPoseDetector
-    try:
-        node = pp.OpenPose()
-        out, = node.estimate(torch.rand(2, 16, 16, 3), detect_body=True,
-                             detect_hand=False, detect_face=True)
-    finally:
-        pp.openpose.OpenPoseDetector = original
-
-    assert out.shape == (2, 16, 16, 3)
-    assert out.dtype == torch.float32
-    assert len(calls) == 2  # once per image in the batch
-    assert all(c[1:] == (True, False, True) for c in calls)  # detect_* flags threaded through
-    print("[ok] OpenPose: builds OpenPoseDetector, unpacks the (canvas, pose_dict) tuple, "
-          "returns a float32 IMAGE batch, threads detect_body/hand/face through")
-
-
-def test_all_preprocessor_nodes_registered():
-    expected = {
-        "DepthMap", "NormalMapBAE", "NormalMapDSINE", "SoftEdgeHED",
-        "SoftEdgePiDiNet", "MLSDLines", "Lineart", "LineartAnime",
-        "MangaLine", "OpenPose", "Canny",
-    }
-    assert expected.issubset(pp.NODE_CLASS_MAPPINGS.keys()), (
-        expected - pp.NODE_CLASS_MAPPINGS.keys())
-    assert expected.issubset(pp.NODE_DISPLAY_NAME_MAPPINGS.keys())
-    print("[ok] all preprocessor nodes are registered in NODE_CLASS_MAPPINGS/"
-          "NODE_DISPLAY_NAME_MAPPINGS")
+def test_module_does_not_self_register_nodes():
+    # DepthMap/Canny are implementation-only here - only krea2.py/qwen_image.py/
+    # flux_klein.py register them, under their own historical names, to avoid
+    # colliding with ComfyUI-ControlNet-Nodes' own generic "DepthMap"/"Canny".
+    assert not hasattr(pp, "NODE_CLASS_MAPPINGS")
+    assert not hasattr(pp, "NODE_DISPLAY_NAME_MAPPINGS")
+    print("[ok] nodes/preprocessors.py does not self-register any nodes")
 
 
 if __name__ == "__main__":
     test_depth_map_delegates_to_detector_per_image()
     test_canny_output_shape_matches_input_and_is_grayscale_replicated()
     test_canny_solid_color_image_has_no_edges()
-    test_normal_map_bae_delegates_to_detector()
-    test_normal_map_dsine_delegates_to_detector()
-    test_soft_edge_hed_delegates_to_detector()
-    test_soft_edge_pidinet_delegates_to_detector()
-    test_mlsd_lines_delegates_to_detector()
-    test_lineart_delegates_to_detector()
-    test_lineart_anime_delegates_to_detector()
-    test_manga_line_delegates_to_detector()
-    test_openpose_delegates_to_detector_and_unpacks_tuple()
-    test_all_preprocessor_nodes_registered()
+    test_module_does_not_self_register_nodes()
     print("[ok] all nodes/preprocessors smoke tests passed")

@@ -249,6 +249,21 @@ def test_img2img_ignores_control_image_without_qwen_control():
     print("[ok] QwenImageImg2Img: control_image with no qwen_control is ignored, not an error")
 
 
+def test_img2img_control_mode_none_skips_control_even_with_qwen_control_connected():
+    # Before "none" existed, qwen_control connected with no control_image
+    # (auto or manual) always raised - there was no way to skip control for
+    # one call. Confirm "none" bypasses that entirely: no raise, no control
+    # attached, even though qwen_control is connected.
+    node = qi.QwenImageImg2Img()
+    model = _FakeModelPatcher()
+    result = node.prepare(model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
+                          qwen_control=qi.QwenImageControl("controlnet", _FakeControlNet()),
+                          control_mode="none")
+    assert result is not None
+    print("[ok] QwenImageImg2Img: control_mode=none skips control attachment even "
+          "though qwen_control is connected, instead of raising")
+
+
 def test_img2img_txt2img_empty_latent_shape():
     node = qi.QwenImageImg2Img()
     model = _FakeModelPatcher()
@@ -369,6 +384,7 @@ if __name__ == "__main__":
     test_apply_controlnet_sets_hint_and_strength()
     test_img2img_rejects_qwen_control_without_control_image()
     test_img2img_ignores_control_image_without_qwen_control()
+    test_img2img_control_mode_none_skips_control_even_with_qwen_control_connected()
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
     test_img2img_model_patch_control_attaches_to_model()

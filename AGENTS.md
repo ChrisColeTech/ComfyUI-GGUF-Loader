@@ -18,24 +18,32 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
   - `nodes/scenema.py` — the Scenema Audio nodes (category `🤖 CCTech/Scenema`).
   - `nodes/extra.py`, `nodes/minimax_h3_prompt.py` — DualVAELoader/ClipProjLoader, and
     the MiniMax-H3 prompt-schema helper (CCTech's own, not vendored).
-  - `nodes/preprocessors.py` — shared ControlNet-aux-style preprocessor nodes
-    (category `🤖 CCTech/Preprocessors`: Depth Map, Normal Map BAE/DSINE, Soft Edge
-    HED/PiDiNet, MLSD Lines, Lineart/Lineart Anime/Manga Line, Canny). Used
-    standalone and by `control_mode="auto_*"` on Krea2Img2Img/QwenImageImg2Img/
-    FluxKleinImg2Img. `Krea2DepthMap`/`Flux2KleinDepthMap`/`QwenImageCanny` are
-    backward-compat aliases registered in their own pipeline's `NODE_CLASS_MAPPINGS`
-    pointing at this file's `DepthMap`/`Canny` classes - not separate implementations.
+  - `nodes/preprocessors.py` — the MINIMUM shared preprocessing: `DepthMap`
+    (Depth Anything V2) + `Canny` (plain cv2), used internally by
+    `control_mode="auto_depth"/"auto_canny"` on Krea2Img2Img/QwenImageImg2Img/
+    FluxKleinImg2Img. Does NOT register any node of its own - registering
+    generic "DepthMap"/"Canny" here would collide with the separate
+    ComfyUI-ControlNet-Nodes package's own registration of those names.
+    `Krea2DepthMap`/`Flux2KleinDepthMap`/`QwenImageCanny` are registered in
+    their own pipeline's `NODE_CLASS_MAPPINGS`, pointing at this file's
+    `DepthMap`/`Canny` classes. The full 11-node ControlNet-aux preprocessor
+    set (normal maps, soft edges, MLSD, lineart variants, OpenPose) lives in
+    the standalone https://github.com/ChrisColeTech/ComfyUI-ControlNet-Nodes
+    package instead - see the 2026-08-25 dated entries below for why.
   - `nodes/{flux_klein,krea2,lmstudio,ltx23,ltx25,minimax_h3,minimax_music,qwen_image,
     qwen_tts,stems,zimage}.py` — the rest of the node families, one file each.
+    `flux_klein.py` only holds the 5 genuinely Klein-specific nodes - 9
+    architecturally-generic Flux-family reference-conditioning nodes moved to
+    the standalone https://github.com/ChrisColeTech/ComfyUI-Flux-Reference-Tools
+    package (see the 2026-08-25 dated entry below).
 - `ops/` — GGMLTensor/GGMLOps: weights stay quantized, dequant per-layer at forward
   time. **This is the repo's core identity.** `ops/__init__.py` (was `ops.py`) is the
   package's public surface; `ops/dequant.py` holds the low-level dequant kernels.
 - `vendor/` — ported/adapted third-party model code, each file's header says which
-  project it was ported from: `clipproj.py`, `depth_anything_v2.py`, `dsine.py`,
-  `hed.py`, `lineart.py`, `lineart_anime.py`, `manga_line.py`, `melband_arch.py`,
-  `mlsd.py`, `normal_bae.py`, `openpose.py` (NOT registered as a node yet - see the
-  dated entry below, CMU non-commercial license), `pidinet.py`, `seedvc.py`,
-  `seedvc_arch.py`, `seedvc_utils.py`, `LICENSE-ClipProj`.
+  project it was ported from: `clipproj.py`, `depth_anything_v2.py` (the only
+  preprocessor architecture kept here - see 2026-08-25 dated entries),
+  `melband_arch.py`, `seedvc.py`, `seedvc_arch.py`, `seedvc_utils.py`,
+  `LICENSE-ClipProj`.
 - `loader.py` — GGUF → fake-quantized state dict (`gguf_sd_loader`), text-encoder
   post-processing (`gguf_clip_loader`: key remaps, Gemma-3 norm `+1` un-bake,
   sentencepiece tokenizer rebuild from GGUF metadata — now cached next to the
@@ -1796,3 +1804,121 @@ Zoe, Depth Anything v1, OneFormer, SAM, DensePose - porting these means
 adding a `transformers` dependency, a separate decision), and the ~15
 "no real model" utility nodes (Scribble, Binary, Tile, Color, Recolor,
 Shuffle, Inpaint, pose-keypoint-drawing helpers).
+
+## Split into three packages; trimmed back to a real minimum (2026-08-25)
+
+User's reaction to landing at 70 registered nodes: "that's a bit much."
+Rather than just trimming, asked for a proper split: two new standalone
+repos published via `gh` CLI, and a real definition of "minimum" for
+what stays in this repo.
+
+**Two new standalone packages** (both `gh repo create --public`,
+`.github/workflows/publish_action.yml` copied from this repo's own,
+`REGISTRY_ACCESS_TOKEN` secret added by the user, both manually triggered
+via `gh workflow run` and confirmed successful, both `main`-branch
+default matching this repo's convention):
+
+- **[ComfyUI-ControlNet-Nodes](https://github.com/ChrisColeTech/ComfyUI-ControlNet-Nodes)**
+  - the 11-node preprocessor set (Depth Anything V2, Normal BAE/DSINE,
+  Soft Edge HED/PiDiNet, MLSD, Lineart/Anime/Manga, OpenPose, Canny) -
+  a straight copy-and-adapt of what had just been built here, done by a
+  general-purpose agent given explicit instructions to leave this repo
+  completely untouched (verified: `git status` in this repo before/after
+  showed only pre-existing changes from other work, nothing from that
+  agent).
+- **[ComfyUI-Flux-Reference-Tools](https://github.com/ChrisColeTech/ComfyUI-Flux-Reference-Tools)**
+  - 9 nodes extracted from `nodes/flux_klein.py` and renamed to drop
+  "Klein" branding (`Flux2KleinMultiReferenceLatent` ->
+  `FluxMultiReferenceLatent`, etc.) - a second general-purpose agent
+  confirmed via grep that none of the 9 actually import anything from
+  this repo's `ops`/`loader`/`vendor` modules, i.e. they were genuinely
+  Flux-family-generic all along, just built and named as part of a
+  Klein-specific port. `FluxDetailController` keeps reading the literal
+  `meta["klein_sections"]` metadata key (optional, still works standalone
+  without it) for cross-package compatibility with this repo's own
+  `Flux2KleinSectionedEncoder`.
+
+**Defining "minimum" for what stays here**: not "whatever seems useful,"
+but literally the two preprocessors this repo's own img2img nodes have
+always auto-derived internally - Depth Anything V2 and plain `cv2.Canny`
+- for `control_mode="auto_depth"/"auto_canny"` on `Krea2Img2Img`/
+`QwenImageImg2Img`/`FluxKleinImg2Img`. Everything else the earlier
+preprocessor batch added (9 vendor files, 9 node classes) got removed
+from `vendor/` and `nodes/preprocessors.py` via `git rm` + a full
+rewrite of that file down to just `DepthMap`+`Canny` (implementation
+only - no `NODE_CLASS_MAPPINGS` of its own anymore, see the file's own
+docstring for why: registering generic "DepthMap"/"Canny" names here
+would collide with ComfyUI-ControlNet-Nodes' own registration of those
+same names if both packs are installed). `nodes/__init__.py`'s merge of
+`nodes.preprocessors`'s own mappings was removed accordingly.
+
+Same logic for `nodes/flux_klein.py`: reverted `FluxKleinImg2Img`'s
+`control_mode` from the 10-option set (added earlier the same day) back
+down to `["manual", "auto_depth", "auto_canny", "none"]` - the exact
+same set Krea2/Qwen-Image use, since the other 7 `auto_*` modes were
+scope creep past "minimum," not something Krea2/Qwen-Image ever had
+either. The `_CONTROL_MODE_NODES` dispatch dict and its `from . import
+preprocessors as pp` import were removed; `auto_canny` is now handled
+the same inline way `auto_depth` already was, calling
+`_auto_canny_control_image` directly (imported from `.preprocessors`
+alongside `_depth_anything_batch`, both still needed).
+
+**New: `control_mode="none"` on all three img2img nodes** (Krea2Img2Img,
+QwenImageImg2Img, FluxKleinImg2Img). User caught a real design gap while
+discussing the trim: `manual` was never "off," it meant "supply
+`control_image`/`reference_image` yourself" - Krea2Img2Img's own guard
+rail (`if has_control_lora and control_image is None:`) fired
+unconditionally whenever a Control LoRA was loaded upstream, regardless
+of `control_mode`, so there was no way to skip control for one
+generation without physically disconnecting or removing the loader.
+Same shape in QwenImageImg2Img (`if qwen_control is not None and
+control_image is None:`). Fixed by adding `and control_mode != "none"`
+to both guard conditions - minimal, surgical, doesn't touch the
+"explicit `control_image` always wins" behavior since that check only
+gates the *auto-derivation-or-raise* branch, not an explicitly-wired
+`control_image`.
+
+**Real bug caught while adding this to QwenImageImg2Img**: the
+downstream attachment block (`if qwen_control is not None:` ->
+`control_image.movedim(...)`) had no `control_image is not None` guard
+of its own - it never needed one before, since the upstream guard always
+either set `control_image` to something or raised. Once `none` could
+leave `control_image` as `None` while `qwen_control` stayed connected,
+this would have crashed with `AttributeError: 'NoneType' object has no
+attribute 'movedim'`. Fixed: `if qwen_control is not None and
+control_image is not None:`.
+
+For Klein, `reference_image is not None and control_mode == "none"` is
+handled as its own branch (logs and does nothing) ahead of the normal
+`elif reference_image is not None:` derivation branch - Klein never had
+Krea2/Qwen-Image's "forced" problem in the first place (its
+`reference_image` was always genuinely optional, no Control-LoRA-style
+gate), so `none` here is purely a graph-toggle convenience, not a bug
+fix - but added for UI consistency across all three nodes.
+
+**Breaking change accepted, not silently avoided**: the 9 nodes moved to
+ComfyUI-Flux-Reference-Tools could NOT be kept as backward-compat
+aliases the way `Krea2DepthMap`/`Flux2KleinDepthMap`/`QwenImageCanny`
+were during the preprocessor consolidation - those aliases work because
+the implementation still lives in this same repo/package; a node that
+now lives in an entirely separate installed package has no path back.
+Any saved workflow using e.g. `Flux2KleinMultiReferenceLatent` directly
+will show a missing-node error unless the user also installs
+ComfyUI-Flux-Reference-Tools AND manually re-adds the (differently-
+named) replacement node. Documented plainly in `nodes/flux_klein.py`'s
+own `NODE_CLASS_MAPPINGS` comment, README, and here - not something to
+paper over.
+
+Net result, verified against the real portable ComfyUI environment:
+**70 -> 50 registered nodes.** `tools/smoke_preprocessors.py` shrank
+from 13 to 4 tests (just `DepthMap`/`Canny` + a check that the module
+self-registers nothing). `tools/smoke_flux_klein.py` shrank from 36 to
+20 tests (removed everything covering the 9 relocated nodes, kept/added
+coverage for the minimum `control_mode` set including a real
+`control_mode=none` skip-attachment test and a `_CONTROL_MODES` exact-
+match test). `smoke_krea2.py`/`smoke_qwen_image.py` each gained one
+`control_mode=none` test. Real-environment check: all 20 removed/moved
+node-type names confirmed absent from `NODE_CLASS_MAPPINGS`, all 8
+kept/alias names confirmed present, `FluxKleinImg2Img` with
+`control_mode="none"` and `control_mode="auto_canny"` both verified
+against a real loaded Klein VAE/CLIP - node count exactly 50.

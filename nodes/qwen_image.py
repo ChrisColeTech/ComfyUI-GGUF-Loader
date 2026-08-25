@@ -305,10 +305,12 @@ class QwenImageImg2Img:
                                                "unconnected for txt2img."}),
                 "qwen_control": ("QWEN_IMAGE_CONTROL", {
                     "tooltip": "From QwenImageControlNetLoader."}),
-                "control_mode": (["manual", "auto_canny", "auto_depth"], {"default": "manual",
+                "control_mode": (["manual", "auto_canny", "auto_depth", "none"], {"default": "manual",
                     "tooltip": "manual: connect control_image yourself. auto_canny/auto_depth: "
                                "derive it from `image` automatically - pick whichever matches "
-                               "the loaded checkpoint. Ignored without qwen_control."}),
+                               "the loaded checkpoint. none: skip control attachment entirely "
+                               "even if qwen_control is connected - for toggling control off "
+                               "without rewiring. Ignored without qwen_control."}),
                 "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
                     "default": "depth_anything_v2_vitb.pth",
                     "tooltip": "auto_depth mode only. Downloads on first use if not already "
@@ -339,7 +341,7 @@ class QwenImageImg2Img:
                 "connected - ignoring control_image.")
             control_image = None
 
-        if qwen_control is not None and control_image is None:
+        if qwen_control is not None and control_image is None and control_mode != "none":
             if control_mode == "auto_canny" and image is not None:
                 logger.info("Qwen-Image: auto-deriving a canny edge map from image "
                             "(control_mode=auto_canny)")
@@ -355,6 +357,9 @@ class QwenImageImg2Img:
                     "auto_depth with an image connected. control_image is required even "
                     "for an inpaint checkpoint - mask (optional) only refines the region, "
                     "it doesn't replace it.")
+        elif qwen_control is not None and control_mode == "none":
+            logger.info("Qwen-Image: control_mode=none - skipping control attachment even "
+                        "though qwen_control is connected.")
 
         if image is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own
@@ -389,7 +394,7 @@ class QwenImageImg2Img:
             logger.info("Qwen-Image: edit_reference attached to positive conditioning "
                         "(reference_latents) - real edit-model conditioning, not ControlNet")
 
-        if qwen_control is not None:
+        if qwen_control is not None and control_image is not None:
             control_pixels = comfy.utils.common_upscale(
                 control_image.movedim(-1, 1), width, height, "lanczos", "disabled"
             ).movedim(1, -1)[:, :, :, :3]

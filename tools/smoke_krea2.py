@@ -427,6 +427,24 @@ def test_auto_canny_control_image_produces_edge_map_matching_input_shape():
     print("[ok] _auto_canny_control_image: output shape matches input")
 
 
+def test_img2img_control_mode_none_skips_control_even_with_lora_loaded():
+    # Before "none" existed, a Control LoRA loaded upstream forced every
+    # generation to either auto-derive or manually supply a control_image -
+    # there was no way to just skip control for one call. Confirm "none"
+    # bypasses that entirely: no raise, no control attached, even though
+    # has_control_lora is True.
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
+                          image=torch.rand(1, 32, 32, 3), control_mode="none")
+    assert result is not None
+    print("[ok] Krea2Img2Img: control_mode=none skips control attachment even "
+          "though a Control LoRA is loaded, instead of raising")
+
+
 def test_img2img_explicit_control_image_overrides_auto_depth():
     # Even in the default auto_depth mode, an explicitly-connected
     # control_image must win over auto-derivation (e.g. a hand-picked depth
@@ -566,6 +584,7 @@ if __name__ == "__main__":
     test_img2img_auto_depth_derives_control_image_from_image()
     test_img2img_auto_canny_derives_control_image_from_image()
     test_auto_canny_control_image_produces_edge_map_matching_input_shape()
+    test_img2img_control_mode_none_skips_control_even_with_lora_loaded()
     test_img2img_explicit_control_image_overrides_auto_depth()
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
