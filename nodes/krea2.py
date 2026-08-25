@@ -52,7 +52,7 @@ import folder_paths
 import node_helpers
 import nodes
 
-from . import depth_anything_v2
+from ..vendor import depth_anything_v2
 
 logger = logging.getLogger(__name__)
 
@@ -667,7 +667,7 @@ class Krea2ModelLoader:
         }
 
     def load(self, unet_name, clip_name, vae_name):
-        from .nodes import UnetLoaderGGUF, CLIPLoaderGGUF
+        from .gguf import UnetLoaderGGUF, CLIPLoaderGGUF
 
         if unet_name.lower().endswith(".gguf"):
             model, = UnetLoaderGGUF().load_unet(unet_name)

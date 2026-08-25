@@ -27,8 +27,19 @@ sys.modules["comfy"].samplers = sys.modules["comfy.samplers"]
 sys.modules["comfy"].sd = sys.modules["comfy.sd"]
 sys.modules["comfy"].utils = sys.modules["comfy.utils"]
 
-sys.path.insert(0, str(REPO_ROOT))
-import nodes_ltx23 as ltx23  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT.parent))
+# Fake the `cctech_gguf_pkg` and `cctech_gguf_pkg.nodes` packages (pointed at
+# the repo root / its nodes/ dir) so importing nodes.ltx23 doesn't run either
+# the real root __init__.py (needs comfy.utils) or the real nodes/__init__.py
+# (aggregates every other node module).
+pkg = types.ModuleType("cctech_gguf_pkg")
+pkg.__path__ = [str(REPO_ROOT)]
+sys.modules["cctech_gguf_pkg"] = pkg
+nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
+nodes_pkg.__path__ = [str(REPO_ROOT / "nodes")]
+sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
+import importlib
+ltx23 = importlib.import_module("cctech_gguf_pkg.nodes.ltx23")  # noqa: E402
 
 SAMPLE = """It's funny, isn't it? How we build these walls around ourselves.
 

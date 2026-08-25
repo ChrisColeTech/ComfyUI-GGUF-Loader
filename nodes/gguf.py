@@ -15,9 +15,9 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import GGMLOps, move_patch_to_device
-from .loader import gguf_sd_loader, gguf_clip_loader, validate_te_type, is_vision_projector
-from .dequant import is_quantized, is_torch_compatible
+from ..ops import GGMLOps, move_patch_to_device
+from ..loader import gguf_sd_loader, gguf_clip_loader, validate_te_type, is_vision_projector
+from ..ops.dequant import is_quantized, is_torch_compatible
 
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -621,85 +621,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF.TITLE,
     "QuadrupleCLIPLoaderGGUF": QuadrupleCLIPLoaderGGUF.TITLE,
 }
-
-# Imported last: nodes_extra subclasses CLIPLoaderGGUF, so it has to come after
-# the class definitions above rather than at the top of the file.
-from .nodes_extra import (NODE_CLASS_MAPPINGS as _EXTRA_CLASSES,
-                          NODE_DISPLAY_NAME_MAPPINGS as _EXTRA_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_EXTRA_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_EXTRA_NAMES)
-
-# Imported last because the Scenema nodes reuse GGUF loader helpers above.
-from .nodes_scenema import (NODE_CLASS_MAPPINGS as _SCENEMA_CLASSES,
-                            NODE_DISPLAY_NAME_MAPPINGS as _SCENEMA_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_SCENEMA_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_SCENEMA_NAMES)
-
-from .nodes_minimax_music import (NODE_CLASS_MAPPINGS as _MUSIC_CLASSES,
-                                  NODE_DISPLAY_NAME_MAPPINGS as _MUSIC_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_MUSIC_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_MUSIC_NAMES)
-
-from .nodes_stems import (NODE_CLASS_MAPPINGS as _STEM_CLASSES,
-                          NODE_DISPLAY_NAME_MAPPINGS as _STEM_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_STEM_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_STEM_NAMES)
-
-from .nodes_minimax_h3 import (NODE_CLASS_MAPPINGS as _H3_CLASSES,
-                               NODE_DISPLAY_NAME_MAPPINGS as _H3_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_H3_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_H3_NAMES)
-
-
-from .nodes_ltx25 import (NODE_CLASS_MAPPINGS as _LTX25_CLASSES,
-                          NODE_DISPLAY_NAME_MAPPINGS as _LTX25_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_LTX25_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_LTX25_NAMES)
-
-from .nodes_zimage import (NODE_CLASS_MAPPINGS as _ZIMAGE_CLASSES,
-                           NODE_DISPLAY_NAME_MAPPINGS as _ZIMAGE_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_ZIMAGE_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_ZIMAGE_NAMES)
-
-from .nodes_ltx23 import (NODE_CLASS_MAPPINGS as _LTX23_CLASSES,
-                          NODE_DISPLAY_NAME_MAPPINGS as _LTX23_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_LTX23_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_LTX23_NAMES)
-
-from .nodes_lmstudio import (NODE_CLASS_MAPPINGS as _LMSTUDIO_CLASSES,
-                             NODE_DISPLAY_NAME_MAPPINGS as _LMSTUDIO_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_LMSTUDIO_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_LMSTUDIO_NAMES)
-
-from .nodes_qwen_tts import (NODE_CLASS_MAPPINGS as _QWEN_TTS_CLASSES,
-                             NODE_DISPLAY_NAME_MAPPINGS as _QWEN_TTS_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_QWEN_TTS_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_QWEN_TTS_NAMES)
-
-from .nodes_krea2 import (NODE_CLASS_MAPPINGS as _KREA2_CLASSES,
-                          NODE_DISPLAY_NAME_MAPPINGS as _KREA2_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_KREA2_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_KREA2_NAMES)
-
-from .nodes_qwen_image import (NODE_CLASS_MAPPINGS as _QWEN_IMAGE_CLASSES,
-                               NODE_DISPLAY_NAME_MAPPINGS as _QWEN_IMAGE_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_QWEN_IMAGE_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_QWEN_IMAGE_NAMES)
-
-from .nodes_flux_klein import (NODE_CLASS_MAPPINGS as _FLUX_KLEIN_CLASSES,
-                               NODE_DISPLAY_NAME_MAPPINGS as _FLUX_KLEIN_NAMES)
-
-NODE_CLASS_MAPPINGS.update(_FLUX_KLEIN_CLASSES)
-NODE_DISPLAY_NAME_MAPPINGS.update(_FLUX_KLEIN_NAMES)

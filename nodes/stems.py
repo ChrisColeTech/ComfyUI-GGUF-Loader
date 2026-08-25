@@ -61,7 +61,7 @@ def resolve_model(name):
 
 
 def _load_patched(path, device):
-    from .melband_arch import MelBandRoformer
+    from ..vendor.melband_arch import MelBandRoformer
 
     model = MelBandRoformer().eval()
     state = comfy.utils.load_torch_file(str(path), safe_load=True)

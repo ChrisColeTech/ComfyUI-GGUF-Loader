@@ -151,7 +151,7 @@ def _load_text_encoder(name):
     if cached is not None:
         return cached
 
-    from .nodes import CLIPLoaderGGUF
+    from .gguf import CLIPLoaderGGUF
 
     loader = CLIPLoaderGGUF()
     path = folder_paths.get_full_path("clip", name) \

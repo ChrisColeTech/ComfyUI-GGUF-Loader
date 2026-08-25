@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from seedvc_utils import select_seedvc_identity, seedvc_output_is_usable
+from vendor.seedvc_utils import select_seedvc_identity, seedvc_output_is_usable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,14 +32,14 @@ def test_unusable_conversions_never_replace_generated_audio():
 
 
 def test_generate_validates_seedvc_output_before_replacing_audio():
-    tree = ast.parse((ROOT / "nodes_scenema.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "nodes" / "scenema.py").read_text(encoding="utf-8"))
     called = {node.func.id for node in ast.walk(tree)
               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     assert "seedvc_output_is_usable" in called
 
 
 def test_conversion_owns_or_borrows_its_bundle_but_never_leaks_one():
-    tree = ast.parse((ROOT / "seedvc.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "vendor" / "seedvc.py").read_text(encoding="utf-8"))
     convert = next(node for node in ast.walk(tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "convert_voice")
     names = {arg.arg for arg in convert.args.kwonlyargs}
@@ -48,7 +48,7 @@ def test_conversion_owns_or_borrows_its_bundle_but_never_leaks_one():
 
 
 def test_scenema_node_mappings_include_voice_clone():
-    tree = ast.parse((ROOT / "nodes_scenema.py").read_text(encoding="utf-8"))
+    tree = ast.parse((ROOT / "nodes" / "scenema.py").read_text(encoding="utf-8"))
     mappings = [node for node in ast.walk(tree)
                 if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == "NODE_CLASS_MAPPINGS"
@@ -60,8 +60,14 @@ def test_scenema_node_mappings_include_voice_clone():
 
 
 def test_seedvc_modules_compile_and_use_relative_imports():
-    for name in ("seedvc.py", "seedvc_arch.py", "seedvc_utils.py", "nodes_scenema.py"):
-        compile((ROOT / name).read_bytes(), name, "exec")
-    seedvc_tree = ast.parse((ROOT / "seedvc.py").read_text(encoding="utf-8"))
+    paths = {
+        "seedvc.py": ROOT / "vendor" / "seedvc.py",
+        "seedvc_arch.py": ROOT / "vendor" / "seedvc_arch.py",
+        "seedvc_utils.py": ROOT / "vendor" / "seedvc_utils.py",
+        "nodes_scenema.py": ROOT / "nodes" / "scenema.py",
+    }
+    for name, path in paths.items():
+        compile(path.read_bytes(), name, "exec")
+    seedvc_tree = ast.parse(paths["seedvc.py"].read_text(encoding="utf-8"))
     imports = [node for node in ast.walk(seedvc_tree) if isinstance(node, ast.ImportFrom)]
     assert any(node.level == 1 and node.module == "seedvc_arch" for node in imports)

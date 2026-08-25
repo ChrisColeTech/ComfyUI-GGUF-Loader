@@ -68,8 +68,15 @@ sys.path.insert(0, str(REPO_ROOT.parent))
 pkg = types.ModuleType("cctech_gguf_pkg")
 pkg.__path__ = [str(REPO_ROOT)]
 sys.modules["cctech_gguf_pkg"] = pkg
+# Fake the `nodes` subpackage too (pointed at the real nodes/ dir) so importing
+# nodes.flux_klein doesn't execute the real nodes/__init__.py aggregation,
+# which would import every other node module and need a much bigger stub
+# surface.
+nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
+nodes_pkg.__path__ = [str(REPO_ROOT / "nodes")]
+sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
 import importlib
-fk = importlib.import_module("cctech_gguf_pkg.nodes_flux_klein")  # noqa: E402
+fk = importlib.import_module("cctech_gguf_pkg.nodes.flux_klein")  # noqa: E402
 
 
 def _clip():

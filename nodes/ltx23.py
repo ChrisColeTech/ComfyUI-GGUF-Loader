@@ -164,8 +164,8 @@ def _load_ltxv_clip(te_name, projections_name):
     if key in _ENCODER_CACHE:
         return _ENCODER_CACHE[key]
 
-    from .loader import gguf_clip_loader
-    from .ops import GGMLOps
+    from ..loader import gguf_clip_loader
+    from ..ops import GGMLOps
 
     te_path = folder_paths.get_full_path("clip", te_name) \
         or folder_paths.get_full_path_or_raise("text_encoders", te_name)
@@ -265,7 +265,7 @@ class LTXV23ModelsLoader:
     def load(self, unet_name, text_encoder_name, projections_name,
              video_vae_name, audio_vae_name):
         if unet_name.lower().endswith(".gguf"):
-            from .nodes import UnetLoaderGGUF
+            from .gguf import UnetLoaderGGUF
             model, = UnetLoaderGGUF().load_unet(unet_name)
         else:
             model = comfy.sd.load_diffusion_model(

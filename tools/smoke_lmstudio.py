@@ -8,14 +8,27 @@ ConnectionError traceback.
 Usage:  python tools/smoke_lmstudio.py
 """
 import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT.parent))
 
-import nodes_lmstudio as lm  # noqa: E402
+# Fake the `cctech_gguf_pkg` and `cctech_gguf_pkg.nodes` packages (pointed at
+# the repo root / its nodes/ dir) so importing nodes.lmstudio doesn't run
+# either the real root __init__.py (needs comfy.utils) or the real
+# nodes/__init__.py (aggregates every other node module).
+pkg = types.ModuleType("cctech_gguf_pkg")
+pkg.__path__ = [str(REPO_ROOT)]
+sys.modules["cctech_gguf_pkg"] = pkg
+nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
+nodes_pkg.__path__ = [str(REPO_ROOT / "nodes")]
+sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
+import importlib
+lm = importlib.import_module("cctech_gguf_pkg.nodes.lmstudio")  # noqa: E402
 
 
 def _fake_response(payload, status=200):

@@ -1,6 +1,6 @@
 import torch
 
-from seedvc_arch import CAMPPlus, InterpolateRegulator, SConv1d, sequence_mask
+from vendor.seedvc_arch import CAMPPlus, InterpolateRegulator, SConv1d, sequence_mask
 
 
 def test_sequence_mask_and_regulator_shapes():

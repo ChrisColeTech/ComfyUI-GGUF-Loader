@@ -66,8 +66,20 @@ _qwen_tts_module.Qwen3TTSModel = MagicMock()
 _qwen_tts_module.Qwen3TTSModel.from_pretrained.return_value = _fake_model_instance
 sys.modules["qwen_tts"] = _qwen_tts_module
 
-sys.path.insert(0, str(REPO_ROOT))
-import nodes_qwen_tts as qt  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT.parent))
+import types
+# Fake the `cctech_gguf_pkg` and `cctech_gguf_pkg.nodes` packages (pointed at
+# the repo root / its nodes/ dir) so importing nodes.qwen_tts doesn't run
+# either the real root __init__.py (needs comfy.utils) or the real
+# nodes/__init__.py (aggregates every other node module).
+pkg = types.ModuleType("cctech_gguf_pkg")
+pkg.__path__ = [str(REPO_ROOT)]
+sys.modules["cctech_gguf_pkg"] = pkg
+nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
+nodes_pkg.__path__ = [str(REPO_ROOT / "nodes")]
+sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
+import importlib
+qt = importlib.import_module("cctech_gguf_pkg.nodes.qwen_tts")  # noqa: E402
 
 _REPO_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 

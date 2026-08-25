@@ -149,8 +149,14 @@ sys.path.insert(0, str(REPO_ROOT.parent))
 pkg = types.ModuleType("cctech_gguf_pkg")
 pkg.__path__ = [str(REPO_ROOT)]
 sys.modules["cctech_gguf_pkg"] = pkg
+# Fake the `nodes` subpackage too (pointed at the real nodes/ dir) so importing
+# nodes.krea2 doesn't execute the real nodes/__init__.py aggregation, which
+# would import every other node module and need a much bigger stub surface.
+nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
+nodes_pkg.__path__ = [str(REPO_ROOT / "nodes")]
+sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
 import importlib
-krea2 = importlib.import_module("cctech_gguf_pkg.nodes_krea2")  # noqa: E402
+krea2 = importlib.import_module("cctech_gguf_pkg.nodes.krea2")  # noqa: E402
 
 
 class _FakeModelPatcher:

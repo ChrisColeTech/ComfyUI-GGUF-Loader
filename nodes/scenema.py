@@ -52,9 +52,9 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .loader import gguf_sd_loader, gguf_clip_loader
-from .ops import GGMLOps
-from .seedvc_utils import select_seedvc_identity, seedvc_output_is_usable
+from ..loader import gguf_sd_loader, gguf_clip_loader
+from ..ops import GGMLOps
+from ..vendor.seedvc_utils import select_seedvc_identity, seedvc_output_is_usable
 
 logger = logging.getLogger(__name__)
 
@@ -794,7 +794,7 @@ class ScenemaModelLoader:
                 f"Could not detect {transformer_name} as an LTX-AV diffusion model. "
                 "Check that it is a Scenema audio transformer checkpoint.")
         if is_gguf:
-            from .nodes import GGUFModelPatcher
+            from .gguf import GGUFModelPatcher
             model = GGUFModelPatcher.clone(model)
 
         _nuke_video_paths(model)
@@ -1135,7 +1135,7 @@ class ScenemaAudioGenerate:
                 # Scenema DiT, and VAE before loading any conversion component.
                 comfy.model_management.unload_all_models()
                 comfy.model_management.soft_empty_cache()
-                from .seedvc import apply_seed_vc_to_result
+                from ..vendor.seedvc import apply_seed_vc_to_result
                 polished = apply_seed_vc_to_result(
                     combined, int(sr), identity, int(identity["sample_rate"]),
                     steps=int(vc_steps), cfg_rate=float(vc_cfg_rate), seed=seed)
@@ -1197,7 +1197,7 @@ class ScenemaAudioVoiceClone:
 
     @torch.inference_mode()
     def convert(self, source_audio, identity_reference, steps=25, cfg_rate=0.5, seed=0):
-        from .seedvc import convert_voice
+        from ..vendor.seedvc import convert_voice
 
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()

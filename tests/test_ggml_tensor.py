@@ -1,9 +1,9 @@
 import torch
 
-import dequant
 from conftest import load_pack_module
 
 ops = load_pack_module("ops")
+dequant = ops.dequant
 
 
 def _plain(values):

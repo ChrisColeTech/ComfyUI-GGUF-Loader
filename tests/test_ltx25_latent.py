@@ -19,7 +19,7 @@ _PKG = "comfy_gguf_ltx25_under_test"
 
 def _load_module():
     """Import nodes_ltx25.py against the handful of Comfy bits it touches."""
-    full = f"{_PKG}.nodes_ltx25"
+    full = f"{_PKG}.nodes.ltx25"
     if full in sys.modules:
         return sys.modules[full]
 
@@ -41,7 +41,7 @@ def _load_module():
 
     package = sys.modules.setdefault(_PKG, types.ModuleType(_PKG))
     package.__path__ = [str(ROOT)]
-    spec = importlib.util.spec_from_file_location(full, ROOT / "nodes_ltx25.py")
+    spec = importlib.util.spec_from_file_location(full, ROOT / "nodes" / "ltx25.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[full] = module
     spec.loader.exec_module(module)

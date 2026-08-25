@@ -19,8 +19,8 @@ import nodes
 import comfy.sd
 import folder_paths
 
-from .nodes import CLIPLoaderGGUF
-from . import clipproj
+from .gguf import CLIPLoaderGGUF
+from ..vendor import clipproj
 
 # The projection folder has to exist before INPUT_TYPES first reads it, or the
 # combo comes up with the controls alone on a fresh install.
