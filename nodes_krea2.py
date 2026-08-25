@@ -37,6 +37,7 @@ pack's separate Apply node existed for, kept without a second required node.
 """
 import logging
 
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,6 +49,7 @@ import comfy.sd
 import comfy.utils
 import numpy as np
 import folder_paths
+import node_helpers
 import nodes
 
 from . import depth_anything_v2
@@ -154,6 +156,21 @@ def _resize_image(image, width, height, upscale_method="lanczos", crop="center")
     samples = image[..., :3].clamp(0.0, 1.0).movedim(-1, 1)
     resized = comfy.utils.common_upscale(samples, width, height, upscale_method, crop)
     return resized.movedim(1, -1).clamp(0.0, 1.0)
+
+
+def _auto_canny_control_image(image, low_threshold=100, high_threshold=200):
+    """Plain cv2.Canny edge detection - no model, no download, deterministic.
+    Same defaults comfyui_controlnet_aux's own Canny preprocessor uses.
+    Mirrors nodes_qwen_image.py's helper of the same name.
+    """
+    out = []
+    for i in range(image.shape[0]):
+        np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+        gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, low_threshold, high_threshold)
+        edges_rgb = np.repeat(edges[:, :, None], 3, axis=2)
+        out.append(torch.from_numpy(edges_rgb.astype(np.float32) / 255.0))
+    return torch.stack(out, dim=0)
 
 
 def _prepare_control_image(image, channel_mode, normalize, invert):
@@ -762,16 +779,36 @@ class Krea2Img2Img:
     half-configured model, the same guarantee the original pack's separate
     Apply node existed for.
 
-    control_mode picks how the control signal is produced, since nothing in
-    a LoRA file says what type it is (depth vs canny vs pose, ...):
+    control_mode/control_image apply ONLY to widened-input-projection
+    Control LoRAs (loaded via Krea2ControlLoRALoader - the depth LoRA is
+    one of these). Nothing in the LoRA file says what type of control image
+    it expects, so control_mode picks how it gets produced:
       "auto_depth" (default) - derive a depth map from `image` automatically
-        (Depth Anything V2, same as Krea2DepthMap) - correct for a depth
+        (Depth Anything V2, same as Krea2DepthMap) - correct for the depth
         Control LoRA, so one photo plugged into `image` is enough.
+      "auto_canny" - derive a canny edge map from `image` automatically
+        (plain cv2.Canny, no model, no download) - for a canny checkpoint
+        that IS a widened-projection Control LoRA (if one exists - not all
+        "canny Krea2 LoRA" files are; see edit_reference below).
       "manual" - do no automatic derivation; control_image must be supplied
-        by hand (a canny/pose/etc. map, or a hand-picked depth map) - use
-        this for any Control LoRA that isn't the depth one.
+        by hand - use this for any widened-projection Control LoRA the two
+        auto modes don't cover (pose/lineart/normal).
     Connecting control_image explicitly always overrides auto-derivation,
-    in either mode.
+    in any mode.
+
+    edit_reference is a SEPARATE, different mechanism, for a SEPARATE kind
+    of LoRA: an ordinary rank-32 style LoRA (no widened projection at all -
+    loaded with stock LoraLoaderModelOnly, NOT Krea2ControlLoRALoader)
+    trained "in-context, ControlNet-style" (e.g. krea2_canny-v0.1.safetensors
+    - confirmed by inspecting its actual tensor keys: plain lora_down/
+    lora_up/alpha triples, no expanded first-layer weight at all). This
+    kind feeds its reference image (a canny map, in that LoRA's case)
+    through Krea2's real DiT `ref_latents` forward parameter (confirmed in
+    comfy/ldm/krea2/model.py) - the same mechanism Qwen-Image-Edit uses,
+    and the same one stock comfy's `ReferenceLatent` node populates.
+    "Structure comes from the edges, content from the text prompt" per that
+    LoRA's own model card - not img2img, not a widened-projection Control
+    LoRA.
 
     Feed the outputs straight into a stock KSampler.
     """
@@ -805,14 +842,16 @@ class Krea2Img2Img:
                 "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
             },
             "optional": {
-                "image": ("IMAGE", {"tooltip": "Init image for img2img, and (in auto_depth "
-                                               "mode) the source photo depth is derived from. "
-                                               "Leave unconnected for txt2img."}),
-                "control_mode": (["auto_depth", "manual"], {"default": "auto_depth",
-                    "tooltip": "auto_depth: derive a depth map from `image` automatically - "
-                               "correct for the depth Control LoRA. manual: no automatic "
-                               "derivation, connect control_image yourself - use this for "
-                               "any other Control LoRA type (canny/pose/lineart/normal)."}),
+                "image": ("IMAGE", {"tooltip": "Init image for img2img, and (in auto_depth/"
+                                               "auto_canny modes) the source photo the control "
+                                               "image is derived from. Leave unconnected for "
+                                               "txt2img."}),
+                "control_mode": (["auto_depth", "auto_canny", "manual"], {"default": "auto_depth",
+                    "tooltip": "auto_depth/auto_canny: derive the control image from `image` "
+                               "automatically - pick whichever matches the loaded Control LoRA. "
+                               "manual: no automatic derivation, connect control_image yourself "
+                               "- use this for any Control LoRA the two auto modes don't cover "
+                               "(pose/lineart/normal)."}),
                 "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
                     "default": "depth_anything_v2_vitb.pth",
                     "tooltip": "auto_depth mode only. Model size for the automatic depth "
@@ -830,6 +869,14 @@ class Krea2Img2Img:
                                "the LoRA's training convention (e.g. depth preview shows "
                                "near objects dark instead of white)."}),
                 "control_batch_mode": (["independent_images", "video_frames"], {"default": "independent_images"}),
+                "edit_reference": ("IMAGE", {"tooltip": "For an in-context/edit-style Krea2 LoRA "
+                                             "(e.g. krea2_canny-v0.1.safetensors - an ordinary LoRA, "
+                                             "loaded via stock LoraLoaderModelOnly, NOT "
+                                             "Krea2ControlLoRALoader): the reference image (a canny "
+                                             "map, for that LoRA). Encoded and attached to positive "
+                                             "conditioning as reference_latents - separate from "
+                                             "img2img's `image` and the widened-projection "
+                                             "control_image above."}),
             },
         }
 
@@ -837,7 +884,8 @@ class Krea2Img2Img:
                 width, height, image=None, control_mode="auto_depth",
                 depth_ckpt_name="depth_anything_v2_vitb.pth", control_image=None,
                 control_channel_mode="grayscale", control_normalize="per_image_minmax",
-                control_invert=False, control_batch_mode="independent_images"):
+                control_invert=False, control_batch_mode="independent_images",
+                edit_reference=None):
         has_control_lora = model.get_attachment(WRAPPER_KEY) is not None
         if control_image is not None and not has_control_lora:
             # Nothing to attach it to - no widened input projection is
@@ -861,17 +909,20 @@ class Krea2Img2Img:
                     depth_batch.append(torch.from_numpy(depth_rgb.astype(np.float32) / 255.0))
                 control_image = torch.stack(depth_batch, dim=0)
                 del detector
-            elif control_mode == "auto_depth":
+            elif control_mode == "auto_canny" and image is not None:
+                logger.info("Krea2: auto-deriving canny edge map from image (control_mode=auto_canny)")
+                control_image = _auto_canny_control_image(image)
+            elif control_mode in ("auto_depth", "auto_canny"):
                 raise ValueError(
-                    "model has a Krea2 Control LoRA loaded and control_mode is auto_depth, "
-                    "but no image was given to derive a depth map from. Connect image, or "
+                    f"model has a Krea2 Control LoRA loaded and control_mode is {control_mode}, "
+                    "but no image was given to derive a control image from. Connect image, or "
                     "connect control_image directly, or remove Krea2ControlLoRALoader.")
             else:
                 raise ValueError(
                     "model has a Krea2 Control LoRA loaded and control_mode is manual, but "
                     "no control_image was given. Sampling would fail with a missing control "
-                    "latent - connect control_image, switch control_mode to auto_depth (depth "
-                    "LoRA only), or remove Krea2ControlLoRALoader.")
+                    "latent - connect control_image, switch control_mode to auto_depth/"
+                    "auto_canny, or remove Krea2ControlLoRALoader.")
 
         if image is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own
@@ -907,6 +958,16 @@ class Krea2Img2Img:
 
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+
+        if edit_reference is not None:
+            ref_pixels = _resize_image(edit_reference, width, height)
+            ref_latent = vae.encode(ref_pixels[:, :, :, :3])
+            positive = node_helpers.conditioning_set_values(
+                positive, {"reference_latents": [ref_latent]}, append=True)
+            logger.info("Krea2: edit_reference attached to positive conditioning "
+                        "(reference_latents) - in-context edit-style LoRA conditioning, "
+                        "not the widened-projection Control LoRA mechanism")
+
         return (model, positive, negative, {"samples": latent}, denoise)
 
 

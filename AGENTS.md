@@ -1195,3 +1195,68 @@ possible in this dev environment): whether Edit checkpoint output now
 actually preserves the source photo's identity while following the
 prompt's edit instruction, with the canny ControlNet's structural guidance
 applied on top.
+
+## Krea2: auto_canny + edit_reference, and two unrelated LoRA families (2026-08-25)
+
+Following the Qwen-Image auto_canny/edit_reference work, extended
+`Krea2Img2Img` symmetrically since the user has a real canny Krea2 LoRA
+(`krea2_canny-v0.1.safetensors`) alongside the depth one.
+
+Added `auto_canny` to `control_mode` (mirrors `nodes_qwen_image.py`'s
+helper exactly - `_auto_canny_control_image` duplicated into
+`nodes_krea2.py` rather than shared, matching this repo's established
+"independent per-file helpers" convention). Straightforward - no surprises.
+
+**Real surprise**, caught by testing against the actual file instead of
+trusting the mirrored pattern: loading `krea2_canny-v0.1.safetensors`
+through `Krea2ControlLoRALoader` failed with `Could not find expanded
+Krea2 first projection weight`. Inspected its actual tensor keys before
+assuming a bug: 588 keys, all plain `lora_down.weight`/`lora_up.weight`/
+`alpha` triples on `attn.wq/wk/wv/wo` and `mlp.gate/up/down`, rank 32 - NO
+`first`/`img_in` key at all. This is architecturally a completely
+different, ordinary LoRA, not a widened-projection Control LoRA.
+
+User pointed at its actual HuggingFace page (nynxz/NK2E) to settle it: "a
+separate control LoRA (ControlNet-style, **in-context**)... Feed a canny
+edge map as the reference instead of a source image: structure comes from
+the edges, content from the text prompt... uses the same node setup as
+editing." That's the Qwen-Image-Edit pattern, not the widened-projection
+one. Confirmed against real source, not just the model card: read
+`comfy/ldm/krea2/model.py`'s DiT `_forward()` (line 295) - it has the
+exact same `ref_latents` parameter Qwen-Image's DiT does. Krea2 has the
+same two-mechanism split Qwen-Image does; this repo just hadn't hit the
+second one for Krea2 yet.
+
+Added `edit_reference` to `Krea2Img2Img`, identical implementation to
+`QwenImageImg2Img`'s (VAE-encode, `node_helpers.conditioning_set_values(
+positive, {"reference_latents": [latent]}, append=True)`, positive only).
+Added `import node_helpers` to `nodes_krea2.py` too.
+
+Corrected usage for `krea2_canny-v0.1.safetensors`: load it with stock
+`LoraLoaderModelOnly` (NOT `Krea2ControlLoRALoader` - that node correctly
+rejects it, this isn't a bug to route around), feed the canny map into
+`Krea2Img2Img`'s new `edit_reference` input instead of `control_image`.
+
+Verified against real weights, not just structural code review:
+- `krea2_canny-v0.1.safetensors` applies cleanly via
+  `comfy.sd.load_lora_for_models(model, None, lora_sd, 1.0, 0.0)` (the
+  same call `LoraLoaderModelOnly` makes internally) - confirms it's a
+  normal, compatible LoRA once routed to the right loader.
+- `ref_latents` confirmed present via
+  `inspect.signature(model.model.diffusion_model._forward)` on the
+  actual real, loaded Krea2 model instance, not just by reading the
+  source file - rules out the parameter being dead/unused on this
+  checkpoint's actual code path.
+
+`tools/smoke_krea2.py` gained `test_img2img_auto_canny_derives_control_image_from_image`,
+`test_auto_canny_control_image_produces_edge_map_matching_input_shape`
+(cv2.Canny is real/deterministic, no fake needed unlike depth), and
+`test_img2img_edit_reference_attaches_reference_latents_to_positive_only`
+(needed the same `node_helpers` stub added to `smoke_qwen_image.py` -
+copied verbatim, same reasoning). `_clip()`-shaped fixture for this test
+needed a real conditioning-list return (`[[tensor, {}]]`), unlike the
+`"cond"`-string fixture most of this file's other tests use, since
+`node_helpers.conditioning_set_values` actually iterates the list. 24/24
+passing. Real-environment check confirms `edit_reference` registers;
+total node count unchanged at 42 (both additions were on existing node
+classes, no new node this time).

@@ -58,6 +58,29 @@ folder_paths.models_dir = str(REPO_ROOT / "models")
 nodes = types.ModuleType("nodes")
 nodes.MAX_RESOLUTION = 16384
 
+# node_helpers imports `from comfy.cli_args import args` at module level in
+# the real ComfyUI, too heavy to import directly offline - stub with a 1:1
+# reimplementation of the real conditioning_set_values (node_helpers.py).
+node_helpers = types.ModuleType("node_helpers")
+
+
+def _conditioning_set_values(conditioning, values={}, append=False):
+    c = []
+    for t in conditioning:
+        n = [t[0], t[1].copy()]
+        for k in values:
+            val = values[k]
+            if append:
+                old_val = n[1].get(k, None)
+                if old_val is not None:
+                    val = old_val + val
+            n[1][k] = val
+        c.append(n)
+    return c
+
+
+node_helpers.conditioning_set_values = _conditioning_set_values
+
 sys.modules["comfy"] = comfy
 sys.modules["comfy.ldm"] = comfy_ldm
 sys.modules["comfy.ldm.common_dit"] = comfy_ldm_common_dit
@@ -67,6 +90,7 @@ sys.modules["comfy.sd"] = comfy_sd
 sys.modules["comfy.utils"] = comfy_utils
 sys.modules["folder_paths"] = folder_paths
 sys.modules["nodes"] = nodes
+sys.modules["node_helpers"] = node_helpers
 comfy.ldm = comfy_ldm
 comfy.model_management = comfy_model_management
 comfy.patcher_extension = comfy_patcher_extension
@@ -300,6 +324,26 @@ def test_img2img_auto_depth_derives_control_image_from_image():
           "image automatically - one photo, one slot")
 
 
+def test_img2img_auto_canny_derives_control_image_from_image():
+    # cv2.Canny is real, deterministic, no model - no fake needed, unlike auto_depth.
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
+                          image=torch.rand(1, 32, 32, 3), control_mode="auto_canny")
+    assert result is not None
+    print("[ok] Krea2Img2Img: auto_canny mode derives control_image from image "
+          "automatically via cv2.Canny")
+
+
+def test_auto_canny_control_image_produces_edge_map_matching_input_shape():
+    out = krea2._auto_canny_control_image(torch.rand(1, 32, 32, 3))
+    assert out.shape == (1, 32, 32, 3)
+    print("[ok] _auto_canny_control_image: output shape matches input")
+
+
 def test_img2img_explicit_control_image_overrides_auto_depth():
     # Even in the default auto_depth mode, an explicitly-connected
     # control_image must win over auto-derivation (e.g. a hand-picked depth
@@ -351,6 +395,22 @@ def test_img2img_with_image_uses_strength_as_denoise():
     print("[ok] Krea2Img2Img: img2img (image given) -> denoise = strength")
 
 
+def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():
+    node = krea2.Krea2Img2Img()
+    model = _FakeModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: [[torch.zeros(1, 1, 4), {}]],
+        tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
+    _, positive, negative, _, _ = node.prepare(
+        model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
+        edit_reference=torch.rand(1, 64, 64, 3))
+    assert "reference_latents" in positive[0][1]
+    assert "reference_latents" not in negative[0][1]
+    print("[ok] Krea2Img2Img: edit_reference attaches reference_latents to "
+          "positive conditioning only")
+
+
 if __name__ == "__main__":
     test_prepare_control_image_grayscale_repeats_to_three_channels()
     test_prepare_control_image_minmax_normalizes_to_0_1()
@@ -369,7 +429,10 @@ if __name__ == "__main__":
     test_img2img_rejects_loaded_lora_without_control_image()
     test_img2img_manual_mode_requires_control_image()
     test_img2img_auto_depth_derives_control_image_from_image()
+    test_img2img_auto_canny_derives_control_image_from_image()
+    test_auto_canny_control_image_produces_edge_map_matching_input_shape()
     test_img2img_explicit_control_image_overrides_auto_depth()
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
+    test_img2img_edit_reference_attaches_reference_latents_to_positive_only()
     print("[ok] all nodes_krea2 smoke tests passed")
