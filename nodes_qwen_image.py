@@ -32,6 +32,8 @@ attachment point the loaded control checkpoint actually needs.
 """
 import logging
 
+import cv2
+import numpy as np
 import torch
 
 import comfy.controlnet
@@ -40,6 +42,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 import nodes
+
+from . import depth_anything_v2
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,20 @@ class QwenImageControl:
     def __init__(self, kind, payload):
         self.kind = kind
         self.payload = payload
+
+
+def _auto_canny_control_image(image, low_threshold=100, high_threshold=200):
+    """Plain cv2.Canny edge detection - no model, no download, deterministic.
+    Same defaults comfyui_controlnet_aux's own Canny preprocessor uses.
+    """
+    out = []
+    for i in range(image.shape[0]):
+        np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+        gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, low_threshold, high_threshold)
+        edges_rgb = np.repeat(edges[:, :, None], 3, axis=2)
+        out.append(torch.from_numpy(edges_rgb.astype(np.float32) / 255.0))
+    return torch.stack(out, dim=0)
 
 
 def _apply_controlnet_to_conditioning(conditioning, control_net, control_hint, strength, vae):
@@ -230,10 +248,27 @@ class QwenImageImg2Img:
 
     Leave image unconnected for txt2img. Leave qwen_control/control_image
     unconnected for plain img2img/txt2img with no ControlNet. Connect
-    qwen_control (from QwenImageControlNetLoader) and control_image together
-    to apply control - whichever attachment point the loaded checkpoint
-    needs (CONDITIONING for InstantX/Union, MODEL for DiffSynth/Fun) is
-    handled automatically based on what QwenImageControlNetLoader detected.
+    qwen_control (from QwenImageControlNetLoader) to apply control - whichever
+    attachment point the loaded checkpoint needs (CONDITIONING for InstantX/
+    Union/Fun, MODEL for DiffSynth) is handled automatically based on what
+    QwenImageControlNetLoader detected.
+
+    control_mode picks how the control image is produced, since (unlike
+    Krea2, which only has one control type) Qwen-Image checkpoints span
+    several different preprocessing needs this pack can't detect from the
+    loaded file:
+      "manual" (default) - control_image must be supplied by hand (a canny
+        map, depth map, etc. matching whichever checkpoint you loaded).
+      "auto_canny" - derives a canny edge map from `image` automatically
+        (plain cv2.Canny, no model, no extra download) - for a canny
+        DiffSynth/Union checkpoint.
+      "auto_depth" - derives a depth map from `image` automatically, using
+        the same Depth Anything V2 model as Krea2DepthMap - for a depth
+        DiffSynth/Union checkpoint.
+    Connecting control_image explicitly always overrides auto-derivation,
+    in any mode. control_image is required even for an inpaint checkpoint;
+    connect `mask` alongside it to refine which region gets inpainted -
+    mask alone isn't enough, there's no photo-only way to auto-derive one.
 
     Feed the outputs straight into a stock KSampler.
     """
@@ -267,29 +302,64 @@ class QwenImageImg2Img:
                 "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
             },
             "optional": {
-                "image": ("IMAGE", {"tooltip": "Init image for img2img. Leave unconnected "
-                                               "for txt2img."}),
+                "image": ("IMAGE", {"tooltip": "Init image for img2img, and (in auto_canny/"
+                                               "auto_depth modes) the source photo the "
+                                               "control image is derived from. Leave "
+                                               "unconnected for txt2img."}),
                 "qwen_control": ("QWEN_IMAGE_CONTROL", {
-                    "tooltip": "From QwenImageControlNetLoader. Requires control_image."}),
+                    "tooltip": "From QwenImageControlNetLoader."}),
+                "control_mode": (["manual", "auto_canny", "auto_depth"], {"default": "manual",
+                    "tooltip": "manual: connect control_image yourself. auto_canny/auto_depth: "
+                               "derive it from `image` automatically - pick whichever matches "
+                               "the loaded checkpoint. Ignored without qwen_control."}),
+                "depth_ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
+                    "default": "depth_anything_v2_vitb.pth",
+                    "tooltip": "auto_depth mode only. Downloads on first use if not already "
+                               "in models/depth_anything_v2."}),
                 "control_image": ("IMAGE", {
-                    "tooltip": "Control map matching qwen_control - a canny/depth/pose map "
-                               "etc. Required when qwen_control is connected."}),
+                    "tooltip": "Control map matching qwen_control - a canny/depth/etc map. "
+                               "Overrides auto_canny/auto_depth when connected. Required in "
+                               "manual mode."}),
+                "mask": ("MASK", {"tooltip": "For an inpaint checkpoint - the region to "
+                                            "inpaint. Not derivable automatically."}),
                 "control_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
-                width, height, image=None, qwen_control=None, control_image=None,
-                control_strength=1.0):
-        if qwen_control is not None and control_image is None:
-            raise ValueError(
-                "qwen_control was given, but no control_image was connected. Connect a "
-                "control image, or remove QwenImageControlNetLoader.")
+                width, height, image=None, qwen_control=None, control_mode="manual",
+                depth_ckpt_name="depth_anything_v2_vitb.pth", control_image=None,
+                mask=None, control_strength=1.0):
         if control_image is not None and qwen_control is None:
             logger.warning(
                 "QwenImageImg2Img: control_image was given, but no qwen_control was "
                 "connected - ignoring control_image.")
             control_image = None
+
+        if qwen_control is not None and control_image is None:
+            if control_mode == "auto_canny" and image is not None:
+                logger.info("Qwen-Image: auto-deriving a canny edge map from image "
+                            "(control_mode=auto_canny)")
+                control_image = _auto_canny_control_image(image)
+            elif control_mode == "auto_depth" and image is not None:
+                logger.info("Qwen-Image: auto-deriving a depth map from image "
+                            "(control_mode=auto_depth)")
+                detector = depth_anything_v2.DepthAnythingV2Detector(depth_ckpt_name).to(
+                    comfy.model_management.get_torch_device())
+                depth_batch = []
+                for i in range(image.shape[0]):
+                    np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
+                    depth_rgb = detector.estimate(np_image, resolution=512)
+                    depth_batch.append(torch.from_numpy(depth_rgb.astype(np.float32) / 255.0))
+                control_image = torch.stack(depth_batch, dim=0)
+                del detector
+            else:
+                raise ValueError(
+                    "qwen_control was given, but no usable control_image is available. "
+                    "Connect control_image directly, or set control_mode to auto_canny/"
+                    "auto_depth with an image connected. control_image is required even "
+                    "for an inpaint checkpoint - mask (optional) only refines the region, "
+                    "it doesn't replace it.")
 
         if image is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own
@@ -321,10 +391,19 @@ class QwenImageImg2Img:
 
             if qwen_control.kind == "model_patch":
                 from comfy_extras.nodes_model_patch import DiffSynthCnetPatch
+                patch_mask = mask
+                if patch_mask is not None:
+                    if patch_mask.ndim == 3:
+                        patch_mask = patch_mask.unsqueeze(1)
+                    if patch_mask.ndim == 4:
+                        patch_mask = patch_mask.unsqueeze(2)
+                    patch_mask = 1.0 - patch_mask
                 model = model.clone()
                 model.set_model_double_block_patch(
-                    DiffSynthCnetPatch(qwen_control.payload, vae, control_pixels, control_strength))
-                logger.info("Qwen-Image: DiffSynth/Fun control patch attached to MODEL")
+                    DiffSynthCnetPatch(qwen_control.payload, vae, control_pixels,
+                                       control_strength, patch_mask))
+                logger.info("Qwen-Image: DiffSynth control patch attached to MODEL%s",
+                          " (with inpaint mask)" if patch_mask is not None else "")
             else:
                 control_hint = control_pixels.movedim(-1, 1)
                 positive = _apply_controlnet_to_conditioning(

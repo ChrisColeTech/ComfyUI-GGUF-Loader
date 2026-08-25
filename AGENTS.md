@@ -1075,3 +1075,48 @@ Verified against the real file after the fix: loads as
 just re-reading the key signature. Re-ran the earlier 4-file real-weights
 check too (3 DiffSynth patches + InstantX/Union) to confirm no regression
 - all still classify the same as before.
+
+## QwenImageImg2Img: control_mode, matching Krea2Img2Img's auto-derive convention (2026-08-25)
+
+User: "its not auto using my image as control image" - fair, since
+Krea2Img2Img auto-derives depth by default. Difference: Krea2 has exactly
+one control type, so a single `auto_depth` default was safe. Qwen-Image
+checkpoints span several distinct preprocessing needs (canny, depth,
+inpaint, and Union which can be any of those) that this pack has no way to
+detect from the loaded file - so `QwenImageImg2Img` now offers the same
+convenience Krea2 has, but defaults to `manual` rather than guessing:
+
+- `control_mode="manual"` (default) - unchanged, connect `control_image`.
+- `control_mode="auto_canny"` - new `_auto_canny_control_image()` helper,
+  plain `cv2.Canny` on `image` - no model, no download, matches
+  `comfyui_controlnet_aux`'s own Canny preprocessor defaults (100/200
+  thresholds). Zero new deps (cv2 already used by depth_anything_v2.py).
+- `control_mode="auto_depth"` - reuses `depth_anything_v2.DepthAnythingV2Detector`
+  (the same Depth Anything V2 port `Krea2DepthMap` uses), added
+  `depth_ckpt_name` widget alongside it.
+
+Also fixed a real gap surfaced while reading `QwenImageDiffsynthControlnet`'s
+signature again for this: `mask` was never exposed on `QwenImageImg2Img` at
+all, silently making inpaint checkpoints unusable for masked inpainting (a
+supplied `image` was the only thing reaching `DiffSynthCnetPatch`). Added
+`mask` (MASK, optional), replicating stock `QwenImageDiffsynthControlnet`'s
+own mask preprocessing exactly (`ndim==3 -> unsqueeze(1)`,
+`ndim==4 -> unsqueeze(2)`, then `1.0 - mask`) before passing to
+`DiffSynthCnetPatch`.
+
+Almost added a `mask`-without-`control_image` shortcut for inpaint-only
+use (assuming mask alone could substitute for the image), but re-checked
+`comfy_extras/nodes_model_patch.py`'s `QwenImageDiffsynthControlnet.INPUT_TYPES()`
+before shipping it: `image` is `"required"` even there, `mask` is only
+`"optional"` - it refines the inpaint region, it doesn't replace the base
+image. Removed that branch before it became a real bug (would have crashed
+inside `DiffSynthCnetPatch.encode_latent_cond()`'s unconditional
+`self.vae.encode(image)` call with `image=None`).
+
+`tools/smoke_qwen_image.py`'s stub `folder_paths` gained `models_dir` and
+`comfy.model_management` gained `get_torch_device` (needed by
+`depth_anything_v2.py`'s module-level constant and the auto_depth path
+respectively); the plain `sys.path.insert` + `import nodes_qwen_image`
+import was replaced with the same synthetic-package trick already used in
+`tools/smoke_krea2.py`, since `from . import depth_anything_v2` is a
+relative import that only resolves inside a real package context.

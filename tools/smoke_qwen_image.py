@@ -22,6 +22,7 @@ comfy_controlnet = types.ModuleType("comfy.controlnet")
 comfy_controlnet.load_controlnet_state_dict = lambda sd: object()
 comfy_model_management = types.ModuleType("comfy.model_management")
 comfy_model_management.intermediate_device = lambda: torch.device("cpu")
+comfy_model_management.get_torch_device = lambda: torch.device("cpu")
 comfy_sd = types.ModuleType("comfy.sd")
 comfy_utils = types.ModuleType("comfy.utils")
 comfy_utils.common_upscale = lambda samples, w, h, method, crop: torch.nn.functional.interpolate(
@@ -31,6 +32,7 @@ folder_paths.get_filename_list = lambda key: []
 folder_paths.get_full_path = lambda key, name: None
 folder_paths.get_full_path_or_raise = lambda key, name: name
 folder_paths.get_folder_paths = lambda key: []
+folder_paths.models_dir = str(REPO_ROOT / "models")
 nodes = types.ModuleType("nodes")
 nodes.MAX_RESOLUTION = 16384
 
@@ -68,8 +70,12 @@ comfy.model_management = comfy_model_management
 comfy.sd = comfy_sd
 comfy.utils = comfy_utils
 
-sys.path.insert(0, str(REPO_ROOT))
-import nodes_qwen_image as qi  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT.parent))
+pkg = types.ModuleType("cctech_gguf_pkg")
+pkg.__path__ = [str(REPO_ROOT)]
+sys.modules["cctech_gguf_pkg"] = pkg
+import importlib
+qi = importlib.import_module("cctech_gguf_pkg.nodes_qwen_image")  # noqa: E402
 
 
 class _FakeModelPatcher:
