@@ -290,6 +290,8 @@ The loader returns standard comfy **MODEL / CLIP / VAE** objects. Native ConvRot
 
 `tools/smoke_minimax_music3.py` validates the three real checkpoint load paths without generating a song.
 
+**Audio Stem Split** lives in the same `🤖 CCTech/MiniMax Music` category — separates any Comfy `AUDIO` (a MiniMax Music 3 generation or anything else) into an acapella and an instrumental with MelBandRoformer (public `MelBandRoformer_fp16` checkpoint; only the inference architecture is ported, staged through Comfy model management like every other model in this pack). Useful standalone, and as a cleaner input for downstream captioning or remixing — an isolated stem gives an audio-language model a much cleaner read on the vocal or the arrangement than the full mix.
+
 ## Credits
 
 Fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (Apache-2.0) — the loader, the quantization tooling and the custom ops are theirs; the backported PRs are their authors', listed in [PR_BACKPORT.md](PR_BACKPORT.md). Report bugs in this fork here, not upstream.

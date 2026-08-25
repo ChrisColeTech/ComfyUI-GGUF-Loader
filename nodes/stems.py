@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 MELBAND_SR = 44100
 MODEL_FOLDER = "scenema-audio"
 SUBDIR = "mel-band-roformer"
-CATEGORY = "🤖 CCTech/Audio"
+CATEGORY = "🤖 CCTech/MiniMax Music"
 
 # ~8 s at 44.1 kHz. The model is fully attentional over the chunk, so this is a
 # memory/quality knob, not a correctness one.
