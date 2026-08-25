@@ -1306,3 +1306,68 @@ error either way. `tools/smoke_krea2.py` gained
 (26/26 total). Docs updated to drop the "load canny with stock
 LoraLoaderModelOnly instead" guidance from the previous entry - it's no
 longer necessary, `Krea2ControlLoRALoader` handles it now.
+
+## QwenImageKSampler + Krea2KSampler: measured, not assumed (2026-08-25)
+
+User asked directly why Z-Image has `ZImageKSampler` but Qwen-Image/Krea2
+don't, and pushed to build them regardless of whether I could "measure"
+anything first ("i dont think you need to measure anything... thats
+something youll have to find out in the code"). Measured anyway, via two
+parallel research agents, because building a sampler without knowing
+whether the underlying premise (a real schedule divergence) holds would
+risk shipping something that doesn't address anything real - same
+standard as every other feature this session.
+
+**Confirmed real for both, same mechanism, smaller than Z-Image's but
+measurable - and critically, NOT a Qwen-Image-specific or Krea2-specific
+bug.** It's generic to `comfy.samplers.KSampler.set_steps()`
+(`comfy/samplers.py:1431-1440`) for ANY `denoise<1.0` sampling of ANY
+flow-matching model: comfy re-expands to `new_steps=int(steps/denoise)`
+and takes the tail, instead of computing the schedule at `steps` directly
+and slicing from `t_start = steps - round(steps*denoise)` (the diffusers
+img2img convention `ZImageKSampler`'s `diffusers_mode` already
+reproduces). Both Qwen-Image and Krea2 share `ModelSamplingFlux` with
+`shift=1.15` (literally the same value, copy-pasted alongside the
+Qwen-Image-family config in `comfy/supported_models.py` - not
+independently calibrated for either). Recomputed at 9 steps/denoise=0.9,
+first via research-agent hand-calculation, then verified against a REAL
+loaded Krea2 model's actual `model_sampling` object
+(`model.get_model_object("model_sampling")` → real
+`comfy.samplers.calculate_sigmas` calls, not simulated): comfy convention
+0.9660138..., diffusers-style 0.9619314..., delta 0.00408 - matches the
+hand-computed research numbers exactly. Smaller than Z-Image's documented
+gap (0.9643 vs 0.9567, Δ≈0.0076) because `ModelSamplingFlux`'s shift curve
+is less steep near σ≈1 than Z-Image's `ModelSamplingDiscreteFlow`, same
+underlying cause either way.
+
+Honest calibration, not hedging on whether to ship: Z-Image's own
+docstring calls this "a compatibility switch for matching another
+pipeline, not a quality setting" - a ~0.4% sigma difference is real but
+small, unlikely to be the full explanation for any "not working properly"
+report on its own (more likely cause: the wiring issues already found and
+fixed - raw photo as control_image, missing edit_reference). Built anyway
+since the gap is confirmed real and it's zero-risk (default
+`denoise_mode="comfy"` is byte-identical to current behavior).
+
+Added `QwenImageKSampler` (`nodes_qwen_image.py`) and `Krea2KSampler`
+(`nodes_krea2.py`) as near-verbatim clones of `ZImageKSampler`
+(`nodes_zimage.py:238-321`) - the `sample()` body is copied unchanged
+since it was already fully generic (only calls
+`model.get_model_object("model_sampling")` + `comfy.samplers`/
+`comfy.sample` primitives, confirmed to need zero Z-Image-specific math).
+Only `TITLE`/`CATEGORY`/`SEARCH_ALIASES`/docstring differ per file, plus
+Qwen-Image/Krea2-appropriate `steps`/`cfg` defaults (20/2.5, vs Z-Image
+Turbo's 9/1.0 - these aren't Turbo-distilled checkpoints).
+
+`tools/smoke_qwen_image.py` and `tools/smoke_krea2.py` each gained 3 tests
+(comfy-mode delegates to `common_ksampler` unchanged, diffusers-mode
+rejects `denoise<=0`, diffusers-mode slices sigmas and returns a correctly
+shaped latent) - needed new fakes for `comfy.samplers`/`comfy.sample`/
+`latent_preview`/`nodes.common_ksampler` in both offline harnesses.
+Krea2's existing `_FakeModelPatcher.get_model_object` raises by design (to
+test other guard rails) - added a separate minimal `_FakeSamplerModel`
+fake for the sampler tests rather than changing the shared fixture. 44/44
+combined smoke tests across the two files pass. Real-environment check
+confirmed both nodes register with the real `comfy.samplers.KSampler.SAMPLERS`/
+`SCHEDULERS` lists, and the sigma math itself was verified against a real
+loaded Krea2 GGUF model (see numbers above) - not just fakes.

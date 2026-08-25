@@ -36,6 +36,49 @@ folder_paths.models_dir = str(REPO_ROOT / "models")
 nodes = types.ModuleType("nodes")
 nodes.MAX_RESOLUTION = 16384
 
+common_ksampler_calls = []
+
+
+def _fake_common_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
+                          positive, negative, latent_image, denoise=1.0):
+    common_ksampler_calls.append(dict(
+        model=model, seed=seed, steps=steps, cfg=cfg, sampler_name=sampler_name,
+        scheduler=scheduler, positive=positive, negative=negative,
+        latent_image=latent_image, denoise=denoise))
+    return ({"samples": torch.zeros(1, 4, 8, 8)},)
+
+
+nodes.common_ksampler = _fake_common_ksampler
+
+comfy_samplers = types.ModuleType("comfy.samplers")
+
+
+class _FakeKSamplerClass:
+    SAMPLERS = ["euler"]
+    SCHEDULERS = ["simple"]
+
+
+comfy_samplers.KSampler = _FakeKSamplerClass
+comfy_samplers.calculate_sigmas = lambda model_sampling, scheduler, steps: torch.linspace(1.0, 0.0, steps + 1)
+comfy_samplers.sampler_object = lambda name: name
+
+comfy_sample_mod = types.ModuleType("comfy.sample")
+comfy_sample_mod.fix_empty_latent_channels = lambda model, samples, a, b: samples
+comfy_sample_mod.prepare_noise = lambda samples, seed, batch_index=None: torch.zeros_like(samples)
+
+
+def _fake_sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, samples,
+                        noise_mask=None, callback=None, disable_pbar=True, seed=0):
+    return samples
+
+
+comfy_sample_mod.sample_custom = _fake_sample_custom
+
+latent_preview_mod = types.ModuleType("latent_preview")
+latent_preview_mod.prepare_callback = lambda model, steps: None
+
+comfy_utils.PROGRESS_BAR_ENABLED = False
+
 class _FakeDiffSynthCnetPatch:
     """Stand-in for comfy_extras.nodes_model_patch.DiffSynthCnetPatch - the
     real one calls model_patch.model.process_input_latent_image(...) in
@@ -84,6 +127,9 @@ sys.modules["comfy.controlnet"] = comfy_controlnet
 sys.modules["comfy.model_management"] = comfy_model_management
 sys.modules["comfy.sd"] = comfy_sd
 sys.modules["comfy.utils"] = comfy_utils
+sys.modules["comfy.samplers"] = comfy_samplers
+sys.modules["comfy.sample"] = comfy_sample_mod
+sys.modules["latent_preview"] = latent_preview_mod
 sys.modules["folder_paths"] = folder_paths
 sys.modules["nodes"] = nodes
 sys.modules["comfy_extras"] = comfy_extras
@@ -93,6 +139,8 @@ comfy.controlnet = comfy_controlnet
 comfy.model_management = comfy_model_management
 comfy.sd = comfy_sd
 comfy.utils = comfy_utils
+comfy.samplers = comfy_samplers
+comfy.sample = comfy_sample_mod
 
 sys.path.insert(0, str(REPO_ROOT.parent))
 pkg = types.ModuleType("cctech_gguf_pkg")
@@ -114,6 +162,9 @@ class _FakeModelPatcher:
 
     def set_model_double_block_patch(self, patch):
         self.double_block_patches.append(patch)
+
+    def get_model_object(self, key):
+        return None
 
 
 class _FakeControlNet:
@@ -259,6 +310,49 @@ def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():
           "positive conditioning only")
 
 
+# ── QwenImageKSampler ─────────────────────────────────────────────────────
+
+def test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged():
+    common_ksampler_calls.clear()
+    node = qi.QwenImageKSampler()
+    model = _FakeModelPatcher()
+    positive, negative = "pos", "neg"
+    latent = {"samples": torch.zeros(1, 4, 8, 8)}
+    result = node.sample(model, positive, negative, latent, 42, 20, 2.5,
+                         "euler", "simple", 1.0, "comfy")
+    assert len(common_ksampler_calls) == 1
+    call = common_ksampler_calls[0]
+    assert call["model"] is model and call["seed"] == 42 and call["steps"] == 20
+    assert call["denoise"] == 1.0
+    assert result[0]["samples"].shape == (1, 4, 8, 8)
+    print("[ok] QwenImageKSampler: denoise_mode=comfy delegates to common_ksampler unchanged")
+
+
+def test_ksampler_diffusers_mode_rejects_zero_denoise():
+    node = qi.QwenImageKSampler()
+    model = _FakeModelPatcher()
+    latent = {"samples": torch.zeros(1, 4, 8, 8)}
+    try:
+        node.sample(model, "pos", "neg", latent, 0, 20, 2.5, "euler", "simple", 0.0, "diffusers")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+    print("[ok] QwenImageKSampler: denoise_mode=diffusers rejects denoise<=0")
+
+
+def test_ksampler_diffusers_mode_slices_sigmas_from_t_start():
+    node = qi.QwenImageKSampler()
+    model = _FakeModelPatcher()
+    latent = {"samples": torch.zeros(1, 4, 8, 8)}
+    out, = node.sample(model, "pos", "neg", latent, 0, 10, 2.5, "euler", "simple", 0.5, "diffusers")
+    # calculate_sigmas fake returns linspace(1,0,11) for steps=10; t_start = round(10-10*0.5) = 5
+    # -> sigmas[5:] has 6 entries, sample_custom (fake) passes samples through unchanged shape.
+    assert out["samples"].shape == (1, 4, 8, 8)
+    assert "downscale_ratio_spacial" not in out
+    print("[ok] QwenImageKSampler: denoise_mode=diffusers slices sigmas from t_start and returns latent")
+
+
 if __name__ == "__main__":
     test_apply_controlnet_stamps_control_key_on_every_conditioning_item()
     test_apply_controlnet_sets_hint_and_strength()
@@ -270,4 +364,7 @@ if __name__ == "__main__":
     test_img2img_controlnet_control_attaches_to_conditioning()
     test_canny_node_produces_edge_map_matching_input_shape()
     test_img2img_edit_reference_attaches_reference_latents_to_positive_only()
+    test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
+    test_ksampler_diffusers_mode_rejects_zero_denoise()
+    test_ksampler_diffusers_mode_slices_sigmas_from_t_start()
     print("[ok] all nodes_qwen_image smoke tests passed")

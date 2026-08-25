@@ -476,16 +476,109 @@ class QwenImageImg2Img:
         return (model, positive, negative, {"samples": latent}, denoise)
 
 
+class QwenImageKSampler:
+    """KSampler for Qwen-Image, with the one option stock KSampler lacks.
+
+    `denoise_mode`:
+      comfy      - delegates to common_ksampler, so it stays identical to
+                   KSampler as ComfyUI changes.
+      diffusers  - slices a steps-long schedule at
+                   t_start = steps - round(steps * denoise), reproducing a
+                   diffusers img2img pipeline step for step.
+
+    Qwen-Image has no bespoke sampling code in comfy at all - it shares
+    ModelSamplingFlux (shift=1.15) with the rest of the Flux family, and
+    comfy's own denoise-slicing convention (KSampler.set_steps:
+    new_steps=int(steps/denoise), take the tail) genuinely diverges from
+    the diffusers img2img convention used above - confirmed by recomputing
+    both schedules for Qwen-Image's actual shift value: at 9 steps,
+    denoise 0.9 starts at sigma ~0.9660 under comfy vs ~0.9619 under
+    diffusers. Smaller than Z-Image's measured gap (0.9643 vs 0.9567) but
+    the same mechanism, so this is a compatibility switch for matching
+    another pipeline, not a quality setting - "comfy" (default) is
+    unchanged stock behavior.
+    """
+
+    TITLE = "Qwen-Image KSampler ⚡"
+    SEARCH_ALIASES = ['sampler', 'sample', 'generate', 'denoise', 'diffuse', 'txt2img', 'img2img']
+    CATEGORY = QWEN_IMAGE_CATEGORY
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    DESCRIPTION = ("KSampler for Qwen-Image with an optional diffusers-style "
+                   "denoise convention for exact img2img pipeline matching.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                 "control_after_generate": True}),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 2.5, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "denoise_mode": (["comfy", "diffusers"], {"default": "comfy"}),
+            },
+        }
+
+    def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
+               sampler_name, scheduler, denoise, denoise_mode):
+        if denoise_mode == "comfy":
+            return nodes.common_ksampler(model, seed, steps, cfg, sampler_name,
+                                         scheduler, positive, negative,
+                                         latent_image, denoise=denoise)
+
+        import comfy.sample
+        import latent_preview
+
+        if denoise <= 0.0:
+            raise ValueError("denoise must be > 0")
+
+        samples = comfy.sample.fix_empty_latent_channels(
+            model, latent_image["samples"],
+            latent_image.get("downscale_ratio_spacial", None),
+            latent_image.get("downscale_ratio_temporal", None))
+
+        sigmas = comfy.samplers.calculate_sigmas(
+            model.get_model_object("model_sampling"), scheduler, steps)
+        sigmas = sigmas[int(round(max(steps - steps * denoise, 0))):]
+
+        noise = comfy.sample.prepare_noise(samples, seed,
+                                           latent_image.get("batch_index", None))
+        out_samples = comfy.sample.sample_custom(
+            model, noise, cfg, comfy.samplers.sampler_object(sampler_name), sigmas,
+            positive, negative, samples,
+            noise_mask=latent_image.get("noise_mask", None),
+            callback=latent_preview.prepare_callback(model, len(sigmas) - 1),
+            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
+
+        logger.info("Qwen-Image KSampler (diffusers): denoise %.2f -> %d of %d steps, "
+                    "start sigma %.4f", denoise, len(sigmas) - 1, steps, float(sigmas[0]))
+        out = latent_image.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out.pop("downscale_ratio_temporal", None)
+        out["samples"] = out_samples
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "QwenImageModelLoader": QwenImageModelLoader,
     "QwenImageControlNetLoader": QwenImageControlNetLoader,
     "QwenImageCanny": QwenImageCanny,
     "QwenImageImg2Img": QwenImageImg2Img,
+    "QwenImageKSampler": QwenImageKSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImageModelLoader": QwenImageModelLoader.TITLE,
     "QwenImageControlNetLoader": QwenImageControlNetLoader.TITLE,
     "QwenImageCanny": QwenImageCanny.TITLE,
+    "QwenImageKSampler": QwenImageKSampler.TITLE,
     "QwenImageImg2Img": QwenImageImg2Img.TITLE,
 }

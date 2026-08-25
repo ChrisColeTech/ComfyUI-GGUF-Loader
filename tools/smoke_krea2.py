@@ -58,6 +58,49 @@ folder_paths.models_dir = str(REPO_ROOT / "models")
 nodes = types.ModuleType("nodes")
 nodes.MAX_RESOLUTION = 16384
 
+common_ksampler_calls = []
+
+
+def _fake_common_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
+                          positive, negative, latent_image, denoise=1.0):
+    common_ksampler_calls.append(dict(
+        model=model, seed=seed, steps=steps, cfg=cfg, sampler_name=sampler_name,
+        scheduler=scheduler, positive=positive, negative=negative,
+        latent_image=latent_image, denoise=denoise))
+    return ({"samples": torch.zeros(1, 4, 8, 8)},)
+
+
+nodes.common_ksampler = _fake_common_ksampler
+
+comfy_samplers = types.ModuleType("comfy.samplers")
+
+
+class _FakeKSamplerClass:
+    SAMPLERS = ["euler"]
+    SCHEDULERS = ["simple"]
+
+
+comfy_samplers.KSampler = _FakeKSamplerClass
+comfy_samplers.calculate_sigmas = lambda model_sampling, scheduler, steps: torch.linspace(1.0, 0.0, steps + 1)
+comfy_samplers.sampler_object = lambda name: name
+
+comfy_sample_mod = types.ModuleType("comfy.sample")
+comfy_sample_mod.fix_empty_latent_channels = lambda model, samples, a, b: samples
+comfy_sample_mod.prepare_noise = lambda samples, seed, batch_index=None: torch.zeros_like(samples)
+
+
+def _fake_sample_custom(model, noise, cfg, sampler, sigmas, positive, negative, samples,
+                        noise_mask=None, callback=None, disable_pbar=True, seed=0):
+    return samples
+
+
+comfy_sample_mod.sample_custom = _fake_sample_custom
+
+latent_preview_mod = types.ModuleType("latent_preview")
+latent_preview_mod.prepare_callback = lambda model, steps: None
+
+comfy_utils.PROGRESS_BAR_ENABLED = False
+
 # node_helpers imports `from comfy.cli_args import args` at module level in
 # the real ComfyUI, too heavy to import directly offline - stub with a 1:1
 # reimplementation of the real conditioning_set_values (node_helpers.py).
@@ -88,6 +131,9 @@ sys.modules["comfy.model_management"] = comfy_model_management
 sys.modules["comfy.patcher_extension"] = comfy_patcher_extension
 sys.modules["comfy.sd"] = comfy_sd
 sys.modules["comfy.utils"] = comfy_utils
+sys.modules["comfy.samplers"] = comfy_samplers
+sys.modules["comfy.sample"] = comfy_sample_mod
+sys.modules["latent_preview"] = latent_preview_mod
 sys.modules["folder_paths"] = folder_paths
 sys.modules["nodes"] = nodes
 sys.modules["node_helpers"] = node_helpers
@@ -96,6 +142,8 @@ comfy.model_management = comfy_model_management
 comfy.patcher_extension = comfy_patcher_extension
 comfy.sd = comfy_sd
 comfy.utils = comfy_utils
+comfy.samplers = comfy_samplers
+comfy.sample = comfy_sample_mod
 
 sys.path.insert(0, str(REPO_ROOT.parent))
 pkg = types.ModuleType("cctech_gguf_pkg")
@@ -440,6 +488,56 @@ def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():
           "positive conditioning only")
 
 
+# ── Krea2KSampler ─────────────────────────────────────────────────────────
+
+class _FakeSamplerModel:
+    """Minimal fake for Krea2KSampler - unlike _FakeModelPatcher, needs a
+    working get_model_object("model_sampling") since the diffusers-mode
+    path calls it directly (no try/except - the real ModelPatcher always
+    has one)."""
+
+    def get_model_object(self, key):
+        return object()
+
+
+def test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged():
+    common_ksampler_calls.clear()
+    node = krea2.Krea2KSampler()
+    model = _FakeSamplerModel()
+    latent = {"samples": torch.zeros(1, 4, 8, 8)}
+    result = node.sample(model, "pos", "neg", latent, 42, 20, 2.5,
+                         "euler", "simple", 1.0, "comfy")
+    assert len(common_ksampler_calls) == 1
+    call = common_ksampler_calls[0]
+    assert call["model"] is model and call["seed"] == 42 and call["steps"] == 20
+    assert call["denoise"] == 1.0
+    assert result[0]["samples"].shape == (1, 4, 8, 8)
+    print("[ok] Krea2KSampler: denoise_mode=comfy delegates to common_ksampler unchanged")
+
+
+def test_ksampler_diffusers_mode_rejects_zero_denoise():
+    node = krea2.Krea2KSampler()
+    model = _FakeSamplerModel()
+    latent = {"samples": torch.zeros(1, 4, 8, 8)}
+    try:
+        node.sample(model, "pos", "neg", latent, 0, 20, 2.5, "euler", "simple", 0.0, "diffusers")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+    print("[ok] Krea2KSampler: denoise_mode=diffusers rejects denoise<=0")
+
+
+def test_ksampler_diffusers_mode_slices_sigmas_from_t_start():
+    node = krea2.Krea2KSampler()
+    model = _FakeSamplerModel()
+    latent = {"samples": torch.zeros(1, 4, 8, 8)}
+    out, = node.sample(model, "pos", "neg", latent, 0, 10, 2.5, "euler", "simple", 0.5, "diffusers")
+    assert out["samples"].shape == (1, 4, 8, 8)
+    assert "downscale_ratio_spacial" not in out
+    print("[ok] Krea2KSampler: denoise_mode=diffusers slices sigmas from t_start and returns latent")
+
+
 if __name__ == "__main__":
     test_prepare_control_image_grayscale_repeats_to_three_channels()
     test_prepare_control_image_minmax_normalizes_to_0_1()
@@ -466,4 +564,7 @@ if __name__ == "__main__":
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
     test_img2img_edit_reference_attaches_reference_latents_to_positive_only()
+    test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
+    test_ksampler_diffusers_mode_rejects_zero_denoise()
+    test_ksampler_diffusers_mode_slices_sigmas_from_t_start()
     print("[ok] all nodes_krea2 smoke tests passed")
