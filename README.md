@@ -167,6 +167,30 @@ Minimal graph for the depth LoRA: `Load Image` → `Krea2 img2img`'s `image` (th
 
 `tools/smoke_krea2.py` covers the tensor-prep helpers (grayscale/normalize/invert/resize), the `Krea2ControlInputProjection` forward math (image-only fallback, and image+control summation), and `Krea2 img2img`'s guard rails, auto_depth derivation, and manual-override precedence (21/21, no GPU). Loading real GGUF/LoRA weights end-to-end, and the Depth Anything V2 port's `load_state_dict(strict=True)` against the real HuggingFace checkpoint, were verified separately against the actual portable ComfyUI environment.
 
+### Qwen-Image ControlNet
+
+Unlike Krea2's Control LoRA, Qwen-Image ControlNet needed no algorithm ported at all — every format in circulation is already native to ComfyUI core:
+
+| Format | Example file | Comfy mechanism |
+|---|---|---|
+| InstantX / Union | `*-InstantX-ControlNet-Union.safetensors` | `comfy.controlnet.load_controlnet_state_dict()` → a real `ControlNet` object, attaches to **CONDITIONING** (same as any classic ControlNet) |
+| Qwen-Image-Fun ControlNet | — | same dispatcher, also a `ControlNet` object |
+| DiffSynth patches (canny/depth/inpaint) | `qwen_image_{canny,depth,inpaint}_diffsynth_controlnet.safetensors` | `comfy_extras.nodes_model_patch.ModelPatchLoader` → a `MODEL_PATCH`, attaches to **MODEL** via `DiffSynthCnetPatch` — the same mechanism this pack's `nodes_zimage.py` already uses for Z-Image's ControlNet |
+
+**Qwen-Image Model Loader** is the same thin GGUF-aware convenience loader as `Krea2ModelLoader`/`ZImageLoader` — MODEL/CLIP/VAE by name (`type="qwen_image"` for CLIP).
+
+**Qwen-Image ControlNet Loader** loads a checkpoint from `models/model_patches` or `models/controlnet` and auto-detects which of the two mechanisms above it needs, by the same state-dict key signatures comfy core's own loaders check for (`controlnet_blocks.0.y_rms.weight` for DiffSynth, `control_blocks.0.after_proj.weight` + `control_img_in.weight` for Fun, otherwise handed to `comfy.controlnet.load_controlnet_state_dict()` for InstantX/Union) — it's a dispatcher, not a reimplementation. Outputs a `QWEN_IMAGE_CONTROL` wrapper tagging which attachment point the loaded checkpoint needs.
+
+**Qwen-Image img2img** — same one-node shape as `Krea2Img2Img`: `model, clip, vae, prompt, negative_prompt, strength, width, height`, plus optional `image` (img2img) and optional `qwen_control` + `control_image` (from the loader above). It routes to whichever attachment the loaded checkpoint needs automatically — `DiffSynthCnetPatch` on a cloned `MODEL` for DiffSynth/Fun, or the same `.set_cond_hint()`/`.set_previous_controlnet()` calls stock `ControlNetApplyAdvanced` makes, applied to **CONDITIONING**, for InstantX/Union — so you never need to know which mechanism a given checkpoint uses. Same guard rails as `Krea2Img2Img`: `qwen_control` with no `control_image` raises (nothing to attach); `control_image` with no `qwen_control` is ignored with a warning (nothing to attach it to).
+
+Graph: `Qwen-Image Model Loader` → `Qwen-Image img2img` (prompt typed directly into this node), alongside `Qwen-Image ControlNet Loader` → `qwen_control`, with your control map (a canny/depth/pose image, from any preprocessor — including this pack's own `Krea2 Depth Map`, which works for any model, not just Krea2) → `control_image` → stock `KSampler` → `VAE Decode`.
+
+`Krea2 Depth Map` is reused as-is for Qwen-Image control images too — it just estimates depth from a photo, nothing Krea2-specific about it.
+
+Not ported: Lotus depth estimation (a diffusion-based depth model some Qwen-Image InstantX workflows use as their depth preprocessor) — it's a different architecture from Depth Anything V2, and a separate job (preprocessor, not ControlNet). `Krea2 Depth Map`'s Depth Anything V2 covers the same role for now.
+
+`tools/smoke_qwen_image.py` covers the control-dispatch helper (conditioning stamping, hint/strength passthrough) and `Qwen-Image img2img`'s guard rails, latent shapes, and both attachment paths (model_patch → cloned `MODEL`; controlnet → `CONDITIONING`, `MODEL` left untouched) — 8/8, no GPU. The format auto-detection and both attachment mechanisms were verified separately against the real files (3 DiffSynth patches + the InstantX/Union checkpoint) in the actual portable ComfyUI environment.
+
 ### LM Studio
 
 **LM Studio Vision Prompt**, under `🤖 CCTech/LM Studio`, is a local drop-in for a cloud vision-prompt node such as comfy-core's `GeminiNode`: optional image + prompt + system_prompt in, one STRING out, so it slots into an existing workflow (e.g. `ltxv23_talking_head`'s photo-to-prompt step) without touching anything downstream. It talks to [LM Studio](https://lmstudio.ai/)'s local OpenAI-compatible server (`LM Studio > Developer > Start Server`; `base_url` defaults to `http://localhost:1234/v1` and is editable per node). Leave `model` blank to auto-use whatever's currently loaded in LM Studio (a live `/v1/models` call at run time, so it stays correct across model switches and across whichever `base_url` this node points at), or type an exact model id to pin one. A connection failure raises a clear "is the server running?" error rather than a bare traceback. Needs the optional `requests` dependency (`pip install requests`, already in `requirements.txt`).

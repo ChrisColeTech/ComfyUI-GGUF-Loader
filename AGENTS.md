@@ -974,3 +974,73 @@ covered separately against real weights, same as the rest of this feature).
 `_FakeModelPatcher` gained a `.model` attribute and a `get_model_object`
 that raises, since these tests now reach `_process_control_latent_for_model`
 instead of stopping at the earlier guard-rail checks. 21/21 passing.
+
+## Qwen-Image ControlNet: a dispatcher, not a port (2026-08-24)
+
+User referenced a blog post (stablediffusiontutorials.com, Qwen-Image
+ControlNets) and asked "is this a clone of krea2 or is more involved."
+Answer turned out to be neither - it's LESS involved than Krea2, because
+unlike Krea2's control-LoRA (a genuinely missing mechanism, nothing in
+comfy or any pack implements the widened-input-projection trick), every
+Qwen-Image ControlNet format already has full native comfy support:
+
+- InstantX/Union and Qwen-Image-Fun checkpoints: real diffusers-style
+  ControlNet weights, auto-detected and built by
+  `comfy.controlnet.load_controlnet_state_dict()` (checked
+  `comfy/controlnet.py:661-722`) into an actual `ControlNet` object - the
+  same one stock `ControlNetLoader`/`ControlNetApplyAdvanced` produce and
+  consume. Attaches to CONDITIONING.
+- DiffSynth canny/depth/inpaint patches and the Fun ControlNet variant
+  loaded as a raw patch: auto-detected and built by
+  `comfy_extras/nodes_model_patch.py`'s `ModelPatchLoader` (key signature
+  `'controlnet_blocks.0.y_rms.weight' in sd` for
+  `QwenImageBlockWiseControlNet`) into a `MODEL_PATCH`, applied via
+  `DiffSynthCnetPatch` - the exact mechanism `nodes_zimage.py`'s
+  `ZImageFunControlnet` already reuses in this repo (it literally
+  subclasses core's `QwenImageDiffsynthControlnet` apply node).
+
+So `QwenImageControlNetLoader` doesn't reimplement either detection or
+either model class - it calls `comfy.controlnet.load_controlnet_state_dict()`
+directly for the InstantX/Union branch, and instantiates core's own
+`ModelPatchLoader` node class directly for the DiffSynth/Fun branch (same
+"reuse the stock class, don't reimplement its dispatch logic" instinct as
+`nodes_zimage.py`'s `_te_name`/`ZImageLoader`). The only new code is the
+`QwenImageControl` wrapper tagging which of the two attachment points
+(`"controlnet"` vs `"model_patch"`) a loaded checkpoint needs, and
+`QwenImageImg2Img` routing to the right one - `_apply_controlnet_to_conditioning`
+replicates core's `ControlNetApplyAdvanced.apply_controlnet()` inline
+(`control_net.copy().set_cond_hint(...).set_previous_controlnet(...)`,
+stamped into each conditioning item's `dict['control']`) for the
+conditioning-attachment path, and `DiffSynthCnetPatch` (imported directly
+from `comfy_extras.nodes_model_patch`, not reimplemented) for the
+model-attachment path.
+
+User provided 5 real files, all placed under
+`N:\ComfyUI_windows_portable_nvidia\ComfyUI\models\model_patches\`:
+`qwen_image_{canny,depth,inpaint}_diffsynth_controlnet.safetensors`,
+`qwen_image-InstantX-ControlNet-Union.safetensors`, and
+`qwen_image_lotus-depth-d-v1-1.safetensors`. Verified format detection
+against all 4 controlnet/patch files (not the 5th) end-to-end through the
+real node class, not just key-sniffing: the 3 DiffSynth files each loaded
+as `MODEL_PATCH` wrapping a real `QwenImageBlockWiseControlNet`, the
+InstantX file loaded as a `ControlNet` wrapping a real
+`QwenImageControlNetModel`.
+
+`qwen_image_lotus-depth-d-v1-1.safetensors` is NOT a ControlNet at all -
+Lotus is a diffusion-based depth *estimator* (a preprocessor, like Depth
+Anything V2), architecturally unrelated to either mechanism above. Left
+unported for now; `Krea2 Depth Map`'s Depth Anything V2 already covers the
+"turn a photo into a depth map" role generically (nothing Krea2-specific
+about it - it just estimates depth), so Qwen-Image workflows can reuse it
+rather than needing a second, different depth-estimator port. Flagged in
+README as explicitly out of scope, not silently dropped.
+
+New file `nodes_qwen_image.py`: `QwenImageModelLoader`,
+`QwenImageControlNetLoader`, `QwenImageImg2Img` - same 3-node shape as
+Krea2's (loader / control loader / one-node img2img+control prep).
+`tools/smoke_qwen_image.py` (8 tests, no GPU) covers the dispatch helper
+and both attachment paths via fakes (`_FakeControlNet`,
+`_FakeDiffSynthCnetPatch` standing in for the real `comfy_extras` class,
+which needs real model weights to construct) - real-weight verification
+done separately via a real-environment check script against the actual
+portable install.
