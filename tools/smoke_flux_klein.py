@@ -164,23 +164,28 @@ def test_img2img_no_reference_image_leaves_conditioning_unchanged():
     print("[ok] FluxKleinImg2Img: no reference_image -> no reference_latents attached")
 
 
-# ── Flux2KleinDepthMap ───────────────────────────────────────────────────
+# ── Flux2KleinDepthMap (backward-compat alias -> shared DepthMap) ───────
 
 def test_depth_map_node_delegates_to_depth_helper():
-    node = fk.Flux2KleinDepthMap()
+    # Flux2KleinDepthMap's own logic moved to the shared preprocessors.
+    # DepthMap - confirm the "Flux2KleinDepthMap" NODE_CLASS_MAPPINGS alias
+    # resolves to it, and that it delegates to the shared depth helper.
+    from cctech_gguf_pkg.nodes import preprocessors as pp
+    assert fk.NODE_CLASS_MAPPINGS["Flux2KleinDepthMap"] is pp.DepthMap
+    node = pp.DepthMap()
     calls = []
-    original = fk._depth_anything_batch
-    fk._depth_anything_batch = lambda image, ckpt_name, resolution=512: (
+    original = pp._depth_anything_batch
+    pp._depth_anything_batch = lambda image, ckpt_name, resolution=512: (
         calls.append((tuple(image.shape), ckpt_name, resolution)) or torch.zeros_like(image))
     try:
         out, = node.estimate(torch.rand(2, 32, 32, 3), ckpt_name="depth_anything_v2_vits.pth",
                              resolution=256)
     finally:
-        fk._depth_anything_batch = original
+        pp._depth_anything_batch = original
     assert calls == [((2, 32, 32, 3), "depth_anything_v2_vits.pth", 256)]
     assert out.shape == (2, 32, 32, 3)
-    print("[ok] Flux2KleinDepthMap: delegates to the shared depth helper with the given "
-          "ckpt_name/resolution")
+    print("[ok] Flux2KleinDepthMap alias -> shared DepthMap node: delegates to the shared "
+          "depth helper with the given ckpt_name/resolution")
 
 
 # ── Flux2KleinMultiReferenceLatent ──────────────────────────────────────

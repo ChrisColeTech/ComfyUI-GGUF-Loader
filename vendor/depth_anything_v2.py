@@ -514,8 +514,11 @@ class DepthAnythingV2(nn.Module):
         image = cv2.cvtColor(raw_image_bgr, cv2.COLOR_BGR2RGB) / 255.0
         image = transform({"image": image})["image"]
         image = torch.from_numpy(image).unsqueeze(0)
-        device = "cuda" if torch.cuda.is_available() else (
-            "mps" if torch.backends.mps.is_available() else "cpu")
+        # Match whatever device the model itself was actually moved to via
+        # DepthAnythingV2Detector.to(device) - re-detecting cuda/mps/cpu here
+        # independently silently ignored an explicit .to("cpu") call whenever
+        # CUDA was available, causing a device-mismatch RuntimeError.
+        device = next(self.parameters()).device
         return image.to(device), (h, w)
 
 

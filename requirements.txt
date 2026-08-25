@@ -7,3 +7,5 @@ protobuf
 requests
 # optional - Qwen3-TTS nodes
 qwen-tts
+# optional - Normal Map (BAE) preprocessor node (EfficientNet-B5 encoder)
+timm

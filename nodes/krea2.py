@@ -37,7 +37,6 @@ pack's separate Apply node existed for, kept without a second required node.
 """
 import logging
 
-import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +52,7 @@ import node_helpers
 import nodes
 
 from ..vendor import depth_anything_v2
+from .preprocessors import DepthMap, _auto_canny_control_image, _depth_anything_batch
 
 logger = logging.getLogger(__name__)
 
@@ -156,21 +156,6 @@ def _resize_image(image, width, height, upscale_method="lanczos", crop="center")
     samples = image[..., :3].clamp(0.0, 1.0).movedim(-1, 1)
     resized = comfy.utils.common_upscale(samples, width, height, upscale_method, crop)
     return resized.movedim(1, -1).clamp(0.0, 1.0)
-
-
-def _auto_canny_control_image(image, low_threshold=100, high_threshold=200):
-    """Plain cv2.Canny edge detection - no model, no download, deterministic.
-    Same defaults comfyui_controlnet_aux's own Canny preprocessor uses.
-    Mirrors nodes_qwen_image.py's helper of the same name.
-    """
-    out = []
-    for i in range(image.shape[0]):
-        np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
-        gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, low_threshold, high_threshold)
-        edges_rgb = np.repeat(edges[:, :, None], 3, axis=2)
-        out.append(torch.from_numpy(edges_rgb.astype(np.float32) / 255.0))
-    return torch.stack(out, dim=0)
 
 
 def _prepare_control_image(image, channel_mode, normalize, invert):
@@ -945,15 +930,7 @@ class Krea2Img2Img:
         if has_control_lora and control_image is None:
             if control_mode == "auto_depth" and image is not None:
                 logger.info("Krea2: auto-deriving depth map from image (control_mode=auto_depth)")
-                detector = depth_anything_v2.DepthAnythingV2Detector(depth_ckpt_name).to(
-                    comfy.model_management.get_torch_device())
-                depth_batch = []
-                for i in range(image.shape[0]):
-                    np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
-                    depth_rgb = detector.estimate(np_image, resolution=512)
-                    depth_batch.append(torch.from_numpy(depth_rgb.astype(np.float32) / 255.0))
-                control_image = torch.stack(depth_batch, dim=0)
-                del detector
+                control_image = _depth_anything_batch(image, depth_ckpt_name)
             elif control_mode == "auto_canny" and image is not None:
                 logger.info("Krea2: auto-deriving canny edge map from image (control_mode=auto_canny)")
                 control_image = _auto_canny_control_image(image)
@@ -1014,59 +991,6 @@ class Krea2Img2Img:
                         "not the widened-projection Control LoRA mechanism")
 
         return (model, positive, negative, {"samples": latent}, denoise)
-
-
-class Krea2DepthMap:
-    """Estimate a depth map from an IMAGE - Depth Anything V2 (DINOv2 + DPT).
-
-    Ported from Fannovel16/comfyui_controlnet_aux (Apache-2.0)'s Depth Anything
-    V2 preprocessor node (see depth_anything_v2.py for the full architecture
-    port). Feed a source photo in, get a depth map IMAGE out - the exact input
-    Krea2ControlLoRALoader's depth-control-lora.safetensors expects on
-    Krea2Img2Img's control_image. Weights auto-download from HuggingFace on
-    first use into models/depth_anything_v2/, same pattern as this pack's
-    Qwen3-TTS loader - no extra install needed.
-    """
-
-    CATEGORY = KREA2_CATEGORY
-    TITLE = "Krea2 Depth Map ⚡"
-    SEARCH_ALIASES = ['depth anything', 'depth estimation', 'depth map', 'preprocessor',
-                       'controlnet preprocessor', 'image to depth']
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "estimate"
-    DESCRIPTION = ("Estimate a depth map from a photo (Depth Anything V2), for "
-                   "Krea2Img2Img's control_image input with the depth Control LoRA.")
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "ckpt_name": (list(depth_anything_v2.MODEL_CONFIGS.keys()), {
-                    "default": "depth_anything_v2_vitb.pth",
-                    "tooltip": "Model size. vits (smallest/fastest) to vitg "
-                               "(largest/slowest). Downloads on first use if "
-                               "not already in models/depth_anything_v2."}),
-                "resolution": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64}),
-            },
-        }
-
-    def estimate(self, image, ckpt_name="depth_anything_v2_vitb.pth", resolution=512):
-        detector = depth_anything_v2.DepthAnythingV2Detector(ckpt_name).to(
-            comfy.model_management.get_torch_device())
-
-        batch = image.shape[0]
-        out = None
-        for i in range(batch):
-            np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
-            depth_rgb = detector.estimate(np_image, resolution=resolution)
-            depth_tensor = torch.from_numpy(depth_rgb.astype(np.float32) / 255.0)
-            if out is None:
-                out = torch.zeros(batch, *depth_tensor.shape, dtype=torch.float32)
-            out[i] = depth_tensor
-
-        del detector
-        return (out,)
 
 
 class Krea2KSampler:
@@ -1165,7 +1089,10 @@ class Krea2KSampler:
 NODE_CLASS_MAPPINGS = {
     "Krea2ModelLoader": Krea2ModelLoader,
     "Krea2ControlLoRALoader": Krea2ControlLoRALoader,
-    "Krea2DepthMap": Krea2DepthMap,
+    # Backward-compat alias: this node's logic moved to the shared
+    # nodes/preprocessors.py DepthMap class - old saved workflows using the
+    # "Krea2DepthMap" type id keep resolving to a working node.
+    "Krea2DepthMap": DepthMap,
     "Krea2Img2Img": Krea2Img2Img,
     "Krea2KSampler": Krea2KSampler,
 }
@@ -1173,7 +1100,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2ModelLoader": Krea2ModelLoader.TITLE,
     "Krea2ControlLoRALoader": Krea2ControlLoRALoader.TITLE,
-    "Krea2DepthMap": Krea2DepthMap.TITLE,
+    "Krea2DepthMap": "Krea2 Depth Map ⚡",
     "Krea2Img2Img": Krea2Img2Img.TITLE,
     "Krea2KSampler": Krea2KSampler.TITLE,
 }

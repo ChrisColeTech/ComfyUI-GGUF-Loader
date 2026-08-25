@@ -299,10 +299,14 @@ def test_img2img_controlnet_control_attaches_to_conditioning():
 
 
 def test_canny_node_produces_edge_map_matching_input_shape():
-    node = qi.QwenImageCanny()
+    # QwenImageCanny's own logic moved to the shared preprocessors.Canny -
+    # confirm the "QwenImageCanny" NODE_CLASS_MAPPINGS alias resolves to it.
+    from cctech_gguf_pkg.nodes.preprocessors import Canny
+    assert qi.NODE_CLASS_MAPPINGS["QwenImageCanny"] is Canny
+    node = Canny()
     (out,) = node.detect(torch.rand(1, 32, 32, 3))
     assert out.shape == (1, 32, 32, 3)
-    print("[ok] QwenImageCanny: output shape matches input")
+    print("[ok] QwenImageCanny alias -> shared Canny node: output shape matches input")
 
 
 def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():

@@ -2,6 +2,15 @@ from .gguf import (GGUFModelPatcher, UnetLoaderGGUF, UnetLoaderGGUFAdvanced,
                     CLIPLoaderGGUF, DualCLIPLoaderGGUF, TripleCLIPLoaderGGUF,
                     QuadrupleCLIPLoaderGGUF, NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS)
 
+# Shared preprocessor nodes (DepthMap, Canny, ...) - krea2/qwen_image/flux_klein
+# import from this module directly regardless of aggregation order here, but
+# it needs its own NODE_CLASS_MAPPINGS merged in too.
+from .preprocessors import (NODE_CLASS_MAPPINGS as _PREPROCESSOR_CLASSES,
+                             NODE_DISPLAY_NAME_MAPPINGS as _PREPROCESSOR_NAMES)
+
+NODE_CLASS_MAPPINGS.update(_PREPROCESSOR_CLASSES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_PREPROCESSOR_NAMES)
+
 # Imported last: nodes_extra subclasses CLIPLoaderGGUF, so it has to come after
 # the class definitions above rather than at the top of the file.
 from .extra import (NODE_CLASS_MAPPINGS as _EXTRA_CLASSES,

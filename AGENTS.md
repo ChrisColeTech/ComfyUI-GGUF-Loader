@@ -18,14 +18,24 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
   - `nodes/scenema.py` — the Scenema Audio nodes (category `🤖 CCTech/Scenema`).
   - `nodes/extra.py`, `nodes/minimax_h3_prompt.py` — DualVAELoader/ClipProjLoader, and
     the MiniMax-H3 prompt-schema helper (CCTech's own, not vendored).
+  - `nodes/preprocessors.py` — shared ControlNet-aux-style preprocessor nodes
+    (category `🤖 CCTech/Preprocessors`: Depth Map, Normal Map BAE/DSINE, Soft Edge
+    HED/PiDiNet, MLSD Lines, Lineart/Lineart Anime/Manga Line, Canny). Used
+    standalone and by `control_mode="auto_*"` on Krea2Img2Img/QwenImageImg2Img/
+    FluxKleinImg2Img. `Krea2DepthMap`/`Flux2KleinDepthMap`/`QwenImageCanny` are
+    backward-compat aliases registered in their own pipeline's `NODE_CLASS_MAPPINGS`
+    pointing at this file's `DepthMap`/`Canny` classes - not separate implementations.
   - `nodes/{flux_klein,krea2,lmstudio,ltx23,ltx25,minimax_h3,minimax_music,qwen_image,
     qwen_tts,stems,zimage}.py` — the rest of the node families, one file each.
 - `ops/` — GGMLTensor/GGMLOps: weights stay quantized, dequant per-layer at forward
   time. **This is the repo's core identity.** `ops/__init__.py` (was `ops.py`) is the
   package's public surface; `ops/dequant.py` holds the low-level dequant kernels.
 - `vendor/` — ported/adapted third-party model code, each file's header says which
-  project it was ported from: `clipproj.py`, `depth_anything_v2.py`, `melband_arch.py`,
-  `seedvc.py`, `seedvc_arch.py`, `seedvc_utils.py`, `LICENSE-ClipProj`.
+  project it was ported from: `clipproj.py`, `depth_anything_v2.py`, `dsine.py`,
+  `hed.py`, `lineart.py`, `lineart_anime.py`, `manga_line.py`, `melband_arch.py`,
+  `mlsd.py`, `normal_bae.py`, `openpose.py` (NOT registered as a node yet - see the
+  dated entry below, CMU non-commercial license), `pidinet.py`, `seedvc.py`,
+  `seedvc_arch.py`, `seedvc_utils.py`, `LICENSE-ClipProj`.
 - `loader.py` — GGUF → fake-quantized state dict (`gguf_sd_loader`), text-encoder
   post-processing (`gguf_clip_loader`: key remaps, Gemma-3 norm `+1` un-bake,
   sentencepiece tokenizer rebuild from GGUF metadata — now cached next to the
@@ -1644,3 +1654,114 @@ Real-environment check: `FluxKleinImg2Img`'s new optional inputs and
 in both positive and negative conditioning with the correct encoded
 shape (`[1, 128, 16, 16]` for a 256x256 reference at Flux.2's real VAE
 downscale ratio) - not just registration, the real encode+attach path.
+
+## Preprocessor expansion: 8 new ControlNet-aux ports + dedup (2026-08-25)
+
+User asked whether the full `comfyui_controlnet_aux` package had been
+ported (it hadn't - only Depth Anything V2 and a plain cv2 Canny
+existed), requested a full inventory, then set two requirements before
+any more porting: (1) no model weight files ever get added to the repo -
+every preprocessor downloads its own weights on first use into the real
+ComfyUI install's `models/<family>/` folder, same as `depth_anything_v2.py`
+already did; (2) a concrete integration plan before implementation.
+Planned via EnterPlanMode/ExitPlanMode (approved plan preserved the
+research: full architecture/dependency/license inventory of all ~15-20
+comfyui_controlnet_aux preprocessor families, tiered by port effort).
+
+**Consolidation first, then new ports.** Confirmed real duplication
+before adding anything: `_auto_canny_control_image()` was copy-pasted
+verbatim in `nodes/krea2.py` and `nodes/qwen_image.py`; the Depth
+Anything V2 detector loop was duplicated three times (inline in both
+`Img2Img.prepare()` methods, plus its own helper in `nodes/flux_klein.py`);
+three near-identical standalone "Depth Map" nodes existed. New file
+`nodes/preprocessors.py` (category `🤖 CCTech/Preprocessors`) is now the
+one place this logic lives - `DepthMap`/`Canny` classes, `_estimate_batch()`
+(shared per-image-in-batch loop, matches every ported detector's
+`.estimate(image_hwc_uint8, resolution=512, **kwargs)` contract) and
+`_depth_anything_batch()`. `Krea2DepthMap`, `Flux2KleinDepthMap`,
+`QwenImageCanny` stay registered in their own pipeline's
+`NODE_CLASS_MAPPINGS` as aliases pointing at the shared classes (with
+their own display-name strings preserved, e.g. `"Krea2 Depth Map ⚡"`) -
+zero graph-breaking change for saved workflows. `control_mode="auto_depth"`/
+`"auto_canny"` on Krea2Img2Img/QwenImageImg2Img now call the shared
+helpers instead of their own inline copies, unchanged behavior.
+
+**Real bug found and fixed during dedup verification, not part of the
+plan**: `depth_anything_v2.py`'s `_image_to_tensor` hardcoded its own
+`"cuda" if torch.cuda.is_available() else "mps"/"cpu"` device detection
+instead of respecting whatever device `DepthAnythingV2Detector.to(device)`
+actually moved the model to - so an explicit `.to("cpu")` call (e.g. a
+`--cpu` ComfyUI launch on a CUDA-capable box) was silently ignored
+whenever CUDA was available, causing a real
+`RuntimeError: Input type (torch.cuda.FloatTensor) and weight type
+(torch.FloatTensor) should be the same` the first time anyone actually
+exercised the real detector on such a machine (never caught before
+because every prior real-environment check of Krea2/Qwen-Image's
+`auto_depth` used the offline-mocked smoke suite or `control_mode="manual"`
+to skip a real download). Fixed: `device = next(self.parameters()).device`
+inside `DepthAnythingV2Detector`'s underlying model. Every subsequent
+port's agent was explicitly briefed on this exact bug and told to derive
+device from the model's own parameters, never re-detect independently -
+confirmed via grep/review in every one of the 9 new ports below.
+
+**8 new preprocessors ported and shipped** (parallel `general-purpose`
+agents, 2 batches, each agent given the exact `depth_anything_v2.py`/
+`hed.py` template convention to mirror, told to verify real HF repo
+ids/filenames against the actual source rather than guess, and to flag
+any new dependency rather than silently add one):
+
+- `vendor/normal_bae.py` (`NormalBAEDetector`) + `vendor/dsine.py`
+  (`DSINEDetector`) - both need the optional `timm` dependency (added to
+  `requirements.txt`) to build a `tf_efficientnet_b5.ap_in1k` encoder,
+  lazily imported inside `Encoder.__init__` (not required just to import
+  the module or register the node).
+- `vendor/hed.py` (`HEDDetector`), `vendor/pidinet.py` (`PiDiNetDetector`,
+  MIT but with an added "commercial use should be contacted with authors
+  first" note - flagged in the file header, node docstring, and README),
+  `vendor/mlsd.py` (`MLSDDetector`) - no new dependencies.
+- `vendor/lineart.py` (`LineartDetector`, fine/coarse checkpoints),
+  `vendor/lineart_anime.py` (`LineartAnimeDetector`), `vendor/manga_line.py`
+  (`MangaLineDetector`) - no new dependencies; each replaced the source's
+  `einops`/PIL usage with plain `.permute()`/numpy since this repo's
+  convention is HWC uint8 numpy in/out, not PIL images.
+
+Each got a matching `nodes/preprocessors.py` node class using
+`_estimate_batch()`, registered in `NODE_CLASS_MAPPINGS`/
+`NODE_DISPLAY_NAME_MAPPINGS`. `tools/smoke_preprocessors.py` grew from
+3 to 12 tests (a shared `_check_detector_backed_node()` helper fakes each
+architecture's Detector class to confirm the node wires it up and returns
+the right IMAGE batch shape/dtype without downloading real weights) - all
+pass, no GPU. Real-environment check against the actual portable ComfyUI:
+all 10 preprocessor nodes register correctly (69 total registered nodes,
+up from 59), and one real end-to-end run per architecture family (real
+HuggingFace download + real inference on a real image) confirmed output
+shape/dtype for all 8 newly-ported detectors, not just Depth Anything
+V2/Canny.
+
+**OpenPose (classic, 3-CNN body/hand/face) ported but NOT registered as
+a node.** `vendor/openpose.py` exists, compiles clean, and its port
+agent verified the same device-derivation discipline across all three
+sub-networks (`_Body`/`_Hand`/`_Face`) - but `open_pose/LICENSE` in the
+source pack turned out to be CMU's actual OpenPose license: "ACADEMIC OR
+NON-PROFIT ORGANIZATION NONCOMMERCIAL RESEARCH USE ONLY," explicitly
+forbidding sublicensing/transferring/"provid[ing] third parties access
+to" the software. That's a materially different, much more restrictive
+situation than every other license in this batch (Apache-2.0/MIT, one
+soft PiDiNet research-use note) - shipping this AS A REGISTERED NODE IN
+A PUBLICLY DISTRIBUTED REPO is a real legal question, not an engineering
+one, and not mine to decide unilaterally. Left the file in `vendor/`
+(not imported by `nodes/preprocessors.py`, not in any
+`NODE_CLASS_MAPPINGS`) pending the user's explicit decision - it does
+nothing and ships to no one until wired in.
+
+Not ported (per the approved plan, explicitly deferred): DWPose (the
+modern pose preprocessor - real extra scope, `onnxruntime`, two-stage
+detector+pose pipeline; worth its own dedicated follow-up), everything
+in the research pass's "heavy" tier (Metric3D, UniFormer, Mesh
+Graphormer, Diffusion Edge, Unimatch - each drags in a vendored
+framework or has an ill-fitting I/O shape), everything that's really a
+thin `transformers.from_pretrained(...)` wrapper upstream now (MiDaS,
+Zoe, Depth Anything v1, OneFormer, SAM, DensePose - porting these means
+adding a `transformers` dependency, a separate decision), and the ~15
+"no real model" utility nodes (Scribble, Binary, Tile, Color, Recolor,
+Shuffle, Inpaint, pose-keypoint-drawing helpers).

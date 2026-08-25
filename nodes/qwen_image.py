@@ -32,8 +32,6 @@ attachment point the loaded control checkpoint actually needs.
 """
 import logging
 
-import cv2
-import numpy as np
 import torch
 
 import comfy.controlnet
@@ -45,6 +43,7 @@ import node_helpers
 import nodes
 
 from ..vendor import depth_anything_v2
+from .preprocessors import Canny, _auto_canny_control_image, _depth_anything_batch
 
 logger = logging.getLogger(__name__)
 
@@ -100,20 +99,6 @@ class QwenImageControl:
     def __init__(self, kind, payload):
         self.kind = kind
         self.payload = payload
-
-
-def _auto_canny_control_image(image, low_threshold=100, high_threshold=200):
-    """Plain cv2.Canny edge detection - no model, no download, deterministic.
-    Same defaults comfyui_controlnet_aux's own Canny preprocessor uses.
-    """
-    out = []
-    for i in range(image.shape[0]):
-        np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
-        gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, low_threshold, high_threshold)
-        edges_rgb = np.repeat(edges[:, :, None], 3, axis=2)
-        out.append(torch.from_numpy(edges_rgb.astype(np.float32) / 255.0))
-    return torch.stack(out, dim=0)
 
 
 def _apply_controlnet_to_conditioning(conditioning, control_net, control_hint, strength, vae):
@@ -244,39 +229,6 @@ class QwenImageControlNetLoader:
         return (QwenImageControl("controlnet", control),)
 
 
-class QwenImageCanny:
-    """Canny edge detection - plain cv2.Canny, no model, no download.
-
-    Feed a source photo in, get an edge-map IMAGE out - a canny DiffSynth/
-    Union/Fun checkpoint's expected control_image input on QwenImageImg2Img.
-    Same logic QwenImageImg2Img's control_mode="auto_canny" uses internally,
-    exposed standalone so you can preview it and reuse it elsewhere -
-    matching Krea2DepthMap's role for depth.
-    """
-
-    CATEGORY = QWEN_IMAGE_CATEGORY
-    TITLE = "Qwen-Image Canny ⚡"
-    SEARCH_ALIASES = ['canny', 'edge detection', 'preprocessor',
-                       'controlnet preprocessor', 'image to canny', 'edge map']
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "detect"
-    DESCRIPTION = ("Canny edge detection for a canny Qwen-Image ControlNet's "
-                   "control_image input. No model, no download.")
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "low_threshold": ("INT", {"default": 100, "min": 0, "max": 255}),
-                "high_threshold": ("INT", {"default": 200, "min": 0, "max": 255}),
-            },
-        }
-
-    def detect(self, image, low_threshold=100, high_threshold=200):
-        return (_auto_canny_control_image(image, low_threshold, high_threshold),)
-
-
 class QwenImageImg2Img:
     """Prompts, init latent, and optional control attach for Qwen-Image - one node.
 
@@ -395,15 +347,7 @@ class QwenImageImg2Img:
             elif control_mode == "auto_depth" and image is not None:
                 logger.info("Qwen-Image: auto-deriving a depth map from image "
                             "(control_mode=auto_depth)")
-                detector = depth_anything_v2.DepthAnythingV2Detector(depth_ckpt_name).to(
-                    comfy.model_management.get_torch_device())
-                depth_batch = []
-                for i in range(image.shape[0]):
-                    np_image = (image[i].cpu().numpy() * 255.0).astype(np.uint8)
-                    depth_rgb = detector.estimate(np_image, resolution=512)
-                    depth_batch.append(torch.from_numpy(depth_rgb.astype(np.float32) / 255.0))
-                control_image = torch.stack(depth_batch, dim=0)
-                del detector
+                control_image = _depth_anything_batch(image, depth_ckpt_name)
             else:
                 raise ValueError(
                     "qwen_control was given, but no usable control_image is available. "
@@ -570,7 +514,10 @@ class QwenImageKSampler:
 NODE_CLASS_MAPPINGS = {
     "QwenImageModelLoader": QwenImageModelLoader,
     "QwenImageControlNetLoader": QwenImageControlNetLoader,
-    "QwenImageCanny": QwenImageCanny,
+    # Backward-compat alias: this node's logic moved to the shared
+    # nodes/preprocessors.py Canny class - old saved workflows using the
+    # "QwenImageCanny" type id keep resolving to a working node.
+    "QwenImageCanny": Canny,
     "QwenImageImg2Img": QwenImageImg2Img,
     "QwenImageKSampler": QwenImageKSampler,
 }
@@ -578,7 +525,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImageModelLoader": QwenImageModelLoader.TITLE,
     "QwenImageControlNetLoader": QwenImageControlNetLoader.TITLE,
-    "QwenImageCanny": QwenImageCanny.TITLE,
+    "QwenImageCanny": "Qwen-Image Canny ⚡",
     "QwenImageKSampler": QwenImageKSampler.TITLE,
     "QwenImageImg2Img": QwenImageImg2Img.TITLE,
 }
