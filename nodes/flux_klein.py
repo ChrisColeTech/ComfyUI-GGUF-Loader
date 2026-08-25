@@ -53,7 +53,7 @@ import folder_paths
 import node_helpers
 import nodes
 
-from . import depth_anything_v2
+from ..vendor import depth_anything_v2
 
 logger = logging.getLogger(__name__)
 
