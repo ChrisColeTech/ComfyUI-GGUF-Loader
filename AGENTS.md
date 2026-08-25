@@ -5,18 +5,41 @@ below was verified against real checkpoints and real ComfyUI code, not inferred.
 
 ## Repo layout
 
-- `nodes.py` — GGUF loader nodes (UNET/CLIP loaders, dual-VAE, ClipProj). Registers
-  `unet_gguf` / `clip_gguf` folder keys. Node category: `🤖 CCTech/GGUF`.
-- `nodes_scenema.py` — the Scenema Audio nodes (category `🤖 CCTech/Scenema`).
+The pack is a Python package (`__init__.py` at repo root doing `from .nodes import
+NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
+
+- `nodes/` — every ComfyUI node class, one module per feature area.
+  - `nodes/gguf.py` — the base GGUF loader nodes (UNET/CLIP loaders: `GGUFModelPatcher`,
+    `UnetLoaderGGUF(Advanced)`, `CLIPLoaderGGUF`, `Dual/Triple/QuadrupleCLIPLoaderGGUF`).
+    Registers `unet_gguf` / `clip_gguf` folder keys. Node category: `🤖 CCTech/GGUF`.
+  - `nodes/__init__.py` — aggregates every other `nodes/*.py` module's
+    `NODE_CLASS_MAPPINGS`/`NODE_DISPLAY_NAME_MAPPINGS` into one dict (order matters —
+    see the comments inline for why each import comes where it does).
+  - `nodes/scenema.py` — the Scenema Audio nodes (category `🤖 CCTech/Scenema`).
+  - `nodes/extra.py`, `nodes/minimax_h3_prompt.py` — DualVAELoader/ClipProjLoader, and
+    the MiniMax-H3 prompt-schema helper (CCTech's own, not vendored).
+  - `nodes/{flux_klein,krea2,lmstudio,ltx23,ltx25,minimax_h3,minimax_music,qwen_image,
+    qwen_tts,stems,zimage}.py` — the rest of the node families, one file each.
+- `ops/` — GGMLTensor/GGMLOps: weights stay quantized, dequant per-layer at forward
+  time. **This is the repo's core identity.** `ops/__init__.py` (was `ops.py`) is the
+  package's public surface; `ops/dequant.py` holds the low-level dequant kernels.
+- `vendor/` — ported/adapted third-party model code, each file's header says which
+  project it was ported from: `clipproj.py`, `depth_anything_v2.py`, `melband_arch.py`,
+  `seedvc.py`, `seedvc_arch.py`, `seedvc_utils.py`, `LICENSE-ClipProj`.
 - `loader.py` — GGUF → fake-quantized state dict (`gguf_sd_loader`), text-encoder
   post-processing (`gguf_clip_loader`: key remaps, Gemma-3 norm `+1` un-bake,
   sentencepiece tokenizer rebuild from GGUF metadata — now cached next to the
-  GGUF as `<name>.spiece_cache.bin`).
-- `ops.py` / `dequant.py` — GGMLTensor/GGMLOps: weights stay quantized, dequant
-  per-layer at forward time. **This is the repo's core identity.**
-- `nodes_extra.py`, `clipproj.py` — DualVAELoader, ClipProjLoader.
+  GGUF as `<name>.spiece_cache.bin`). Stays at repo root — distinct from `ops/`'s
+  low-level tensor ops.
 - `tools/smoke_scenema.py` — CPU dry-run of the Scenema load paths against real
   checkpoints (`--skip-te` skips the slow Gemma GGUF part).
+
+Cross-file relative imports: within `nodes/`, siblings import each other as
+`from .gguf import X`; things one level up (`loader.py`, `ops/`, `vendor/`) are
+`from ..loader import X` / `from ..ops import X` / `from ..vendor import X`. `import
+nodes` (unqualified, no dot) anywhere in the codebase means ComfyUI core's own global
+`nodes` module (e.g. `nodes.MAX_RESOLUTION`) — unrelated to this repo's `nodes/`
+package despite the name collision.
 
 Reference ComfyUI checkout used for verification: `D:\Projects\ComfyUI\upstream\ComfyUI`
 (rev 155 / v0.32.0 era). Weights: `D:\models\image-models\scenema-audio` (the

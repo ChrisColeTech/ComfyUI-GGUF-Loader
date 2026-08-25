@@ -1,10 +1,29 @@
+import importlib.util
+from pathlib import Path
+
 import pytest
 
-from minimax_h3_prompt import (build_prompt, duration_seconds, ensure_shot_marker,
-                               last_shot_index,
-                               looks_structured, on_frame_grid, parse_fields,
-                               reference_header, schema_problems, snap_to_frame_grid,
-                               strip_shot1_timestamp)
+# Loaded directly by file path (not `from nodes.minimax_h3_prompt import ...`)
+# since this module has no relative imports of its own, and going through the
+# `nodes` package name would trigger nodes/__init__.py's full node-aggregation
+# import chain, plus risks colliding with other tests' fake ComfyUI-core
+# `nodes` module stand-in.
+_spec = importlib.util.spec_from_file_location(
+    "minimax_h3_prompt", Path(__file__).resolve().parents[1] / "nodes" / "minimax_h3_prompt.py")
+_minimax_h3_prompt = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_minimax_h3_prompt)
+
+build_prompt = _minimax_h3_prompt.build_prompt
+duration_seconds = _minimax_h3_prompt.duration_seconds
+ensure_shot_marker = _minimax_h3_prompt.ensure_shot_marker
+last_shot_index = _minimax_h3_prompt.last_shot_index
+looks_structured = _minimax_h3_prompt.looks_structured
+on_frame_grid = _minimax_h3_prompt.on_frame_grid
+parse_fields = _minimax_h3_prompt.parse_fields
+reference_header = _minimax_h3_prompt.reference_header
+schema_problems = _minimax_h3_prompt.schema_problems
+snap_to_frame_grid = _minimax_h3_prompt.snap_to_frame_grid
+strip_shot1_timestamp = _minimax_h3_prompt.strip_shot1_timestamp
 
 
 # The instruction lines are fixed by MiniMax and must be reproduced verbatim, so

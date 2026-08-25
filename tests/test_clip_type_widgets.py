@@ -60,12 +60,13 @@ def _core_layout(with_single=True, with_dual=True, with_triple=False):
 
 
 def _import_nodes_module():
-    """Import the pack's nodes.py against stub Comfy modules.
+    """Import the pack's nodes/gguf.py against stub Comfy modules.
 
-    The heavyweight sibling modules (scenema, stems, ...) are pre-stubbed
-    in sys.modules so nodes.py's tail imports do not drag their deps in;
-    only the type-widget plumbing itself is under test here. sys.modules
-    is restored before returning so no other test can see the stubs.
+    Only the type-widget plumbing itself is under test here - nodes/gguf.py
+    no longer drags in the heavyweight sibling modules (scenema, stems, ...)
+    at all, that aggregation now lives in nodes/__init__.py, which this test
+    deliberately avoids importing. sys.modules is restored before returning
+    so no other test can see the stubs.
     """
     import torch
     saved_modules = dict(sys.modules)
@@ -100,17 +101,17 @@ def _import_nodes_module():
             package = types.ModuleType(_PKG)
             package.__path__ = [str(ROOT)]
             sys.modules[_PKG] = package
-        for name in ("nodes_extra", "nodes_scenema", "nodes_minimax_music",
-                     "nodes_stems", "nodes_minimax_h3", "nodes_ltx25"):
-            full = f"{_PKG}.{name}"
-            if full not in sys.modules:
-                stub = types.ModuleType(full)
-                stub.NODE_CLASS_MAPPINGS = {}
-                stub.NODE_DISPLAY_NAME_MAPPINGS = {}
-                sys.modules[full] = stub
+        # Fake the `nodes` subpackage too (pointed at the real nodes/ dir) so
+        # importing nodes.gguf doesn't run the real nodes/__init__.py
+        # aggregation - only the loader-class module itself is under test.
+        nodes_pkg_full = f"{_PKG}.nodes"
+        if nodes_pkg_full not in sys.modules:
+            nodes_package = types.ModuleType(nodes_pkg_full)
+            nodes_package.__path__ = [str(ROOT / "nodes")]
+            sys.modules[nodes_pkg_full] = nodes_package
 
-        full = f"{_PKG}.nodes"
-        spec = importlib.util.spec_from_file_location(full, ROOT / "nodes.py")
+        full = f"{_PKG}.nodes.gguf"
+        spec = importlib.util.spec_from_file_location(full, ROOT / "nodes" / "gguf.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules[full] = module
         spec.loader.exec_module(module)

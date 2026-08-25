@@ -1,6 +1,6 @@
 import torch
 
-from melband_arch import MelBandRoformer, librosa_mel_fn
+from vendor.melband_arch import MelBandRoformer, librosa_mel_fn
 
 
 def test_band_structure_matches_the_public_checkpoint():

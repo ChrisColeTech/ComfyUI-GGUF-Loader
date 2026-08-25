@@ -40,7 +40,13 @@ def load_pack_module(name):
         package = types.ModuleType(_PKG)
         package.__path__ = [str(ROOT)]
         sys.modules[_PKG] = package
-    spec = importlib.util.spec_from_file_location(full, ROOT / f"{name}.py")
+    pkg_init = ROOT / name / "__init__.py"
+    if pkg_init.is_file():
+        # name is now a package (e.g. ops/) rather than a flat module.
+        spec = importlib.util.spec_from_file_location(
+            full, pkg_init, submodule_search_locations=[str(ROOT / name)])
+    else:
+        spec = importlib.util.spec_from_file_location(full, ROOT / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[full] = module
     spec.loader.exec_module(module)

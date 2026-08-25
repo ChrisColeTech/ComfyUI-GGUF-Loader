@@ -7,7 +7,7 @@ import re
 import os
 
 from .ops import GGMLTensor
-from .dequant import is_quantized, dequantize_tensor
+from .ops.dequant import is_quantized, dequantize_tensor
 
 # Image / DiT / UNet GGUF architecture allowlist.
 # Keep in sync with the arch tags we write when quantizing custom models under

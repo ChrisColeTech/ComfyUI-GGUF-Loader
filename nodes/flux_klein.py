@@ -106,7 +106,7 @@ class FluxKleinModelLoader:
         }
 
     def load(self, unet_name, clip_name, vae_name):
-        from .nodes import UnetLoaderGGUF, CLIPLoaderGGUF
+        from .gguf import UnetLoaderGGUF, CLIPLoaderGGUF
 
         if unet_name.lower().endswith(".gguf"):
             model, = UnetLoaderGGUF().load_unet(unet_name)

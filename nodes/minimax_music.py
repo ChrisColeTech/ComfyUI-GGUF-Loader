@@ -12,8 +12,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .loader import gguf_clip_loader, gguf_sd_loader
-from .ops import GGMLOps
+from ..loader import gguf_clip_loader, gguf_sd_loader
+from ..ops import GGMLOps
 
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ def _load_diffusion(path):
     model = comfy.sd.load_diffusion_model_state_dict(
         sd, model_options={"custom_operations": GGMLOps()}, **kwargs)
     if model is not None:
-        from .nodes import GGUFModelPatcher
+        from .gguf import GGUFModelPatcher
         model = GGUFModelPatcher.clone(model)
     return model
 

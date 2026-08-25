@@ -32,8 +32,11 @@ def main():
     pkg = types.ModuleType("cctech_gguf_pkg")
     pkg.__path__ = [str(root)]
     sys.modules["cctech_gguf_pkg"] = pkg
-    ns = __import__("importlib").import_module("cctech_gguf_pkg.nodes_ltx23")
-    print("[ok] nodes_ltx23 imports")
+    nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
+    nodes_pkg.__path__ = [str(root / "nodes")]
+    sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
+    ns = __import__("importlib").import_module("cctech_gguf_pkg.nodes.ltx23")
+    print("[ok] nodes.ltx23 imports")
 
     video = ns._load_vae("ltxv23_uncensored_video_vae.safetensors", want_audio=False)
     assert type(video.first_stage_model).__name__ == "VideoVAE"
