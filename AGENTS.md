@@ -1477,3 +1477,75 @@ Not yet ported (tracked as remaining Klein work): `Flux2KleinColorAnchor`,
 repo's actual loaded Klein CLIP before porting), `Flux2KleinMaskRefController`,
 `Flux2KleinRefLatentController`+`Flux2KleinTextRefBalance`+
 `Flux2KleinRefLatentWeight`, `IdentityGuidance`.
+
+## Flux Klein: Part E, the rest of the pack (2026-08-25)
+
+Same file, `nodes_flux_klein.py`. Ported the remaining 10 nodes from
+ComfyUI-Flux2Klein-Enhancer - all straightforward, faithful translations,
+no architecture decisions needed since each reduces to one of the three
+mechanism families already established in Parts C/D:
+
+- `Flux2KleinColorAnchor` + `Flux2KleinIdentityGuidance` (renamed from
+  source's `IdentityGuidance` for naming consistency with the rest of
+  this file) both register via
+  `model.model_options["sampler_post_cfg_function"]` - confirmed this
+  only fires through comfy's own `CFGGuider`/`sampling_function`, so
+  BOTH require sampling through stock `KSampler` to do anything at all.
+  Ported as a list-append on a fresh copy (`list(...) + [fn]`) rather
+  than the source's `setdefault(...).append(...)` in-place mutation, to
+  avoid the clone potentially sharing the same list object as the
+  original model's `model_options` dict depending on how deep
+  `ModelPatcher.clone()`'s copy actually goes.
+- `Flux2KleinEnhancer`, `Flux2KleinDetailController`,
+  `Flux2KleinTextEnhancer`, `Flux2KleinMaskRefController` are pure
+  conditioning-dict mutation, no model hooks. `DetailController` reads
+  `meta["klein_sections"]` (from `SectionedEncoder`) for real section
+  boundaries, falls back to fixed 25/50/25 slicing without it - same
+  "honest about the fallback being arbitrary" framing as the source.
+- `Flux2KleinRefLatentController` + `Flux2KleinTextRefBalance` +
+  `Flux2KleinRefLatentWeight` are `set_model_attn1_patch` variants -
+  same hook family as Identity Feature Transfer's output patch, but
+  scaling K/V directly instead of pulling values toward a reference
+  bank.
+- `Flux2KleinSectionedEncoder` reaches into
+  `clip.tokenizer.qwen3_8b.tokenizer`/`.qwen3_4b.tokenizer` directly -
+  the ONE node in this whole port with a real Klein-CLIP-internals
+  dependency. Verified live against the user's real
+  `qwen3-4b-fp8_mixed.safetensors` Klein CLIP (loaded via
+  `comfy.sd.load_clip(..., clip_type=CLIPType.FLUX2)`):
+  `clip.tokenizer` is a real `KleinTokenizer`, `.qwen3_4b` is a real
+  `Qwen3Tokenizer` with `.tokenizer` being a genuine HF `Qwen2Tokenizer`
+  (`.qwen3_8b` is `None` on this 4B-text-encoder checkpoint, as
+  expected - the source's own dual-attribute check handles this by
+  design). Ports cleanly, confirmed rather than assumed.
+
+`tools/smoke_flux_klein.py` gained 14 more tests (now 28/28 total, no
+GPU): Color Anchor's inactive-without-reference guard and hook
+registration on a clone (not the original model); Enhancer's no-op
+passthrough (`out is cond`, no tensor copy) and active-region scaling;
+Detail Controller's real-vs-fallback section range selection; Text
+Enhancer's BOS-token-skipped magnitude scaling; Mask Ref Controller's
+black-mask full-attenuation and no-reference-latents passthrough; Ref
+Latent Controller/Text-Ref Balance/Ref Latent Weight's `attn1_patch`
+K/V-range scaling verified on synthetic q/k/v tensors with a fake
+`extra_options`; Identity Guidance's direct-mode pull math (denoised
+moves exactly halfway to the reference at strength=0.5) and sigma-window
+gating (no-op outside `[start_percent, end_percent]`); Sectioned
+Encoder's `klein_sections` emission with a fake HF tokenizer plus its
+graceful no-tokenizer fallback (still encodes, just no section metadata).
+
+Real-environment check: all 10 new nodes register with correct
+`INPUT_TYPES`/`RETURN_TYPES` (58 total registered nodes, up from 48);
+`Flux2KleinRefLatentController`, `Flux2KleinRefLatentWeight`,
+`Flux2KleinColorAnchor`, and `Flux2KleinIdentityGuidance` were each
+applied against the real GGUF-loaded `flux-2-klein-9b` `GGUFModelPatcher`
+and confirmed their respective hook (`attn1_patch` or
+`sampler_post_cfg_function`) actually lands in
+`model_options`/`transformer_options["patches"]` on the cloned model,
+not the original.
+
+This completes the Klein port plan (Parts A-E). Full parity with
+ComfyUI-Flux2Klein-Enhancer achieved except the two deliberate
+exclusions (`Flux2KleinKSamplerExperimental`, the source's own
+superseded Identity Feature Transfer V1/Advanced/V3) - both documented
+in the module docstring and README with the reasoning.

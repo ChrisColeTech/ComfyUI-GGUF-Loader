@@ -275,6 +275,227 @@ def test_identity_transfer_output_patch_noop_without_reference_tokens():
           "extra_options carries no reference tokens (e.g. non-Klein/non-Flux2 model)")
 
 
+# ── Part E: remaining simple Klein nodes ────────────────────────────────
+
+class _FakeSimpleModel:
+    def __init__(self):
+        self.model_options = {}
+        self.attn1_patch = None
+
+    def clone(self):
+        clone = _FakeSimpleModel()
+        clone.model_options = dict(self.model_options)
+        return clone
+
+    def set_model_attn1_patch(self, fn):
+        self.attn1_patch = fn
+
+
+def test_color_anchor_inactive_without_reference_latents():
+    node = fk.Flux2KleinColorAnchor()
+    model = _FakeSimpleModel()
+    positive = [[torch.zeros(1, 1, 4), {}]]
+    out, = node.apply(model, positive, strength=0.5)
+    assert "sampler_post_cfg_function" not in out.model_options
+    print("[ok] Flux2KleinColorAnchor: no reference_latents in conditioning -> inactive, no hook registered")
+
+
+def test_color_anchor_registers_post_cfg_hook_with_reference():
+    node = fk.Flux2KleinColorAnchor()
+    model = _FakeSimpleModel()
+    ref = torch.rand(1, 128, 8, 8)
+    positive = [[torch.zeros(1, 1, 4), {"reference_latents": [ref]}]]
+    out, = node.apply(model, positive, strength=0.5)
+    assert len(out.model_options["sampler_post_cfg_function"]) == 1
+    assert model.model_options.get("sampler_post_cfg_function") is None  # clone(), not mutate original
+    print("[ok] Flux2KleinColorAnchor: reference present -> registers sampler_post_cfg_function on a clone")
+
+
+def test_enhancer_noop_returns_conditioning_unchanged():
+    node = fk.Flux2KleinEnhancer()
+    cond = [[torch.rand(1, 4, 12), {}]]
+    out, = node.enhance(cond)
+    assert out is cond
+    print("[ok] Flux2KleinEnhancer: all-neutral params -> passthrough, no tensor copy")
+
+
+def test_enhancer_active_scale_multiplies_active_region():
+    node = fk.Flux2KleinEnhancer()
+    tensor = torch.ones(1, 4, 12)
+    cond = [[tensor, {}]]
+    out, = node.enhance(cond, active_scale=2.0)
+    assert torch.allclose(out[0][0], tensor * 2.0)
+    print("[ok] Flux2KleinEnhancer: active_scale=2.0 doubles the (fully-active) conditioning")
+
+
+def test_detail_controller_uses_klein_sections_when_present():
+    node = fk.Flux2KleinDetailController()
+    tensor = torch.ones(1, 6, 4)
+    cond = [[tensor, {"klein_sections": {"front": (0, 2), "mid": (2, 4), "end": (4, 6)}}]]
+    out, = node.control(cond, front_mult=2.0)
+    result = out[0][0]
+    assert torch.allclose(result[:, 0:2], tensor[:, 0:2] * 2.0)
+    assert torch.allclose(result[:, 2:6], tensor[:, 2:6])
+    print("[ok] Flux2KleinDetailController: klein_sections metadata drives real front/mid/end ranges")
+
+
+def test_detail_controller_falls_back_to_fixed_split_without_metadata():
+    node = fk.Flux2KleinDetailController()
+    tensor = torch.ones(1, 8, 4)
+    cond = [[tensor, {}]]
+    out, = node.control(cond, front_mult=3.0)
+    result = out[0][0]
+    # active_end=8 (no attention_mask) -> front = [0:2) (25% of 8)
+    assert torch.allclose(result[:, 0:2], tensor[:, 0:2] * 3.0)
+    assert torch.allclose(result[:, 2:8], tensor[:, 2:8])
+    print("[ok] Flux2KleinDetailController: no klein_sections -> fixed 25/50/25 fallback")
+
+
+def test_text_enhancer_magnitude_scales_active_region_skipping_bos():
+    node = fk.Flux2KleinTextEnhancer()
+    tensor = torch.ones(1, 4, 4)
+    cond = [[tensor, {}]]
+    out, = node.enhance(cond, magnitude=2.0)
+    result = out[0][0]
+    assert torch.allclose(result[:, 0], tensor[:, 0])  # BOS token untouched
+    assert torch.allclose(result[:, 1:], tensor[:, 1:] * 2.0)
+    print("[ok] Flux2KleinTextEnhancer: magnitude scales all but the skipped BOS token")
+
+
+def test_mask_ref_controller_attenuates_black_regions():
+    node = fk.Flux2KleinMaskRefController()
+    ref = torch.ones(1, 4, 4, 4)
+    cond = [[torch.zeros(1, 1, 4), {"reference_latents": [ref]}]]
+    mask = torch.zeros(4, 4)  # fully black -> full attenuation at strength=1.0
+    out, = node.apply_mask(cond, mask, strength=1.0)
+    new_ref = out[0][1]["reference_latents"][0]
+    assert torch.allclose(new_ref, torch.zeros_like(new_ref), atol=1e-5)
+    print("[ok] Flux2KleinMaskRefController: black mask + strength=1.0 zeroes the reference latent")
+
+
+def test_mask_ref_controller_noop_without_reference_latents():
+    node = fk.Flux2KleinMaskRefController()
+    cond = [[torch.zeros(1, 1, 4), {}]]
+    mask = torch.ones(4, 4)
+    out, = node.apply_mask(cond, mask, strength=1.0)
+    assert "reference_latents" not in out[0][1]
+    print("[ok] Flux2KleinMaskRefController: no reference_latents -> passthrough, no crash")
+
+
+def test_ref_latent_controller_registers_attn1_patch():
+    node = fk.Flux2KleinRefLatentController()
+    model = _FakeSimpleModel()
+    positive = [[torch.zeros(1, 1, 4), {}]]
+    out_model, out_cond = node.control(model, positive, strength=2.0, reference_index=0)
+    assert out_model.attn1_patch is not None
+    assert out_cond is positive
+    result = out_model.attn1_patch(
+        torch.zeros(1, 1, 3, 4), torch.ones(1, 1, 5, 4), torch.ones(1, 1, 5, 4),
+        extra_options={"reference_image_num_tokens": [2]})
+    assert torch.allclose(result["k"][:, :, -2:, :], torch.full((1, 1, 2, 4), 2.0))
+    assert torch.allclose(result["k"][:, :, :-2, :], torch.ones(1, 1, 3, 4))
+    print("[ok] Flux2KleinRefLatentController: attn1_patch scales only the addressed reference's K/V range")
+
+
+def test_text_ref_balance_scales_text_and_reference_oppositely():
+    node = fk.Flux2KleinTextRefBalance()
+    model = _FakeSimpleModel()
+    positive = [[torch.zeros(1, 1, 4), {}]]
+    out_model, _ = node.balance_streams(model, positive, balance=0.0)  # text_scale=0, ref_scale=1
+    k = torch.ones(1, 1, 6, 4)
+    result = out_model.attn1_patch(
+        torch.zeros(1, 1, 3, 4), k, k.clone(),
+        extra_options={"img_slice": (2, 6), "reference_image_num_tokens": [2]})
+    assert torch.allclose(result["k"][:, :, :2, :], torch.zeros(1, 1, 2, 4))  # text zeroed at balance=0
+    assert torch.allclose(result["k"][:, :, -2:, :], torch.ones(1, 1, 2, 4))  # ref untouched (ref_scale=1)
+    print("[ok] Flux2KleinTextRefBalance: balance=0.0 zeroes text tokens, leaves reference tokens at scale 1")
+
+
+def test_ref_latent_weight_registers_flat_multiplier():
+    node = fk.Flux2KleinRefLatentWeight()
+    model = _FakeSimpleModel()
+    out_model, = node.execute(model, reference_index=0, weight=3.0)
+    assert out_model.attn1_patch is not None
+    result = out_model.attn1_patch(
+        torch.zeros(1, 1, 2, 4), torch.ones(1, 1, 4, 4), torch.ones(1, 1, 4, 4),
+        extra_options={"reference_image_num_tokens": [2]})
+    assert torch.allclose(result["k"][:, :, -2:, :], torch.full((1, 1, 2, 4), 3.0))
+    print("[ok] Flux2KleinRefLatentWeight: flat weight multiplies only the addressed reference's K/V")
+
+
+def test_identity_guidance_direct_mode_pulls_toward_reference():
+    node = fk.Flux2KleinIdentityGuidance()
+    model = _FakeSimpleModel()
+    ref_latent = {"samples": torch.ones(1, 4, 8, 8) * 5.0}
+    out_model, = node.apply(model, ref_latent, strength=0.5, start_percent=0.0,
+                            end_percent=1.0, mode="direct")
+    fn = out_model.model_options["sampler_post_cfg_function"][0]
+    denoised = torch.zeros(1, 4, 8, 8)
+    result = fn({"denoised": denoised, "sigma": torch.tensor([0.5])})
+    assert torch.allclose(result, torch.full_like(denoised, 2.5))  # halfway to 5.0
+    print("[ok] Flux2KleinIdentityGuidance: direct mode pulls denoised halfway toward the reference at strength=0.5")
+
+
+def test_identity_guidance_outside_window_is_a_noop():
+    node = fk.Flux2KleinIdentityGuidance()
+    model = _FakeSimpleModel()
+    ref_latent = {"samples": torch.ones(1, 4, 8, 8) * 5.0}
+    out_model, = node.apply(model, ref_latent, strength=0.5, start_percent=0.9,
+                            end_percent=1.0, mode="direct")
+    fn = out_model.model_options["sampler_post_cfg_function"][0]
+    denoised = torch.zeros(1, 4, 8, 8)
+    result = fn({"denoised": denoised, "sigma": torch.tensor([0.5])})  # progress=0.5, outside [0.9,1.0]
+    assert torch.equal(result, denoised)
+    print("[ok] Flux2KleinIdentityGuidance: sigma progress outside [start,end] window -> no-op")
+
+
+def test_sectioned_encoder_emits_klein_sections_with_real_tokenizer():
+    node = fk.Flux2KleinSectionedEncoder()
+
+    class _FakeHFTokenizer:
+        def __call__(self, text, add_special_tokens=False, return_tensors=None):
+            return {"input_ids": text.split() if text else []}
+
+    class _FakeSub:
+        tokenizer = _FakeHFTokenizer()
+
+    class _FakeTokenizerHolder:
+        qwen3_4b = _FakeSub()
+
+    class _FakeClip:
+        tokenizer = _FakeTokenizerHolder()
+
+        def tokenize(self, text):
+            return text
+
+        def encode_from_tokens(self, tokens, return_pooled=True):
+            return torch.zeros(1, 4, 8), torch.zeros(1, 8)
+
+    cond, front, mid, end, full = node.encode_sectioned(
+        _FakeClip(), front_text="a b", mid_text="c", end_text="d e f", separator="comma")
+    ranges = cond[0][1]["klein_sections"]
+    assert set(ranges.keys()) == {"front", "mid", "end"}
+    assert front == "a b" and mid == "c" and end == "d e f"
+    print("[ok] Flux2KleinSectionedEncoder: emits klein_sections when the HF tokenizer path resolves")
+
+
+def test_sectioned_encoder_warns_without_tokenizer_but_still_encodes():
+    node = fk.Flux2KleinSectionedEncoder()
+
+    class _FakeClipNoTokenizer:
+        tokenizer = None
+
+        def tokenize(self, text):
+            return text
+
+        def encode_from_tokens(self, tokens, return_pooled=True):
+            return torch.zeros(1, 4, 8), torch.zeros(1, 8)
+
+    cond, *_ = node.encode_sectioned(_FakeClipNoTokenizer(), front_text="a")
+    assert "klein_sections" not in cond[0][1]
+    print("[ok] Flux2KleinSectionedEncoder: no HF tokenizer path -> still encodes, just no klein_sections metadata")
+
+
 if __name__ == "__main__":
     test_img2img_txt2img_uses_flux2_real_empty_latent_shape()
     test_img2img_with_image_uses_strength_as_denoise()
@@ -290,4 +511,20 @@ if __name__ == "__main__":
     test_identity_transfer_parse_ref_indices_all_and_ranges()
     test_identity_transfer_output_patch_pulls_generated_toward_reference()
     test_identity_transfer_output_patch_noop_without_reference_tokens()
+    test_color_anchor_inactive_without_reference_latents()
+    test_color_anchor_registers_post_cfg_hook_with_reference()
+    test_enhancer_noop_returns_conditioning_unchanged()
+    test_enhancer_active_scale_multiplies_active_region()
+    test_detail_controller_uses_klein_sections_when_present()
+    test_detail_controller_falls_back_to_fixed_split_without_metadata()
+    test_text_enhancer_magnitude_scales_active_region_skipping_bos()
+    test_mask_ref_controller_attenuates_black_regions()
+    test_mask_ref_controller_noop_without_reference_latents()
+    test_ref_latent_controller_registers_attn1_patch()
+    test_text_ref_balance_scales_text_and_reference_oppositely()
+    test_ref_latent_weight_registers_flat_multiplier()
+    test_identity_guidance_direct_mode_pulls_toward_reference()
+    test_identity_guidance_outside_window_is_a_noop()
+    test_sectioned_encoder_emits_klein_sections_with_real_tokenizer()
+    test_sectioned_encoder_warns_without_tokenizer_but_still_encodes()
     print("[ok] all nodes_flux_klein smoke tests passed")

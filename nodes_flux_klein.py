@@ -37,6 +37,7 @@ with it) and the source's own explicitly-superseded older Identity
 Feature Transfer / Advanced / V3 nodes (kept in the source only for ITS
 OWN backward compatibility).
 """
+import gc
 import logging
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -838,11 +839,912 @@ class Flux2KleinIdentityFeatureTransfer:
         return (m,)
 
 
+# ── Part E: remaining simple Klein nodes (ported from
+# ComfyUI-Flux2Klein-Enhancer, MIT, capitan01R) ─────────────────────────
+
+def _detect_active_end(meta: dict, seq_len: int, override: int) -> int:
+    """Active-region detection: honest attention_mask read, falls back to
+    the FULL sequence length (not a hardcoded 77) when no mask is present."""
+    if override > 0:
+        return min(override, seq_len)
+    attn_mask = meta.get("attention_mask", None)
+    if attn_mask is not None and attn_mask.dim() >= 2:
+        nonzero = attn_mask[0].nonzero()
+        if len(nonzero) > 0:
+            return int(nonzero[-1].item()) + 1
+    return seq_len
+
+
+def _klein_layer_slice_size(embed_dim: int) -> int:
+    """Klein conditioning stacks 3 Qwen3 hidden-layer slices along the embed
+    dim (12288 = 3*4096 for the 8B text encoder, 7680 = 3*2560 for 4B).
+    Returns the per-layer slice width, or embed_dim unchanged (disabling
+    the per-layer ops) for an unrecognized architecture."""
+    if embed_dim % 3 == 0:
+        return embed_dim // 3
+    return embed_dim
+
+
+class Flux2KleinColorAnchor:
+    """Nudge each denoising step's x0 prediction toward the reference
+    latent's per-channel spatial-mean color, ramping in over the course of
+    sampling. Registers via model_options["sampler_post_cfg_function"],
+    which only fires through comfy's own CFGGuider/sampling_function - a
+    stock KSampler (or anything using comfy's normal sampling pipeline) is
+    required for this to have any effect; it does nothing paired with a
+    hand-rolled sampling loop that bypasses CFGGuider."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Color Anchor ⚡"
+    SEARCH_ALIASES = ['color anchor', 'color correction', 'color drift', 'color match']
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    DESCRIPTION = ("Pulls each sampling step's color back toward a reference "
+                   "latent's channel means, ramping in over the run. Requires "
+                   "sampling through stock KSampler.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "conditioning": ("CONDITIONING",),
+                "strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+            },
+            "optional": {
+                "ramp_curve": ("FLOAT", {"default": 1.5, "min": 0.5, "max": 8.0, "step": 0.1}),
+                "ref_index": ("INT", {"default": 0, "min": 0, "max": 63}),
+                "channel_weights": (["uniform", "by_variance"], {"default": "uniform"}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def apply(self, model, conditioning, strength=0.5, ramp_curve=1.5,
+              ref_index=0, channel_weights="uniform", debug=False):
+        if strength == 0.0:
+            return (model,)
+
+        ref_means = None
+        ch_trust = None
+        for _, meta in conditioning:
+            rl = meta.get("reference_latents", None)
+            if rl is not None and ref_index < len(rl):
+                ref = rl[ref_index].float()
+                ref_means = ref.mean(dim=(-2, -1), keepdim=True)
+                if channel_weights == "by_variance":
+                    spatial_var = ref.var(dim=(-2, -1), keepdim=True)
+                    ch_trust = 1.0 / (1.0 + spatial_var)
+                    ch_trust = ch_trust / ch_trust.max().clamp(min=1e-8)
+                break
+
+        if ref_means is None:
+            logger.info("Flux2KleinColorAnchor: no reference latent found in "
+                        "conditioning - node inactive.")
+            return (model,)
+
+        _ref_means, _ch_trust = ref_means, ch_trust
+        _strength = strength
+        _curve = max(ramp_curve, 1e-3)
+        _state = {"sigma_max": None, "step": 0}
+
+        def _color_anchor_fn(args):
+            denoised = args["denoised"]
+            sigma = args["sigma"]
+            try:
+                s = sigma.max().item()
+            except (AttributeError, TypeError):
+                s = float(sigma)
+
+            if _state["sigma_max"] is None or s > _state["sigma_max"]:
+                _state["sigma_max"] = s
+                _state["step"] = 0
+
+            sigma_max = _state["sigma_max"]
+            sigma_progress = max(0.0, min(1.0, (sigma_max - s) / sigma_max if sigma_max > 1e-6 else 0.0))
+            _state["step"] += 1
+            step_progress = 1.0 - 0.5 ** _state["step"]
+            progress = max(sigma_progress, step_progress)
+            curved = progress ** (1.0 / _curve)
+            effective = _strength * curved
+            if effective < 1e-5:
+                return denoised
+
+            ref = _ref_means.to(denoised.device, dtype=denoised.dtype)
+            cur = denoised.mean(dim=(-2, -1), keepdim=True)
+            correction = ref - cur
+            if _ch_trust is not None:
+                correction = correction * _ch_trust.to(denoised.device, dtype=denoised.dtype)
+            corrected = denoised + correction * effective
+
+            if debug:
+                logger.info("Flux2KleinColorAnchor: step=%d sigma=%.4f progress=%.3f effective=%.3f",
+                            _state["step"], s, progress, effective)
+            return corrected
+
+        m = model.clone()
+        m.model_options["sampler_post_cfg_function"] = list(
+            m.model_options.get("sampler_post_cfg_function", [])) + [_color_anchor_fn]
+        return (m,)
+
+
+class Flux2KleinEnhancer:
+    """Scalar/whitening operations on the active-token region of Klein
+    conditioning, plus a Klein-specific per-Qwen3-layer scale (Klein
+    conditioning stacks 3 hidden-layer slices along the embed dim)."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Enhancer ⚡"
+    SEARCH_ALIASES = ['conditioning enhancer', 'prompt strength', 'contrast', 'whiten']
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "enhance"
+    DESCRIPTION = "Scalar/whitening/per-layer scaling on Klein's active-token conditioning region."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "active_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "per_token_whiten": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 5.0, "step": 0.05}),
+                "norm_equalize": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+            },
+            "optional": {
+                "early_layer_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05}),
+                "mid_layer_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05}),
+                "late_layer_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05}),
+                "preserve_original": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "active_end_override": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def enhance(self, conditioning, active_scale=1.0, per_token_whiten=0.0,
+                norm_equalize=0.0, early_layer_scale=1.0, mid_layer_scale=1.0,
+                late_layer_scale=1.0, preserve_original=0.0,
+                active_end_override=0, debug=False):
+        if not conditioning:
+            return (conditioning,)
+
+        no_op = (active_scale == 1.0 and per_token_whiten == 0.0 and norm_equalize == 0.0
+                  and early_layer_scale == 1.0 and mid_layer_scale == 1.0
+                  and late_layer_scale == 1.0 and preserve_original == 0.0)
+        if no_op:
+            return (conditioning,)
+
+        output = []
+        for idx, (cond_tensor, meta) in enumerate(conditioning):
+            original_dtype = cond_tensor.dtype
+            cond = cond_tensor.float()
+            if cond.dim() != 3:
+                output.append((cond_tensor, meta))
+                continue
+
+            seq_len, embed_dim = cond.shape[1], cond.shape[2]
+            active_end = _detect_active_end(meta, seq_len, active_end_override)
+            slice_w = _klein_layer_slice_size(embed_dim)
+
+            active = cond[:, :active_end, :].clone()
+            original_active = active.clone()
+
+            if per_token_whiten != 0.0:
+                seq_mean = active.mean(dim=1, keepdim=True)
+                active = seq_mean + (active - seq_mean) * (1.0 + per_token_whiten)
+
+            if norm_equalize > 0.0:
+                token_norms = active.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                target_norm = token_norms.mean()
+                normalized = active / token_norms * target_norm
+                active = active * (1.0 - norm_equalize) + normalized * norm_equalize
+
+            if active_scale != 1.0:
+                active = active * active_scale
+
+            if slice_w * 3 == embed_dim and (
+                early_layer_scale != 1.0 or mid_layer_scale != 1.0 or late_layer_scale != 1.0
+            ):
+                if early_layer_scale != 1.0:
+                    active[:, :, :slice_w] = active[:, :, :slice_w] * early_layer_scale
+                if mid_layer_scale != 1.0:
+                    active[:, :, slice_w:2 * slice_w] = active[:, :, slice_w:2 * slice_w] * mid_layer_scale
+                if late_layer_scale != 1.0:
+                    active[:, :, 2 * slice_w:] = active[:, :, 2 * slice_w:] * late_layer_scale
+
+            if preserve_original > 0.0:
+                active = active * (1.0 - preserve_original) + original_active * preserve_original
+
+            result = cond.clone()
+            result[:, :active_end, :] = active
+            if debug:
+                diff = (result - cond).abs()
+                logger.info("Flux2KleinEnhancer: item %d diff mean=%.6f max=%.6f",
+                            idx, diff.mean().item(), diff.max().item())
+            output.append((result.to(original_dtype), meta))
+
+        gc.collect()
+        return (output,)
+
+
+class Flux2KleinDetailController:
+    """Per-section conditioning multiplier. Reads meta["klein_sections"]
+    (emitted by Flux Klein Sectioned Encoder) for real section boundaries;
+    falls back to a fixed 25/50/25 split of the active region when that
+    metadata is absent (arbitrary boundaries - Qwen3 has no positional
+    semantic role for tokens; pair with the Sectioned Encoder for a
+    meaningful effect)."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Detail Controller ⚡"
+    SEARCH_ALIASES = ['detail controller', 'section multiplier', 'prompt section']
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "control"
+    DESCRIPTION = "Per-section (front/mid/end) conditioning multiplier, honest with Sectioned Encoder metadata."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"conditioning": ("CONDITIONING",)},
+            "optional": {
+                "front_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "mid_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "end_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "emphasis_start": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
+                "emphasis_end": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
+                "emphasis_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "preserve_original": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def control(self, conditioning, front_mult=1.0, mid_mult=1.0, end_mult=1.0,
+                emphasis_start=0, emphasis_end=0, emphasis_mult=1.0,
+                preserve_original=0.0, debug=False):
+        if not conditioning:
+            return (conditioning,)
+
+        no_op = (front_mult == 1.0 and mid_mult == 1.0 and end_mult == 1.0
+                  and (emphasis_end == 0 or emphasis_mult == 1.0)
+                  and preserve_original == 0.0)
+        if no_op:
+            return (conditioning,)
+
+        output = []
+        for idx, (cond_tensor, meta) in enumerate(conditioning):
+            original_dtype = cond_tensor.dtype
+            cond = cond_tensor.float()
+            if cond.dim() != 3:
+                output.append((cond_tensor, meta))
+                continue
+
+            seq_len = cond.shape[1]
+            active_end = _detect_active_end(meta, seq_len, 0)
+
+            sections = meta.get("klein_sections")
+            if sections and all(k in sections for k in ("front", "mid", "end")):
+                front_range, mid_range, end_range = sections["front"], sections["mid"], sections["end"]
+                source = "klein_sections (Sectioned Encoder, real boundaries)"
+            else:
+                num = active_end
+                f_end, m_end = int(num * 0.25), int(num * 0.75)
+                front_range, mid_range, end_range = (0, f_end), (f_end, m_end), (m_end, num)
+                source = "fixed 25/50/25 fallback (pair with Sectioned Encoder for real ranges)"
+
+            if debug:
+                logger.info("Flux2KleinDetailController: item %d active=[0:%d] source=%s front=%s mid=%s end=%s",
+                            idx, active_end, source, front_range, mid_range, end_range)
+
+            active = cond[:, :active_end, :].clone()
+            original_active = active.clone()
+
+            def _scale(rng, mult):
+                s, e = rng
+                s = max(0, min(s, active_end))
+                e = max(s, min(e, active_end))
+                if mult == 1.0 or e <= s:
+                    return
+                active[:, s:e, :] = active[:, s:e, :] * mult
+
+            _scale(front_range, front_mult)
+            _scale(mid_range, mid_mult)
+            _scale(end_range, end_mult)
+            if emphasis_end > 0 and emphasis_mult != 1.0:
+                _scale((emphasis_start, emphasis_end), emphasis_mult)
+            if preserve_original > 0.0:
+                active = active * (1.0 - preserve_original) + original_active * preserve_original
+
+            result = cond.clone()
+            result[:, :active_end, :] = active
+            output.append((result.to(original_dtype), meta))
+
+        gc.collect()
+        return (output,)
+
+
+class Flux2KleinTextEnhancer:
+    """Normalize / contrast / magnitude adjustments on the active text
+    conditioning region, with a safe (never sign-inverting) negative-
+    contrast formula."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Text Enhancer ⚡"
+    SEARCH_ALIASES = ['text enhancer', 'prompt magnitude', 'token contrast']
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "enhance"
+    DESCRIPTION = "Normalize/contrast/magnitude adjustments on the active text conditioning tokens."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "magnitude": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
+            },
+            "optional": {
+                "contrast": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05}),
+                "normalize_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "skip_bos": ("BOOLEAN", {"default": True}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def enhance(self, conditioning, magnitude=1.0, contrast=0.0,
+                normalize_strength=0.0, skip_bos=True, debug=False):
+        if not conditioning:
+            return (conditioning,)
+        if magnitude == 1.0 and contrast == 0.0 and normalize_strength == 0.0:
+            return (conditioning,)
+
+        import math
+        output = []
+        for cond_tensor, meta in conditioning:
+            cond = cond_tensor.float().clone()
+            seq_len = cond.shape[1]
+            active_end = _detect_active_end(meta, seq_len, 0)
+            start_idx = 1 if skip_bos else 0
+            active = cond[:, start_idx:active_end, :]
+
+            if normalize_strength > 0.0:
+                norms = active.norm(dim=-1, keepdim=True)
+                mean_norm = norms.mean()
+                normalized = active / (norms + 1e-8) * mean_norm
+                active = active * (1 - normalize_strength) + normalized * normalize_strength
+
+            if contrast != 0.0:
+                seq_mean = active.mean(dim=1, keepdim=True)
+                deviation = active - seq_mean
+                scale = (1.0 + contrast) if contrast >= 0 else math.exp(contrast)
+                active = seq_mean + deviation * scale
+
+            if magnitude != 1.0:
+                active = active * magnitude
+
+            cond[:, start_idx:active_end, :] = active
+            output.append((cond.to(cond_tensor.dtype), meta))
+        return (output,)
+
+
+_KLEIN_CHAT_TEMPLATE = (
+    "<|im_start|>user\n{}<|im_end|>\n"
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+)
+_KLEIN_SECTION_SEPARATORS = {"comma": ", ", "period": ". ", "space": " ", "newline": "\n"}
+
+
+def _klein_hf_tokenizer(clip):
+    """Return the underlying HF tokenizer (Qwen3-8B or Qwen3-4B Klein
+    variant) - confirmed against a real loaded Klein CLIP: clip.tokenizer
+    is a KleinTokenizer exposing .qwen3_4b (present) / .qwen3_8b (present
+    only on the 8B-text-encoder variant), each with a real HF .tokenizer."""
+    tok = getattr(clip, "tokenizer", None)
+    if tok is None:
+        return None
+    for attr in ("qwen3_8b", "qwen3_4b"):
+        sub = getattr(tok, attr, None)
+        if sub is not None and hasattr(sub, "tokenizer"):
+            return sub.tokenizer
+    return None
+
+
+def _klein_count_tokens(hf_tok, text: str) -> int:
+    if not text:
+        return 0
+    out = hf_tok(text, add_special_tokens=False, return_tensors=None)
+    return len(out["input_ids"])
+
+
+def _klein_wrapper_lengths(hf_tok) -> Tuple[int, int]:
+    prefix, suffix = _KLEIN_CHAT_TEMPLATE.split("{}")
+    return _klein_count_tokens(hf_tok, prefix), _klein_count_tokens(hf_tok, suffix)
+
+
+def _klein_section_ranges(hf_tok, sections: Dict[str, str], separator: str) -> Optional[Dict[str, Tuple[int, int]]]:
+    if hf_tok is None:
+        return None
+    prefix_len, _ = _klein_wrapper_lengths(hf_tok)
+    sep_len = _klein_count_tokens(hf_tok, separator) if separator else 0
+    front_n = _klein_count_tokens(hf_tok, sections.get("front", ""))
+    mid_n = _klein_count_tokens(hf_tok, sections.get("mid", ""))
+    end_n = _klein_count_tokens(hf_tok, sections.get("end", ""))
+
+    pos = prefix_len
+    ranges: Dict[str, Tuple[int, int]] = {}
+    ranges["front"] = (pos, pos + front_n)
+    pos += front_n
+    if front_n > 0 and mid_n > 0:
+        pos += sep_len
+    ranges["mid"] = (pos, pos + mid_n)
+    pos += mid_n
+    if (mid_n > 0 and end_n > 0) or (front_n > 0 and mid_n == 0 and end_n > 0):
+        pos += sep_len
+    ranges["end"] = (pos, pos + end_n)
+    return ranges
+
+
+def _klein_parse_marker_sections(text: str) -> Optional[Dict[str, str]]:
+    if not text:
+        return None
+    pattern = r"\[(FRONT|MID|END)\](.*?)(?=\[(?:FRONT|MID|END)\]|$)"
+    matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+    if not matches:
+        return None
+    sections = {"front": "", "mid": "", "end": ""}
+    for name, content in matches:
+        sections[name.lower()] = content.strip()
+    return sections
+
+
+class Flux2KleinSectionedEncoder:
+    """Tokenize a 3-section prompt (front/mid/end) and emit per-section
+    token ranges as conditioning metadata (meta["klein_sections"]) that
+    Flux Klein Detail Controller reads for real (not fixed-25/50/25)
+    section boundaries. The only node in this port with a real
+    Klein-CLIP-internals dependency - confirmed against a real loaded
+    Klein CLIP object that clip.tokenizer.qwen3_4b.tokenizer (or
+    .qwen3_8b.tokenizer on the 8B-text-encoder variant) is a genuine HF
+    tokenizer, not something this pack needs to reimplement."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Sectioned Encoder ⚡"
+    SEARCH_ALIASES = ['sectioned encoder', 'section prompt', 'front mid end']
+    RETURN_TYPES = ("CONDITIONING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("conditioning", "front_section", "mid_section", "end_section", "full_prompt")
+    FUNCTION = "encode_sectioned"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Tokenizes a front/mid/end sectioned prompt and stamps real per-section token ranges onto conditioning."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"clip": ("CLIP",)},
+            "optional": {
+                "front_text": ("STRING", {"multiline": True, "default": ""}),
+                "mid_text": ("STRING", {"multiline": True, "default": ""}),
+                "end_text": ("STRING", {"multiline": True, "default": ""}),
+                "combined_prompt": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Optional single prompt with [FRONT]/[MID]/[END] markers - "
+                               "overrides the three text boxes when non-empty and contains markers."}),
+                "separator": (list(_KLEIN_SECTION_SEPARATORS.keys()), {"default": "comma"}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def encode_sectioned(self, clip, front_text="", mid_text="", end_text="",
+                         combined_prompt="", separator="comma", debug=False):
+        marker_sections = _klein_parse_marker_sections(combined_prompt)
+        sections = marker_sections or {"front": front_text or "", "mid": mid_text or "", "end": end_text or ""}
+        sep_str = _KLEIN_SECTION_SEPARATORS.get(separator, ", ")
+        parts = [sections[k] for k in ("front", "mid", "end") if sections[k]]
+        full_prompt = sep_str.join(parts)
+
+        tokens = clip.tokenize(full_prompt)
+        cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+
+        hf_tok = _klein_hf_tokenizer(clip)
+        ranges = _klein_section_ranges(hf_tok, sections, sep_str)
+        meta: Dict = {"pooled_output": pooled}
+        if ranges is not None:
+            meta["klein_sections"] = ranges
+            if debug:
+                logger.info("Flux2KleinSectionedEncoder: klein_sections=%s", ranges)
+        else:
+            logger.warning("Flux2KleinSectionedEncoder: HF tokenizer not accessible on "
+                           "CLIP - no klein_sections metadata emitted; Detail Controller "
+                           "will fall back to fixed 25/50/25 slicing.")
+
+        return ([[cond, meta]], sections["front"], sections["mid"], sections["end"], full_prompt)
+
+
+class Flux2KleinMaskRefController:
+    """Spatially attenuate a reference latent using a painted mask -
+    multiplies it by a per-pixel scalar derived from the mask and replaces
+    meta["reference_latents"][reference_index] with the result."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Mask Ref Controller ⚡"
+    SEARCH_ALIASES = ['mask ref controller', 'reference mask', 'attenuate reference']
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "apply_mask"
+    DESCRIPTION = "Spatially attenuates a reference latent by a painted mask, replacing it in conditioning."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"conditioning": ("CONDITIONING",), "mask": ("MASK",)},
+            "optional": {
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+                "feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+                "reference_index": ("INT", {"default": 0, "min": 0, "max": 7, "step": 1}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    @staticmethod
+    def _resize_mask_to_latent(mask: torch.Tensor, lat_h: int, lat_w: int) -> torch.Tensor:
+        if mask.dim() == 2:
+            m = mask.unsqueeze(0).unsqueeze(0).float()
+        elif mask.dim() == 3:
+            m = mask[0:1].unsqueeze(1).float()
+        elif mask.dim() == 4:
+            m = mask[0:1, 0:1].float()
+        else:
+            raise ValueError(f"unexpected mask shape {tuple(mask.shape)}")
+        return F.interpolate(m, size=(lat_h, lat_w), mode="bilinear", align_corners=False)
+
+    @staticmethod
+    def _feather_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+        if radius <= 0:
+            return mask
+        sigma = max(radius / 3.0, 1e-6)
+        ax = torch.arange(radius * 2 + 1, dtype=torch.float32, device=mask.device) - radius
+        gauss_1d = torch.exp(-0.5 * (ax / sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        kernel = (gauss_1d.unsqueeze(0) * gauss_1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+        return F.conv2d(mask, kernel, padding=radius).clamp(0.0, 1.0)
+
+    def apply_mask(self, conditioning, mask, strength=1.0, invert_mask=False,
+                   feather=0, reference_index=0, debug=False):
+        if not conditioning or strength == 0.0:
+            return (conditioning,)
+
+        output = []
+        for idx, (cond_tensor, meta) in enumerate(conditioning):
+            new_meta = meta.copy()
+            ref_latents = meta.get("reference_latents", None)
+            if not ref_latents or reference_index >= len(ref_latents):
+                if debug:
+                    logger.info("Flux2KleinMaskRefController: item %d has no ref latent "
+                                "at index %d, skipping", idx, reference_index)
+                output.append((cond_tensor, new_meta))
+                continue
+
+            ref = ref_latents[reference_index].float().clone()
+            original_dtype = ref_latents[reference_index].dtype
+            _, num_ch, lat_h, lat_w = ref.shape
+
+            spatial_mask = self._resize_mask_to_latent(mask, lat_h, lat_w)
+            if invert_mask:
+                spatial_mask = 1.0 - spatial_mask
+            if feather > 0:
+                spatial_mask = self._feather_mask(spatial_mask, feather)
+
+            multiplier = (1.0 - strength * (1.0 - spatial_mask)).to(ref.device)
+            modified = ref * multiplier
+
+            new_refs = list(ref_latents)
+            new_refs[reference_index] = modified.to(original_dtype)
+            new_meta["reference_latents"] = new_refs
+            output.append((cond_tensor, new_meta))
+
+        gc.collect()
+        return (output,)
+
+
+def _klein_spatial_token_weights(num_tokens, ref_latent, mode, fade_strength, device):
+    if mode == "none" or ref_latent is None:
+        return None
+    _, _, H, W = ref_latent.shape
+    patch_size = 2
+    h_p = (H + patch_size // 2) // patch_size
+    w_p = (W + patch_size // 2) // patch_size
+    y = torch.linspace(0.0, 1.0, h_p, device=device)
+    x = torch.linspace(0.0, 1.0, w_p, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+    if mode == "center_out":
+        dist = torch.sqrt((yy - 0.5) ** 2 + (xx - 0.5) ** 2)
+        dist = dist / dist.max().clamp(min=1e-8)
+        weights = 1.0 - dist * fade_strength
+    elif mode == "edges_out":
+        dist = torch.sqrt((yy - 0.5) ** 2 + (xx - 0.5) ** 2)
+        dist = dist / dist.max().clamp(min=1e-8)
+        weights = (1.0 - fade_strength) + dist * fade_strength
+    elif mode == "top_down":
+        weights = 1.0 - yy * fade_strength
+    elif mode == "left_right":
+        weights = 1.0 - xx * fade_strength
+    else:
+        return None
+
+    weights = weights.clamp(0.0, 5.0).flatten()
+    n = weights.shape[0]
+    if n > num_tokens:
+        weights = weights[:num_tokens]
+    elif n < num_tokens:
+        weights = torch.cat([weights, torch.ones(num_tokens - n, device=device)])
+    return weights
+
+
+class Flux2KleinRefLatentController:
+    """Scale a specific reference's K/V contribution at every attention
+    block, with an optional spatial fade (center-out/edges-out/top-down/
+    left-right) over that reference's own token grid."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Ref Latent Controller ⚡"
+    SEARCH_ALIASES = ['ref latent controller', 'reference strength', 'spatial fade']
+    RETURN_TYPES = ("MODEL", "CONDITIONING")
+    FUNCTION = "control"
+    DESCRIPTION = "Scales one reference's K/V attention contribution, with an optional spatial fade."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "conditioning": ("CONDITIONING",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.05}),
+                "reference_index": ("INT", {"default": 0, "min": 0, "max": 7}),
+            },
+            "optional": {
+                "spatial_fade": (["none", "center_out", "edges_out", "top_down", "left_right"], {"default": "none"}),
+                "spatial_fade_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def control(self, model, conditioning, strength=1.0, reference_index=0,
+                spatial_fade="none", spatial_fade_strength=0.5, debug=False):
+        m = model.clone()
+
+        ref_latent = None
+        if conditioning and spatial_fade != "none":
+            for _, meta in conditioning:
+                rl = meta.get("reference_latents", None)
+                if rl and reference_index < len(rl):
+                    ref_latent = rl[reference_index]
+                    break
+
+        _strength, _ref_idx, _fade, _fade_s, _ref_latent = (
+            strength, reference_index, spatial_fade, spatial_fade_strength, ref_latent)
+
+        def ref_weight_patch(q, k, v, extra_options=None, **kwargs):
+            extra_options = extra_options or {}
+            ref_tokens = extra_options.get("reference_image_num_tokens", [])
+            if not ref_tokens or _ref_idx >= len(ref_tokens):
+                return {}
+
+            total_ref = sum(ref_tokens)
+            tok_start = sum(ref_tokens[:_ref_idx])
+            tok_end = tok_start + ref_tokens[_ref_idx]
+            num_ref_tok = ref_tokens[_ref_idx]
+            seq_start = -total_ref + tok_start
+            seq_end = -total_ref + tok_end
+
+            if _fade != "none" and _ref_latent is not None:
+                token_w = _klein_spatial_token_weights(num_ref_tok, _ref_latent, _fade, _fade_s, k.device)
+                scale = (_strength * token_w).view(1, 1, -1, 1).to(k.dtype) if token_w is not None else _strength
+            else:
+                scale = _strength
+
+            seq_end_idx = None if seq_end == 0 else seq_end
+            k = k.clone()
+            v = v.clone()
+            k[:, :, seq_start:seq_end_idx, :] = k[:, :, seq_start:seq_end_idx, :] * scale
+            v[:, :, seq_start:seq_end_idx, :] = v[:, :, seq_start:seq_end_idx, :] * scale
+            if debug:
+                logger.info("Flux2KleinRefLatentController: block=%s ref_index=%d tokens=[%d:%d] strength=%.3f",
+                            extra_options.get("block_index", "?"), _ref_idx, seq_start, seq_end, _strength)
+            return {"q": q, "k": k, "v": v}
+
+        m.set_model_attn1_patch(ref_weight_patch)
+        return (m, conditioning)
+
+
+class Flux2KleinTextRefBalance:
+    """Scale text-token vs. reference-token K/V contributions in opposite
+    directions from a single balance dial: 0.0 = text only, 1.0 = reference
+    only, 0.5 = both unscaled."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Text/Ref Balance ⚡"
+    SEARCH_ALIASES = ['text ref balance', 'prompt vs reference']
+    RETURN_TYPES = ("MODEL", "CONDITIONING")
+    FUNCTION = "balance_streams"
+    DESCRIPTION = "Single dial trading text-prompt strength against reference-image strength."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "conditioning": ("CONDITIONING",),
+                "balance": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+            "optional": {"debug": ("BOOLEAN", {"default": False})},
+        }
+
+    def balance_streams(self, model, conditioning, balance=0.5, debug=False):
+        m = model.clone()
+        if balance <= 0.5:
+            text_scale, ref_scale = balance * 2.0, 1.0
+        else:
+            text_scale, ref_scale = 1.0, (1.0 - balance) * 2.0
+
+        _text_s, _ref_s = text_scale, ref_scale
+
+        def balance_patch(q, k, v, extra_options=None, **kwargs):
+            extra_options = extra_options or {}
+            img_slice = extra_options.get("img_slice", None)
+            ref_tokens = extra_options.get("reference_image_num_tokens", [])
+            if img_slice is None and not ref_tokens:
+                return {}
+
+            k = k.clone()
+            v = v.clone()
+            if img_slice is not None and _text_s != 1.0:
+                txt_end = img_slice[0]
+                k[:, :, :txt_end, :] *= _text_s
+                v[:, :, :txt_end, :] *= _text_s
+            if ref_tokens and _ref_s != 1.0:
+                total_ref = sum(ref_tokens)
+                k[:, :, -total_ref:, :] *= _ref_s
+                v[:, :, -total_ref:, :] *= _ref_s
+            if debug:
+                logger.info("Flux2KleinTextRefBalance: block=%s txt_scale=%.3f ref_scale=%.3f",
+                            extra_options.get("block_index", "?"), _text_s, _ref_s)
+            return {"q": q, "k": k, "v": v}
+
+        m.set_model_attn1_patch(balance_patch)
+        return (m, conditioning)
+
+
+class Flux2KleinRefLatentWeight:
+    """Flat K/V weight multiplier for a single reference's tokens - the
+    simple case of Ref Latent Controller with no conditioning input or
+    spatial fade needed."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Ref Latent Weight ⚡"
+    SEARCH_ALIASES = ['ref latent weight', 'reference weight']
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "execute"
+    DESCRIPTION = "Flat attention K/V weight multiplier for one reference's tokens."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "reference_index": ("INT", {"default": 0, "min": 0, "max": 7}),
+                "weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05}),
+            },
+        }
+
+    def execute(self, model, reference_index, weight):
+        m = model.clone()
+        _ref_idx, _weight = reference_index, weight
+
+        def ref_weight_patch(q, k, v, extra_options=None, **kwargs):
+            extra_options = extra_options or {}
+            ref_tokens = extra_options.get("reference_image_num_tokens", [])
+            if not ref_tokens or _ref_idx >= len(ref_tokens):
+                return {}
+            total_ref = sum(ref_tokens)
+            tok_start = sum(ref_tokens[:_ref_idx])
+            tok_end = tok_start + ref_tokens[_ref_idx]
+            seq_start = -total_ref + tok_start
+            seq_end = -total_ref + tok_end
+            seq_end_idx = None if seq_end == 0 else seq_end
+            k = k.clone()
+            v = v.clone()
+            k[:, :, seq_start:seq_end_idx, :] *= _weight
+            v[:, :, seq_start:seq_end_idx, :] *= _weight
+            return {"q": q, "k": k, "v": v}
+
+        m.set_model_attn1_patch(ref_weight_patch)
+        return (m,)
+
+
+class Flux2KleinIdentityGuidance:
+    """Sampling-loop correction: pulls each step's x0 prediction toward a
+    VAE-encoded identity reference latent, over a configurable sigma
+    window, via one of three blend modes. Registers via
+    model_options["sampler_post_cfg_function"] - same stock-KSampler
+    requirement as Flux2KleinColorAnchor."""
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein Identity Guidance ⚡"
+    SEARCH_ALIASES = ['identity guidance', 'identity correction', 'sampling loop correction']
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    DESCRIPTION = "Pulls each sampling step toward a reference latent over a sigma window. Requires sampling through stock KSampler."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "identity_latent": ("LATENT", {"tooltip": "VAE-encoded reference image at full resolution."}),
+                "strength": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "end_percent": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "mode": (["adaptive", "direct", "channel_match"], {"default": "adaptive"}),
+            },
+        }
+
+    def apply(self, model, identity_latent, strength=0.3,
+              start_percent=0.0, end_percent=0.8, mode="adaptive"):
+        m = model.clone()
+        ref = identity_latent["samples"]
+        _ref, _strength, _start, _end, _mode = ref, strength, start_percent, end_percent, mode
+
+        def post_cfg_fn(args):
+            denoised = args["denoised"]
+            sigma = args["sigma"]
+            s_now = float(sigma.flatten()[0])
+            progress = max(0.0, min(1.0, 1.0 - s_now))
+            if progress < _start or progress > _end:
+                return denoised
+
+            ref_resized = _ref.to(device=denoised.device, dtype=denoised.dtype)
+            if ref_resized.shape[0] != denoised.shape[0]:
+                ref_resized = ref_resized[:1].expand(denoised.shape[0], -1, -1, -1)
+            if ref_resized.shape[2:] != denoised.shape[2:]:
+                ref_resized = F.interpolate(ref_resized, size=denoised.shape[2:], mode="bilinear", align_corners=False)
+            if ref_resized.shape[1] != denoised.shape[1]:
+                if ref_resized.shape[1] > denoised.shape[1]:
+                    ref_resized = ref_resized[:, :denoised.shape[1]]
+                else:
+                    ref_resized = F.pad(ref_resized, (0, 0, 0, 0, 0, denoised.shape[1] - ref_resized.shape[1]))
+
+            if _mode == "direct":
+                denoised = denoised + (ref_resized - denoised) * _strength
+            elif _mode == "adaptive":
+                d_flat = denoised.flatten(2)
+                r_flat = ref_resized.flatten(2)
+                cos_sim = F.cosine_similarity(d_flat, r_flat, dim=1)
+                weight = cos_sim.clamp(0.0, 1.0).unsqueeze(1).view(
+                    denoised.shape[0], 1, denoised.shape[2], denoised.shape[3])
+                denoised = denoised + (ref_resized - denoised) * weight * _strength
+            elif _mode == "channel_match":
+                ref_mean = ref_resized.mean(dim=(2, 3), keepdim=True)
+                ref_std = ref_resized.std(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+                den_mean = denoised.mean(dim=(2, 3), keepdim=True)
+                den_std = denoised.std(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+                matched = (denoised - den_mean) / den_std * ref_std + ref_mean
+                denoised = denoised + (matched - denoised) * _strength
+            return denoised
+
+        m.model_options["sampler_post_cfg_function"] = list(
+            m.model_options.get("sampler_post_cfg_function", [])) + [post_cfg_fn]
+        return (m,)
+
+
 NODE_CLASS_MAPPINGS = {
     "FluxKleinModelLoader": FluxKleinModelLoader,
     "FluxKleinImg2Img": FluxKleinImg2Img,
     "Flux2KleinMultiReferenceLatent": Flux2KleinMultiReferenceLatent,
     "Flux2KleinIdentityFeatureTransfer": Flux2KleinIdentityFeatureTransfer,
+    "Flux2KleinColorAnchor": Flux2KleinColorAnchor,
+    "Flux2KleinEnhancer": Flux2KleinEnhancer,
+    "Flux2KleinDetailController": Flux2KleinDetailController,
+    "Flux2KleinTextEnhancer": Flux2KleinTextEnhancer,
+    "Flux2KleinSectionedEncoder": Flux2KleinSectionedEncoder,
+    "Flux2KleinMaskRefController": Flux2KleinMaskRefController,
+    "Flux2KleinRefLatentController": Flux2KleinRefLatentController,
+    "Flux2KleinTextRefBalance": Flux2KleinTextRefBalance,
+    "Flux2KleinRefLatentWeight": Flux2KleinRefLatentWeight,
+    "Flux2KleinIdentityGuidance": Flux2KleinIdentityGuidance,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -850,4 +1752,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxKleinImg2Img": FluxKleinImg2Img.TITLE,
     "Flux2KleinMultiReferenceLatent": Flux2KleinMultiReferenceLatent.TITLE,
     "Flux2KleinIdentityFeatureTransfer": Flux2KleinIdentityFeatureTransfer.TITLE,
+    "Flux2KleinColorAnchor": Flux2KleinColorAnchor.TITLE,
+    "Flux2KleinEnhancer": Flux2KleinEnhancer.TITLE,
+    "Flux2KleinDetailController": Flux2KleinDetailController.TITLE,
+    "Flux2KleinTextEnhancer": Flux2KleinTextEnhancer.TITLE,
+    "Flux2KleinSectionedEncoder": Flux2KleinSectionedEncoder.TITLE,
+    "Flux2KleinMaskRefController": Flux2KleinMaskRefController.TITLE,
+    "Flux2KleinRefLatentController": Flux2KleinRefLatentController.TITLE,
+    "Flux2KleinTextRefBalance": Flux2KleinTextRefBalance.TITLE,
+    "Flux2KleinRefLatentWeight": Flux2KleinRefLatentWeight.TITLE,
+    "Flux2KleinIdentityGuidance": Flux2KleinIdentityGuidance.TITLE,
 }
