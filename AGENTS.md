@@ -1922,3 +1922,73 @@ node-type names confirmed absent from `NODE_CLASS_MAPPINGS`, all 8
 kept/alias names confirmed present, `FluxKleinImg2Img` with
 `control_mode="none"` and `control_mode="auto_canny"` both verified
 against a real loaded Klein VAE/CLIP - node count exactly 50.
+
+## Fix: FluxKleinImg2Img canvas sizing + dual reference_image_2 (2026-08-25)
+
+User traced a real broken img2img result back to a specific real shipped
+example workflow, `image_flux2_klein_image_edit_9b_base.json`, and asked
+us to confirm `FluxKleinImg2Img` does the same thing. It didn't, in two
+ways:
+
+1. **Canvas sizing was disconnected from the actual reference photo.**
+   `width`/`height` were plain user-typed widget defaults (1024x1024)
+   trusted as exact - used to center-crop-resize (`comfy.utils.common_
+   upscale(..., "center")`) any connected reference image to that exact
+   aspect ratio, and to build the empty-latent canvas independently of
+   the photo's own shape. The real workflow never does this: every
+   reference photo goes through `ImageScaleToTotalPixels` (aspect-
+   preserving resize to a fixed megapixel budget) then `GetImageSize`,
+   and THAT derived size feeds `EmptyFlux2LatentImage`/`Flux2Scheduler`
+   - the canvas always matches the reference photo's own aspect ratio,
+   never an independent literal size. Confirmed by direct JSON graph
+   inspection of the shipped workflow (two subgraphs sharing a name but
+   different UUIDs - a single-reference 9B one and a dual-reference
+   9B-base one), not assumed.
+
+2. **Only one reference image slot existed.** The real workflow's
+   dual-reference subgraph (node 92: "apply the logo from image 2 onto
+   the car in image 1") uses TWO `LoadImage` nodes, each independently
+   scaled and VAE-encoded, then chained via two sequential
+   `ReferenceLatent` calls per conditioning branch (positive and
+   negative) - the second image's reference attached on top of the
+   first's, both raw, no preprocessing on either.
+
+Fixed both: new `_scale_to_megapixels(image, megapixels, resolution_
+steps=16)` helper is an aspect-preserving port of comfy core's own
+`ImageScaleToTotalPixels` math (`comfy_extras/nodes_post_processing.py`)
+- `resolution_steps=16` is a deliberate deviation from the real
+workflow's own `resolution_steps=1`, chosen to stay aligned with
+Flux.2's real `/16` latent downscale stride and avoid a fractional-
+latent-pixel edge case; not an unverified guess. `width`/`height` are
+now a pixel budget: whenever `image`, `reference_image`, or the new
+`reference_image_2` is connected, the real canvas re-derives from that
+photo's own aspect ratio at the same budget, with `image` taking
+priority over `reference_image` over `reference_image_2` for sizing.
+Pure txt2img (nothing connected) still uses `width`/`height` literally.
+`reference_image_2` is raw-only (no `control_mode` dispatch - that
+still only applies to `reference_image`), attached after
+`reference_image` on both positive and negative conditioning, matching
+the real dual-reference chain exactly.
+
+User's explicit note: `image`/`reference_image`/`reference_image_2`'s
+naming is confusing (`reference_image` reads like "the ControlNet
+image" but is really Klein's general edit-reference mechanism) - a
+separate, later, repo-wide renaming pass was explicitly deferred, not
+folded into this fix.
+
+`tools/smoke_flux_klein.py` gained 6 tests (26 total): `_scale_to_
+megapixels` aspect-ratio/megapixel-budget/rounding correctness on its
+own, the actual bug scenario (non-square `reference_image` no longer
+forced into the square widget default - asserted via real latent
+shape), `image`-vs-`reference_image` sizing priority (asserted via a
+custom fake VAE that records the shape actually passed into `encode()`,
+since the shared `_vae()` fixture's fixed-shape return value would have
+made a naive output-shape assertion pass trivially regardless of
+whether the fix worked), and `reference_image_2` attaching raw
+alongside `reference_image` both combined and standalone. Real-
+environment check against the actual portable ComfyUI install, the real
+Flux.2 VAE, and a real loaded Klein CLIP: a 2:1 landscape
+`reference_image` produced a 91x45 (non-square, correctly-proportioned)
+latent instead of the old square default, and `reference_image` +
+`reference_image_2` together produced exactly 2 `reference_latents`
+entries on both positive and negative conditioning.

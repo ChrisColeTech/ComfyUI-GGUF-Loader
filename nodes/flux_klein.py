@@ -87,6 +87,28 @@ def _resize_image(image, width, height, upscale_method="lanczos", crop="center")
     return resized.movedim(1, -1).clamp(0.0, 1.0)
 
 
+def _scale_to_megapixels(image, megapixels, resolution_steps=16):
+    """Aspect-preserving resize to hit `megapixels` million pixels total,
+    rounded to the nearest multiple of resolution_steps. Exact port of
+    comfy_extras/nodes_post_processing.py's ImageScaleToTotalPixels math
+    (scale_by = sqrt(total / (w*h)), each dim rounded to resolution_steps) -
+    confirmed against the real shipped Klein example workflow
+    (image_flux2_klein_image_edit_9b_base.json), which chains
+    ImageScaleToTotalPixels -> GetImageSize -> EmptyFlux2LatentImage/
+    Flux2Scheduler so the canvas ALWAYS matches the reference photo's own
+    aspect ratio - never an independent user-typed width/height. Default
+    resolution_steps=16 (not comfy's default of 1) to stay aligned with
+    Flux.2's real /16 latent downscale, avoiding a fractional-pixel latent
+    edge; the shipped workflow itself used resolution_steps=1, so this is a
+    deliberate, safer deviation, not an unverified guess."""
+    h, w = image.shape[1], image.shape[2]
+    total = megapixels * 1024 * 1024
+    scale_by = (total / (w * h)) ** 0.5
+    new_w = max(resolution_steps, round(w * scale_by / resolution_steps) * resolution_steps)
+    new_h = max(resolution_steps, round(h * scale_by / resolution_steps) * resolution_steps)
+    return int(new_w), int(new_h)
+
+
 # ── Nodes ─────────────────────────────────────────────────────────────────
 
 class FluxKleinModelLoader:
@@ -173,14 +195,33 @@ class FluxKleinImg2Img:
     Krea2Img2Img/QwenImageImg2Img already use for control types they don't
     auto-derive.
 
-    `image` (img2img partial-denoise starting point) and `reference_image`
-    (conditioning-only reference) are independent and answer different
-    questions - what to start denoising from vs. what identity/structure to
-    reference - matching this pack's edit_reference convention on Krea2Img2Img/
-    QwenImageImg2Img. For 3+ references or advanced reference-conditioning
-    tools (color anchoring, per-reference weighting, identity guidance),
-    install the separate ComfyUI-Flux-Reference-Tools package - those nodes
-    work on any Flux-family model including Klein, not just this one.
+    `image` (img2img partial-denoise starting point) and `reference_image`/
+    `reference_image_2` (conditioning-only references) are independent and
+    answer different questions - what to start denoising from vs. what
+    identity/structure to reference - matching this pack's edit_reference
+    convention on Krea2Img2Img/QwenImageImg2Img. `reference_image_2` exists
+    because the real shipped example workflow's own 9B-base dual-reference
+    subgraph (image_flux2_klein_image_edit_9b_base.json) chains exactly two
+    references onto both positive and negative conditioning in sequence -
+    confirmed by tracing its actual node graph, not assumed. It's always
+    attached RAW (no control_mode preprocessing), matching that workflow.
+    For 3+ references or advanced reference-conditioning tools (color
+    anchoring, per-reference weighting, identity guidance), install the
+    separate ComfyUI-Flux-Reference-Tools package - those nodes work on any
+    Flux-family model including Klein, not just this one.
+
+    `width`/`height` are the pixel BUDGET (width*height), not necessarily
+    the exact output size: whenever `image` or a reference image is
+    connected, the canvas is re-derived from that photo's own aspect ratio
+    at the same total pixel count (aspect-preserving, `_scale_to_megapixels`,
+    matching the real example workflow's own
+    ImageScaleToTotalPixels -> GetImageSize -> EmptyFlux2LatentImage chain
+    exactly) - `width`/`height` are used as-given only for pure txt2img
+    (no image, no reference_image). This was a real bug before it was
+    fixed: `width`/`height` used to be trusted as exact independent of any
+    connected photo, silently distorting the reference image via a center-
+    crop resize to a mismatched aspect ratio, and generating a canvas that
+    didn't match it.
 
     The empty-latent (txt2img) path uses Flux.2's REAL shape - confirmed
     via comfy_extras/nodes_flux.py's EmptyFlux2LatentImage:
@@ -220,7 +261,12 @@ class FluxKleinImg2Img:
                                        "tooltip": "img2img only. How much of the init image "
                                                   "to discard. Ignored without an image."}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
-                "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
+                "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16,
+                                  "tooltip": "Pixel budget (width*height), not necessarily the exact "
+                                             "output size - if image/reference_image is connected, "
+                                             "the canvas is re-derived from that photo's own aspect "
+                                             "ratio at this same total pixel count. Used as-given "
+                                             "only for pure txt2img."}),
                 "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
             },
             "optional": {
@@ -232,6 +278,11 @@ class FluxKleinImg2Img:
                                                "for a pure reference-driven edit, leave `image` "
                                                "unconnected (txt2img latent) and connect only "
                                                "this."}),
+                "reference_image_2": ("IMAGE", {"tooltip": "A second reference image, matching "
+                                               "the real example workflow's dual-reference "
+                                               "subgraph - always attached raw (no control_mode "
+                                               "preprocessing), chained onto positive+negative "
+                                               "after reference_image."}),
                 "control_mode": (_CONTROL_MODES, {"default": "manual",
                     "tooltip": "manual: attach reference_image raw. auto_depth: run it through "
                                "Depth Anything V2 first - reproduces the real example workflow's "
@@ -252,8 +303,21 @@ class FluxKleinImg2Img:
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
-                width, height, image=None, reference_image=None, control_mode="manual",
-                depth_ckpt_name="depth_anything_v2_vitb.pth"):
+                width, height, image=None, reference_image=None, reference_image_2=None,
+                control_mode="manual", depth_ckpt_name="depth_anything_v2_vitb.pth"):
+        # width/height are a pixel BUDGET, not necessarily the exact output
+        # size - re-derive the real canvas from whichever photo defines it
+        # (image takes priority as the actual img2img target; else the
+        # first connected reference), matching the real example workflow's
+        # own ImageScaleToTotalPixels -> GetImageSize -> EmptyFlux2LatentImage
+        # chain exactly, instead of trusting a user-typed value that may not
+        # match the photo's aspect ratio.
+        size_source = image if image is not None else (
+            reference_image if reference_image is not None else reference_image_2)
+        if size_source is not None:
+            megapixels = (width * height) / (1024.0 * 1024.0)
+            width, height = _scale_to_megapixels(size_source, megapixels)
+
         if image is None:
             # Flux.2's real empty-latent shape - see class docstring for why
             # this can't use the generic /8-downscale placeholder.
@@ -294,6 +358,18 @@ class FluxKleinImg2Img:
             negative = node_helpers.conditioning_set_values(negative, values, append=True)
             logger.info("Flux Klein: reference_image (%s) attached to positive+negative "
                         "conditioning as reference_latents", control_mode)
+
+        if reference_image_2 is not None:
+            # Always raw - matches the real example workflow's dual-reference
+            # subgraph exactly (both images plain VAEEncode -> ReferenceLatent,
+            # no preprocessing on either).
+            ref2_pixels = _resize_image(reference_image_2, width, height)
+            ref2_latent = vae.encode(ref2_pixels[:, :, :, :3])
+            values2 = {"reference_latents": [ref2_latent]}
+            positive = node_helpers.conditioning_set_values(positive, values2, append=True)
+            negative = node_helpers.conditioning_set_values(negative, values2, append=True)
+            logger.info("Flux Klein: reference_image_2 (raw) attached to positive+negative "
+                        "conditioning as reference_latents")
 
         return (model, positive, negative, {"samples": latent}, denoise)
 
