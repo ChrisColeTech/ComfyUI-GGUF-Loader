@@ -2349,3 +2349,80 @@ actual portable ComfyUI: both nodes register with the documented
 `INPUT_TYPES`, and the wrapper-registration-to-`transformer_options`
 bridge was confirmed against real `comfy.model_patcher.ModelPatcher`/
 `comfy.sampler_helpers` objects, not fakes.
+
+## Split img2img and ControlNet img2img into separate nodes: Krea2, Qwen-Image, Klein (2026-08-26)
+
+User's directive after the Krea2 GGUF/fp8 debugging session and the
+Krea2 Identity Edit port: two real bugs this session traced back to the
+exact same root cause - one node's `IMAGE` inputs doing two structurally
+different jobs at once ("what to partially denoise/reference" and "what
+control map to derive/attach") - `FluxKleinImg2Img`'s `control_mode=
+none` silently skipping the entire reference attachment, and
+`Krea2Img2Img`'s `auto_canny` derivation breaking when a photo moved off
+`image` onto a reference slot. Rather than keep patching one blurred
+node per model, the fix: split *every* image model's img2img node into
+two separate, independent, standalone nodes - a plain img2img node with
+zero control-related inputs, and a `*ControlNetImg2Img` node with
+everything the current combined node already has (img2img inputs *and*
+control inputs together - full superset, not control-only). Each node
+is complete on its own; there is no dependency between them, and no
+chained "Apply" step - a misread of the instruction, corrected by the
+user ("i didnt say anything about an apply node, where did that come
+from").
+
+Scope: Krea2, Qwen-Image, Klein this pass. Z-Image (`nodes/zimage.py`,
+`ZImageImg2Img`) has the exact same blurred pattern (`image` mixed with
+`control_patch`/`control_image`) but is explicitly deferred to a
+follow-up alongside the LTX models, per the user's own sequencing.
+
+Same mechanical pattern in all three files - duplicate the existing
+combined class, trim one copy down to `images` only (drop every
+control-related input and the control-guard logic entirely - a Control
+LoRA loaded upstream with the plain node in use now surfaces the
+model's own wrapper-level error at sample time instead of a friendly
+node-level guard, since the plain node has no way to attach a control
+latent at all), keep the other copy exactly as the current node already
+is, renamed `*ControlNetImg2Img`:
+
+- `nodes/krea2.py`: `Krea2Img2Img` (trimmed) + `Krea2ControlNetImg2Img`
+  (new, has `control_mode`/`control_image`/`depth_ckpt_name`/
+  `control_channel_mode`/`control_normalize`/`control_invert`/
+  `control_batch_mode` and the `has_control_lora` guard).
+- `nodes/qwen_image.py`: `QwenImageImg2Img` (trimmed) +
+  `QwenImageControlNetImg2Img` (new, has `qwen_control`/`control_mode`/
+  `depth_ckpt_name`/`control_image`/`mask`/`control_strength`, both
+  attachment paths - DiffSynth model-patch vs. real ControlNet-on-
+  conditioning - unchanged).
+- `nodes/flux_klein.py`: `FluxKleinImg2Img` (trimmed, `images` only,
+  canvas-sizing now derives from `images` alone) +
+  `FluxKleinControlNetImg2Img` (new, has `control_source_image`/
+  `control_mode`/`depth_ckpt_name`, canvas-sizing priority `images` then
+  `control_source_image` unchanged).
+
+This is a real breaking change for any saved workflow using a control
+input by name on the old combined node type (the socket becomes
+orphaned once that type name resolves to the trimmed class) - consistent
+with this session's established practice of taking breaking changes
+when they genuinely remove confusion, always documented rather than
+silently avoided.
+
+`_auto_canny_control_image`/`_depth_anything_batch` stay the only
+genuinely shared helpers (already imported from `nodes/preprocessors.py`)
+- the control-plumbing code itself is copy-pasted into each
+`*ControlNetImg2Img` class, not refactored into a shared function,
+matching this repo's existing convention of per-pipeline duplication
+over premature abstraction.
+
+`tools/smoke_krea2.py`/`tools/smoke_qwen_image.py`/
+`tools/smoke_flux_klein.py`: no new test *cases* invented - each file's
+existing img2img coverage already split cleanly along this exact seam,
+so tests that only ever exercised `images`/txt2img moved (unchanged) to
+instantiate the trimmed class, and tests exercising `control_mode`/
+`control_image`/`qwen_control`/`control_source_image` moved to
+instantiate the new `*ControlNetImg2Img` class instead - same
+assertions, same fakes, just pointed at the right class per the split.
+39/39 (Krea2), 14/14 (Qwen-Image), 26/26 (Klein) unchanged, 84/84 full
+pytest suite. Real-environment check against the actual portable
+ComfyUI: all six classes register, plain nodes have exactly zero of the
+control-related keys, and each `*ControlNetImg2Img`'s `INPUT_TYPES` is
+confirmed a strict superset of its plain sibling's.

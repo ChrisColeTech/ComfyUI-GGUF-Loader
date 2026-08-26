@@ -2,9 +2,13 @@
 
   Krea2ModelLoader     unet / clip / vae by name -> MODEL, CLIP, VAE
   Krea2ControlLoRALoader  model + control-LoRA file -> LoRA-patched model
-  Krea2Img2Img          model, clip, vae, prompts (+ optional init image,
-                         + optional control image) -> model, positive,
-                         negative, latent, denoise -> stock KSampler
+  Krea2Img2Img          model, clip, vae, prompts (+ optional init image)
+                         -> model, positive, negative, latent, denoise
+                         -> stock KSampler. No ControlNet inputs.
+  Krea2ControlNetImg2Img  same as Krea2Img2Img, plus control_image/
+                         control_mode for Control-LoRA-guided generation -
+                         kept as a separate node so the plain one above
+                         never shows control-related inputs.
 
 Krea2 is natively detected by ComfyUI core (comfy.sd.load_diffusion_model_state_dict
 picks it up via unet_config.image_model == "krea2"; comfy.sd.CLIPType.KREA2 selects
@@ -825,17 +829,16 @@ class Krea2ControlLoRALoader:
 
 
 class Krea2Img2Img:
-    """Prompts, init latent, and optional control image for Krea2 - one node.
+    """Prompts and init latent for Krea2 - one node, no ControlNet.
 
-    Two image-shaped slots, dead simple: `images` for img2img, `control_image`
-    for ControlNet. Leave `images` unconnected for txt2img. Leave
-    `control_image` unconnected for plain img2img/txt2img with no LoRA-guided
-    control - if no Control LoRA is loaded, a connected control_image is
-    simply ignored (with a warning), since there's nothing to attach it to.
-    If a Krea2 Control LoRA IS loaded (via Krea2ControlLoRALoader) and
-    neither control_image nor a usable images is available, this raises
-    instead of silently sampling a half-configured model, the same guarantee
-    the original pack's separate Apply node existed for.
+    One image-shaped slot: `images`. Leave unconnected for txt2img. For
+    ControlNet-guided generation (Krea2 Control LoRA), use `Krea2ControlNetImg2Img`
+    instead - kept as a separate node on purpose, so this one never shows
+    control-related inputs at all. If a Krea2 Control LoRA happens to be
+    loaded upstream anyway and this node is used, sampling raises the
+    model's own clear error ("no control latent is attached") rather than
+    silently half-configuring anything - but this node has no way to
+    attach one itself.
 
     `images` is real img2img: VAE-encoded, then partially denoised at
     `strength` (comfy's own `KSampler`-style img2img - noise added onto the
@@ -843,6 +846,95 @@ class Krea2Img2Img:
     batch-aware - a batch of N photos naturally becomes N independent img2img
     generations, since `vae.encode()`/`KSampler` already process a batched
     latent as N parallel runs, no special-casing needed.
+
+    Feed the outputs straight into a stock KSampler.
+    """
+
+    CATEGORY = KREA2_CATEGORY
+    TITLE = "Krea2 img2img ⚡"
+    SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img',
+                       'encode image', 'image to latent']
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Prompts and init latent for Krea2, no ControlNet. Leave "
+                   "images unconnected for txt2img. For ControlNet-guided "
+                   "generation use Krea2ControlNetImg2Img instead. Feed the "
+                   "outputs straight into a stock KSampler.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01,
+                                       "tooltip": "img2img only. How much of the init image(s) "
+                                                  "to discard. Ignored without images."}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8,
+                                  "tooltip": "Output size. With init image(s) this resizes them."}),
+                "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "One or more init images for img2img "
+                                               "(batch-aware - a batch of N becomes N "
+                                               "independent img2img generations). Leave "
+                                               "unconnected for txt2img."}),
+            },
+        }
+
+    def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
+                width, height, images=None):
+        if images is None:
+            # txt2img: a plain, architecture-agnostic empty latent - comfy's own
+            # sampling path (comfy.sample.fix_empty_latent_channels, called from
+            # common_ksampler) corrects channel count and adds the time dimension
+            # for whatever model is attached, the same way stock EmptyLatentImage
+            # works across every architecture.
+            latent = torch.zeros(
+                [batch_size, 4, height // 8, width // 8],
+                device=comfy.model_management.intermediate_device())
+            denoise = 1.0
+            logger.info("Krea2: txt2img, empty latent %s", tuple(latent.shape))
+        else:
+            pixels = comfy.utils.common_upscale(
+                images.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+            latent = vae.encode(pixels[:, :, :, :3])
+            if batch_size > 1:
+                latent = latent.repeat(batch_size, *([1] * (latent.dim() - 1)))
+            denoise = strength
+            logger.info("Krea2: img2img, latent %s, strength %.2f", tuple(latent.shape), strength)
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+
+        return (model, positive, negative, {"samples": latent}, denoise)
+
+
+class Krea2ControlNetImg2Img:
+    """Prompts, init latent, and control image for Krea2 - ControlNet img2img.
+
+    Same as `Krea2Img2Img` plus everything needed for ControlNet-guided
+    generation, kept in its own node so the plain img2img node never has to
+    show control-related inputs. Two image-shaped slots, dead simple:
+    `images` for img2img, `control_image` for ControlNet. Leave `images`
+    unconnected for txt2img. Leave `control_image` unconnected for plain
+    img2img/txt2img with no LoRA-guided control - if no Control LoRA is
+    loaded, a connected control_image is simply ignored (with a warning),
+    since there's nothing to attach it to. If a Krea2 Control LoRA IS
+    loaded (via Krea2ControlLoRALoader) and neither control_image nor a
+    usable images is available, this raises instead of silently sampling a
+    half-configured model, the same guarantee the original pack's separate
+    Apply node existed for.
+
+    `images` is real img2img: VAE-encoded, then partially denoised at
+    `strength`. It's batch-aware - a batch of N photos naturally becomes N
+    independent img2img generations, since `vae.encode()`/`KSampler` already
+    process a batched latent as N parallel runs, no special-casing needed.
 
     control_mode/control_image apply ONLY to widened-input-projection
     Control LoRAs (loaded via Krea2ControlLoRALoader - the depth LoRA is
@@ -868,9 +960,10 @@ class Krea2Img2Img:
     """
 
     CATEGORY = KREA2_CATEGORY
-    TITLE = "Krea2 img2img ⚡"
+    TITLE = "Krea2 ControlNet img2img ⚡"
     SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img',
-                       'encode image', 'image to latent', 'controlnet apply']
+                       'encode image', 'image to latent', 'controlnet apply',
+                       'controlnet img2img']
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
     FUNCTION = "prepare"
@@ -942,7 +1035,7 @@ class Krea2Img2Img:
             # about. Ignore it rather than force control_image to be
             # disconnected just to toggle the LoRA loader on/off.
             logger.warning(
-                "Krea2Img2Img: control_image was given, but model has no Krea2 "
+                "Krea2ControlNetImg2Img: control_image was given, but model has no Krea2 "
                 "Control LoRA loaded - ignoring control_image.")
             control_image = None
 
@@ -1592,6 +1685,7 @@ NODE_CLASS_MAPPINGS = {
     # "Krea2DepthMap" type id keep resolving to a working node.
     "Krea2DepthMap": DepthMap,
     "Krea2Img2Img": Krea2Img2Img,
+    "Krea2ControlNetImg2Img": Krea2ControlNetImg2Img,
     "Krea2KSampler": Krea2KSampler,
     "Krea2EditModelPatch": Krea2EditModelPatch,
     "Krea2EditGroundedEncode": Krea2EditGroundedEncode,
@@ -1602,6 +1696,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2ControlLoRALoader": Krea2ControlLoRALoader.TITLE,
     "Krea2DepthMap": "Krea2 Depth Map ⚡",
     "Krea2Img2Img": Krea2Img2Img.TITLE,
+    "Krea2ControlNetImg2Img": Krea2ControlNetImg2Img.TITLE,
     "Krea2EditModelPatch": Krea2EditModelPatch.TITLE,
     "Krea2EditGroundedEncode": Krea2EditGroundedEncode.TITLE,
     "Krea2KSampler": Krea2KSampler.TITLE,

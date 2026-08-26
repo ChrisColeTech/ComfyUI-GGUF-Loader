@@ -2,9 +2,13 @@
 
   QwenImageModelLoader      unet / clip / vae by name -> MODEL, CLIP, VAE
   QwenImageControlNetLoader control checkpoint by name -> QWEN_IMAGE_CONTROL
-  QwenImageImg2Img          model, clip, vae, prompts, qwen_control (+ optional
-                            init image, + optional control image) -> model,
-                            positive, negative, latent, denoise -> stock KSampler
+  QwenImageImg2Img          model, clip, vae, prompts (+ optional init
+                            image) -> model, positive, negative, latent,
+                            denoise -> stock KSampler. No ControlNet inputs.
+  QwenImageControlNetImg2Img  same as QwenImageImg2Img, plus qwen_control/
+                            control_image/control_mode for ControlNet-
+                            guided generation - kept as a separate node so
+                            the plain one above never shows control inputs.
 
 Unlike Krea2's Control LoRA (which needed a from-scratch widened-input-
 projection port - nothing in comfy or any other pack implements that
@@ -230,15 +234,12 @@ class QwenImageControlNetLoader:
 
 
 class QwenImageImg2Img:
-    """Prompts, init latent, and optional control attach for Qwen-Image - one node.
+    """Prompts and init latent for Qwen-Image - one node, no ControlNet.
 
-    Two image-shaped slots, dead simple: `images` for img2img, `control_image`
-    for ControlNet. Leave `images` unconnected for txt2img. Leave
-    qwen_control/control_image unconnected for plain img2img/txt2img with no
-    ControlNet. Connect qwen_control (from QwenImageControlNetLoader) to
-    apply control - whichever attachment point the loaded checkpoint needs
-    (CONDITIONING for InstantX/Union/Fun, MODEL for DiffSynth) is handled
-    automatically based on what QwenImageControlNetLoader detected.
+    One image-shaped slot: `images`. Leave unconnected for txt2img. For
+    ControlNet-guided generation use `QwenImageControlNetImg2Img` instead -
+    kept as a separate node on purpose, so this one never shows control-
+    related inputs at all.
 
     `images` is real img2img: VAE-encoded, then partially denoised at
     `strength`. It's batch-aware - a batch of N photos naturally becomes N
@@ -248,6 +249,93 @@ class QwenImageImg2Img:
     for a genuine Qwen-Image-Edit checkpoint, connect the photo here and use
     a real `strength` (not just a control map) so the model is actually
     denoising from it.
+
+    Feed the outputs straight into a stock KSampler.
+    """
+
+    CATEGORY = QWEN_IMAGE_CATEGORY
+    TITLE = "Qwen-Image img2img ⚡"
+    SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img',
+                       'encode image', 'image to latent']
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Prompts and init latent for Qwen-Image, no ControlNet. "
+                   "Leave images unconnected for txt2img. For ControlNet-"
+                   "guided generation use QwenImageControlNetImg2Img instead. "
+                   "Feed the outputs straight into a stock KSampler.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01,
+                                       "tooltip": "img2img only. How much of the init image(s) "
+                                                  "to discard. Ignored without images."}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8,
+                                  "tooltip": "Output size. With init image(s) this resizes them."}),
+                "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "One or more init images for img2img "
+                                               "(batch-aware - a batch of N becomes N "
+                                               "independent img2img generations). Leave "
+                                               "unconnected for txt2img."}),
+            },
+        }
+
+    def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
+                width, height, images=None):
+        if images is None:
+            # txt2img: a plain, architecture-agnostic empty latent - comfy's own
+            # sampling path (comfy.sample.fix_empty_latent_channels, called from
+            # common_ksampler) corrects channel count and adds the time dimension
+            # for whatever model is attached, the same way stock EmptyLatentImage
+            # works across every architecture.
+            latent = torch.zeros(
+                [batch_size, 4, height // 8, width // 8],
+                device=comfy.model_management.intermediate_device())
+            denoise = 1.0
+            logger.info("Qwen-Image: txt2img, empty latent %s", tuple(latent.shape))
+        else:
+            pixels = comfy.utils.common_upscale(
+                images.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+            latent = vae.encode(pixels[:, :, :, :3])
+            if batch_size > 1:
+                latent = latent.repeat(batch_size, *([1] * (latent.dim() - 1)))
+            denoise = strength
+            logger.info("Qwen-Image: img2img, latent %s, strength %.2f", tuple(latent.shape), strength)
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+
+        return (model, positive, negative, {"samples": latent}, denoise)
+
+
+class QwenImageControlNetImg2Img:
+    """Prompts, init latent, and control attach for Qwen-Image - ControlNet img2img.
+
+    Same as `QwenImageImg2Img` plus everything needed for ControlNet-guided
+    generation, kept in its own node so the plain img2img node never has to
+    show control-related inputs. Two image-shaped slots, dead simple:
+    `images` for img2img, `control_image` for ControlNet. Leave `images`
+    unconnected for txt2img. Leave qwen_control/control_image unconnected
+    for plain img2img/txt2img with no ControlNet. Connect qwen_control
+    (from QwenImageControlNetLoader) to apply control - whichever
+    attachment point the loaded checkpoint needs (CONDITIONING for
+    InstantX/Union/Fun, MODEL for DiffSynth) is handled automatically
+    based on what QwenImageControlNetLoader detected.
+
+    `images` is real img2img: VAE-encoded, then partially denoised at
+    `strength`. It's batch-aware - a batch of N photos naturally becomes N
+    independent img2img generations, since `vae.encode()`/`KSampler` already
+    process a batched latent as N parallel runs, no special-casing needed.
 
     control_mode picks how the control image is produced, since (unlike
     Krea2, which only has one control type) Qwen-Image checkpoints span
@@ -270,9 +358,10 @@ class QwenImageImg2Img:
     """
 
     CATEGORY = QWEN_IMAGE_CATEGORY
-    TITLE = "Qwen-Image img2img ⚡"
+    TITLE = "Qwen-Image ControlNet img2img ⚡"
     SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img',
-                       'encode image', 'image to latent', 'controlnet apply']
+                       'encode image', 'image to latent', 'controlnet apply',
+                       'controlnet img2img']
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
     FUNCTION = "prepare"
@@ -332,7 +421,7 @@ class QwenImageImg2Img:
                 mask=None, control_strength=1.0):
         if control_image is not None and qwen_control is None:
             logger.warning(
-                "QwenImageImg2Img: control_image was given, but no qwen_control was "
+                "QwenImageControlNetImg2Img: control_image was given, but no qwen_control was "
                 "connected - ignoring control_image.")
             control_image = None
 
@@ -509,6 +598,7 @@ NODE_CLASS_MAPPINGS = {
     # "QwenImageCanny" type id keep resolving to a working node.
     "QwenImageCanny": Canny,
     "QwenImageImg2Img": QwenImageImg2Img,
+    "QwenImageControlNetImg2Img": QwenImageControlNetImg2Img,
     "QwenImageKSampler": QwenImageKSampler,
 }
 
@@ -518,4 +608,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImageCanny": "Qwen-Image Canny ⚡",
     "QwenImageKSampler": QwenImageKSampler.TITLE,
     "QwenImageImg2Img": QwenImageImg2Img.TITLE,
+    "QwenImageControlNetImg2Img": QwenImageControlNetImg2Img.TITLE,
 }

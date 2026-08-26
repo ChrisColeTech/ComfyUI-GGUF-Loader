@@ -4,9 +4,14 @@ conditioning tools.
 
   FluxKleinModelLoader        unet / clip / vae by name -> MODEL, CLIP, VAE
   FluxKleinImg2Img            model, clip, vae, prompts (+ optional
-                               reference images / controlnet-style source
-                               image) -> model, positive, negative, latent
-                               -> stock KSampler or FluxKleinKSampler
+                               reference images) -> model, positive,
+                               negative, latent -> stock KSampler or
+                               FluxKleinKSampler. No ControlNet inputs.
+  FluxKleinControlNetImg2Img  same as FluxKleinImg2Img, plus
+                               control_source_image/control_mode for
+                               ControlNet-style reference derivation -
+                               kept as a separate node so the plain one
+                               above never shows control-related inputs.
   Flux2KleinMultiReferenceLatent  up to 8 reference latents -> CONDITIONING
 
 Flux.2 Klein is natively supported by ComfyUI core (unet_config.image_model
@@ -169,7 +174,7 @@ class FluxKleinModelLoader:
 
 
 class FluxKleinImg2Img:
-    """Prompts, init latent, and reference images for FLUX.2 Klein.
+    """Prompts, init latent, and reference images for FLUX.2 Klein - no ControlNet.
 
     Klein's real editing mechanism - confirmed against the actual shipped
     example workflows (single-reference "Image Edit (Flux.2 Klein 9B)" and
@@ -180,42 +185,22 @@ class FluxKleinImg2Img:
     AND negative conditioning as reference_latents, plus a text
     instruction. This node has no partial-denoise img2img path at all - it
     only builds pure-noise latents, because that's the only mechanism any
-    real Klein edit example ever uses; `denoise` is always 1.0. (Generic
-    partial-denoise img2img is a real, separate diffusion technique - it's
-    just not how Klein edits images, and mixing the two into one node
-    input was actively misleading.)
+    real Klein edit example ever uses; `denoise` is always 1.0.
 
-    Two separate inputs cover the two things a reference image can be:
+    One image-shaped slot: `images` - one or more RAW reference photos,
+    always attached untouched as reference_latents to both positive and
+    negative conditioning. This is a single IMAGE socket but batch-aware:
+    if the incoming tensor has N images stacked in the batch dimension,
+    each one gets its own VAEEncode + reference_latents append, exactly
+    matching the real dual-reference subgraph's own per-image
+    ReferenceLatent chain (confirmed by tracing its actual node graph,
+    not assumed) - combine multiple photos upstream with a stock "Batch
+    Images" node before wiring the result in here.
 
-    `images` - one or more RAW reference photos, always attached untouched
-    as reference_latents to both positive and negative conditioning. This
-    is a single IMAGE socket but batch-aware: if the incoming tensor has N
-    images stacked in the batch dimension, each one gets its own VAEEncode
-    + reference_latents append, exactly matching the real dual-reference
-    subgraph's own per-image ReferenceLatent chain (confirmed by tracing
-    its actual node graph, not assumed) - combine multiple photos upstream
-    with a stock "Batch Images" node before wiring the result in here.
-
-    `control_source_image` - a photo to turn INTO a controlnet-style map
-    before attaching it. Klein has no real ControlNet/Control-LoRA of its
-    own; "using it as a controlnet image" here just means running it
-    through this pack's own preprocessor and feeding the RESULT through
-    the same reference_latents mechanism as `images`, appended after them.
-    `control_mode` picks the preprocessor: `manual` attaches
-    control_source_image raw (e.g. if you already computed your own map
-    elsewhere and just want it attached without reprocessing), `auto_depth`
-    runs it through Depth Anything V2 first - reproducing the real example
-    workflow's own structural-reference trick (AIO_Preprocessor -> MiDaS
-    depth -> reference_latents), the one mode CONFIRMED meaningful to
-    Klein's own training - `auto_canny` runs plain cv2 edge detection
-    first, mechanically valid but unverified for Klein specifically, and
-    `none` skips control_source_image attachment entirely even if it's
-    connected, for toggling it off without rewiring. For anything beyond
-    depth/canny (normal maps, soft edges, MLSD, lineart variants,
-    OpenPose), install the separate ComfyUI-ControlNet-Nodes package and
-    wire its output into `control_source_image` yourself with
-    control_mode=manual - same pattern Krea2Img2Img/QwenImageImg2Img
-    already use for control types they don't auto-derive.
+    For turning a photo INTO a controlnet-style map (depth/canny) and
+    attaching that instead, use `FluxKleinControlNetImg2Img` - kept as a
+    separate node on purpose, so this one never shows control-related
+    inputs at all.
 
     For 3+ references or advanced reference-conditioning tools (color
     anchoring, per-reference weighting, identity guidance), install the
@@ -223,17 +208,12 @@ class FluxKleinImg2Img:
     Flux-family model including Klein, not just this one.
 
     `width`/`height` are the pixel BUDGET (width*height), not necessarily
-    the exact output size: whenever `images` or `control_source_image` is
-    connected, the canvas is re-derived from that photo's own aspect ratio
-    at the same total pixel count (aspect-preserving, `_scale_to_megapixels`,
-    matching the real example workflow's own
-    ImageScaleToTotalPixels -> GetImageSize -> EmptyFlux2LatentImage chain
-    exactly) - `width`/`height` are used as-given only for pure txt2img
-    (nothing connected). This was a real bug before it was fixed:
-    `width`/`height` used to be trusted as exact independent of any
-    connected photo, silently distorting the reference image via a center-
-    crop resize to a mismatched aspect ratio, and generating a canvas that
-    didn't match it.
+    the exact output size: whenever `images` is connected, the canvas is
+    re-derived from that photo's own aspect ratio at the same total pixel
+    count (aspect-preserving, `_scale_to_megapixels`, matching the real
+    example workflow's own ImageScaleToTotalPixels -> GetImageSize ->
+    EmptyFlux2LatentImage chain exactly) - `width`/`height` are used
+    as-given only for pure txt2img (nothing connected).
 
     The empty-latent path uses Flux.2's REAL shape - confirmed via
     comfy_extras/nodes_flux.py's EmptyFlux2LatentImage:
@@ -264,8 +244,131 @@ class FluxKleinImg2Img:
     RETURN_NAMES = ("model", "positive", "negative", "latent")
     FUNCTION = "prepare"
     DESCRIPTION = ("Prompts, init latent, and reference images for FLUX.2 "
-                   "Klein's real edit mechanism (always a pure-noise start). "
-                   "Feed the outputs straight into a stock KSampler.")
+                   "Klein's real edit mechanism (always a pure-noise start), "
+                   "no ControlNet. For ControlNet-guided generation use "
+                   "FluxKleinControlNetImg2Img instead. Feed the outputs "
+                   "straight into a stock KSampler.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16,
+                                  "tooltip": "Pixel budget (width*height), not necessarily the exact "
+                                             "output size - if images is connected, the canvas is "
+                                             "re-derived from that photo's own aspect ratio at this "
+                                             "same total pixel count. Used as-given only for pure "
+                                             "txt2img."}),
+                "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "One or more RAW reference photos (batch-aware - "
+                                               "combine multiple with a stock Batch Images node "
+                                               "upstream). Each is independently encoded and "
+                                               "attached to positive+negative conditioning as "
+                                               "reference_latents - Klein's real edit mechanism."}),
+            },
+        }
+
+    def prepare(self, model, clip, vae, prompt, negative_prompt, batch_size, width, height,
+                images=None):
+        # width/height are a pixel BUDGET, not necessarily the exact output
+        # size - re-derive the real canvas from `images`, matching the real
+        # example workflow's own ImageScaleToTotalPixels -> GetImageSize ->
+        # EmptyFlux2LatentImage chain exactly, instead of trusting a
+        # user-typed value that may not match the photo's aspect ratio.
+        if images is not None:
+            megapixels = (width * height) / (1024.0 * 1024.0)
+            width, height = _scale_to_megapixels(images[0:1], megapixels)
+
+        # Klein's real edit mechanism always starts from pure noise - see
+        # class docstring for why this can't use the generic /8-downscale
+        # placeholder.
+        latent = torch.zeros(
+            [batch_size, 128, height // 16, width // 16],
+            device=comfy.model_management.intermediate_device())
+        logger.info("Flux Klein: empty latent %s (pure noise - Klein's real edit "
+                    "mechanism never partially denoises an existing photo)", tuple(latent.shape))
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+
+        if images is not None:
+            for i in range(images.shape[0]):
+                pixels = _resize_image(images[i:i + 1], width, height)
+                ref_latent = vae.encode(pixels[:, :, :, :3])
+                values = {"reference_latents": [ref_latent]}
+                positive = node_helpers.conditioning_set_values(positive, values, append=True)
+                negative = node_helpers.conditioning_set_values(negative, values, append=True)
+            logger.info("Flux Klein: %d image(s) from `images` attached raw to positive+negative "
+                        "conditioning as reference_latents", images.shape[0])
+
+        return (model, positive, negative, {"samples": latent})
+
+
+class FluxKleinControlNetImg2Img:
+    """Prompts, init latent, reference images, and control attach for FLUX.2 Klein.
+
+    Same as `FluxKleinImg2Img` plus a control-source input for turning a
+    photo into a controlnet-style map before attaching it, kept in its own
+    node so the plain node above never has to show control-related inputs.
+
+    `images` - one or more RAW reference photos, always attached untouched
+    as reference_latents to both positive and negative conditioning
+    (batch-aware, see `FluxKleinImg2Img`).
+
+    `control_source_image` - a photo to turn INTO a controlnet-style map
+    before attaching it. Klein has no real ControlNet/Control-LoRA of its
+    own; "using it as a controlnet image" here just means running it
+    through this pack's own preprocessor and feeding the RESULT through
+    the same reference_latents mechanism as `images`, appended after them.
+    `control_mode` picks the preprocessor: `manual` attaches
+    control_source_image raw (e.g. if you already computed your own map
+    elsewhere and just want it attached without reprocessing), `auto_depth`
+    runs it through Depth Anything V2 first - reproducing the real example
+    workflow's own structural-reference trick (AIO_Preprocessor -> MiDaS
+    depth -> reference_latents), the one mode CONFIRMED meaningful to
+    Klein's own training - `auto_canny` runs plain cv2 edge detection
+    first, mechanically valid but unverified for Klein specifically, and
+    `none` skips control_source_image attachment entirely even if it's
+    connected, for toggling it off without rewiring. For anything beyond
+    depth/canny (normal maps, soft edges, MLSD, lineart variants,
+    OpenPose), install the separate ComfyUI-ControlNet-Nodes package and
+    wire its output into `control_source_image` yourself with
+    control_mode=manual - same pattern Krea2ControlNetImg2Img/
+    QwenImageControlNetImg2Img already use for control types they don't
+    auto-derive.
+
+    `width`/`height` are the pixel BUDGET (width*height): whenever `images`
+    or `control_source_image` is connected, the canvas is re-derived from
+    that photo's own aspect ratio at the same total pixel count (`images`
+    takes priority over `control_source_image` for sizing) - matching the
+    real example workflow's own ImageScaleToTotalPixels -> GetImageSize ->
+    EmptyFlux2LatentImage chain exactly.
+
+    No `denoise` output - see `FluxKleinImg2Img`'s docstring.
+
+    Feed the outputs straight into a stock KSampler or FluxKleinKSampler.
+    """
+
+    CATEGORY = FLUX_KLEIN_CATEGORY
+    TITLE = "Flux Klein ControlNet img2img ⚡"
+    SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img', 'encode image',
+                       'reference image', 'edit reference', 'pose transfer', 'controlnet apply',
+                       'controlnet img2img']
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Prompts, init latent, reference images, and control-image "
+                   "attach for FLUX.2 Klein's real edit mechanism (always a "
+                   "pure-noise start). Feed the outputs straight into a "
+                   "stock KSampler.")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1208,6 +1311,7 @@ class Flux2KleinSectionedEncoder:
 NODE_CLASS_MAPPINGS = {
     "FluxKleinModelLoader": FluxKleinModelLoader,
     "FluxKleinImg2Img": FluxKleinImg2Img,
+    "FluxKleinControlNetImg2Img": FluxKleinControlNetImg2Img,
     # Backward-compat alias: this node's logic moved to the shared
     # nodes/preprocessors.py DepthMap class - old saved workflows using the
     # "Flux2KleinDepthMap" type id keep resolving to a working node.
@@ -1220,6 +1324,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FluxKleinModelLoader": FluxKleinModelLoader.TITLE,
     "FluxKleinImg2Img": FluxKleinImg2Img.TITLE,
+    "FluxKleinControlNetImg2Img": FluxKleinControlNetImg2Img.TITLE,
     "Flux2KleinDepthMap": "Flux Klein Depth Map ⚡",
     "Flux2KleinIdentityFeatureTransfer": Flux2KleinIdentityFeatureTransfer.TITLE,
     "Flux2KleinEnhancer": Flux2KleinEnhancer.TITLE,

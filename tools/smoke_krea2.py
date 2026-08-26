@@ -339,7 +339,7 @@ def test_img2img_ignores_control_image_without_loaded_lora():
     # control_image to and no half-configured state - it's safe to ignore
     # (with a warning), not an error. Unlike the reverse case (LoRA loaded,
     # no control_image), which IS a real half-configured-model risk.
-    node = krea2.Krea2Img2Img()
+    node = krea2.Krea2ControlNetImg2Img()
     model = _FakeModelPatcher()
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -347,11 +347,11 @@ def test_img2img_ignores_control_image_without_loaded_lora():
     result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
                           control_image=torch.rand(1, 8, 8, 3))
     assert result is not None
-    print("[ok] Krea2Img2Img: control_image with no Control LoRA loaded is ignored, not an error")
+    print("[ok] Krea2ControlNetImg2Img: control_image with no Control LoRA loaded is ignored, not an error")
 
 
 def test_img2img_rejects_loaded_lora_without_control_image():
-    node = krea2.Krea2Img2Img()
+    node = krea2.Krea2ControlNetImg2Img()
     model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -362,11 +362,11 @@ def test_img2img_rejects_loaded_lora_without_control_image():
     except ValueError as e:
         raised = "control_image" in str(e)
     assert raised
-    print("[ok] Krea2Img2Img: Control LoRA loaded, auto_depth mode, no images or control_image -> raises")
+    print("[ok] Krea2ControlNetImg2Img: Control LoRA loaded, auto_depth mode, no images or control_image -> raises")
 
 
 def test_img2img_manual_mode_requires_control_image():
-    node = krea2.Krea2Img2Img()
+    node = krea2.Krea2ControlNetImg2Img()
     model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -378,7 +378,7 @@ def test_img2img_manual_mode_requires_control_image():
     except ValueError as e:
         raised = "manual" in str(e) and "control_image" in str(e)
     assert raised
-    print("[ok] Krea2Img2Img: Control LoRA loaded, manual mode, images given but no "
+    print("[ok] Krea2ControlNetImg2Img: Control LoRA loaded, manual mode, images given but no "
           "control_image -> raises (manual mode never auto-derives)")
 
 
@@ -401,7 +401,7 @@ def test_img2img_auto_depth_derives_control_image_from_images():
     original = krea2.depth_anything_v2.DepthAnythingV2Detector
     krea2.depth_anything_v2.DepthAnythingV2Detector = _FakeDetector
     try:
-        node = krea2.Krea2Img2Img()
+        node = krea2.Krea2ControlNetImg2Img()
         model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
         clip = types.SimpleNamespace(
             encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -411,13 +411,13 @@ def test_img2img_auto_depth_derives_control_image_from_images():
         assert result is not None
     finally:
         krea2.depth_anything_v2.DepthAnythingV2Detector = original
-    print("[ok] Krea2Img2Img: auto_depth mode (default) derives control_image from "
+    print("[ok] Krea2ControlNetImg2Img: auto_depth mode (default) derives control_image from "
           "images automatically - one photo, one slot")
 
 
 def test_img2img_auto_canny_derives_control_image_from_images():
     # cv2.Canny is real, deterministic, no model - no fake needed, unlike auto_depth.
-    node = krea2.Krea2Img2Img()
+    node = krea2.Krea2ControlNetImg2Img()
     model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -425,7 +425,7 @@ def test_img2img_auto_canny_derives_control_image_from_images():
     result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
                           images=torch.rand(1, 32, 32, 3), control_mode="auto_canny")
     assert result is not None
-    print("[ok] Krea2Img2Img: auto_canny mode derives control_image from images "
+    print("[ok] Krea2ControlNetImg2Img: auto_canny mode derives control_image from images "
           "automatically via cv2.Canny")
 
 
@@ -441,7 +441,7 @@ def test_img2img_control_mode_none_skips_control_even_with_lora_loaded():
     # there was no way to just skip control for one call. Confirm "none"
     # bypasses that entirely: no raise, no control attached, even though
     # has_control_lora is True.
-    node = krea2.Krea2Img2Img()
+    node = krea2.Krea2ControlNetImg2Img()
     model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -449,7 +449,7 @@ def test_img2img_control_mode_none_skips_control_even_with_lora_loaded():
     result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
                           images=torch.rand(1, 32, 32, 3), control_mode="none")
     assert result is not None
-    print("[ok] Krea2Img2Img: control_mode=none skips control attachment even "
+    print("[ok] Krea2ControlNetImg2Img: control_mode=none skips control attachment even "
           "though a Control LoRA is loaded, instead of raising")
 
 
@@ -464,7 +464,7 @@ def test_img2img_explicit_control_image_overrides_auto_depth():
     original = krea2.depth_anything_v2.DepthAnythingV2Detector
     krea2.depth_anything_v2.DepthAnythingV2Detector = _fail_if_called
     try:
-        node = krea2.Krea2Img2Img()
+        node = krea2.Krea2ControlNetImg2Img()
         model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
         clip = types.SimpleNamespace(
             encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
@@ -475,7 +475,7 @@ def test_img2img_explicit_control_image_overrides_auto_depth():
         assert result is not None
     finally:
         krea2.depth_anything_v2.DepthAnythingV2Detector = original
-    print("[ok] Krea2Img2Img: an explicitly-connected control_image overrides "
+    print("[ok] Krea2ControlNetImg2Img: an explicitly-connected control_image overrides "
           "auto_depth derivation")
 
 

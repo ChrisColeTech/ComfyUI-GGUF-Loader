@@ -228,7 +228,7 @@ def test_apply_controlnet_sets_hint_and_strength():
 # ── QwenImageImg2Img guard rails ─────────────────────────────────────────
 
 def test_img2img_rejects_qwen_control_without_control_image():
-    node = qi.QwenImageImg2Img()
+    node = qi.QwenImageControlNetImg2Img()
     model = _FakeModelPatcher()
     try:
         node.prepare(model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
@@ -237,16 +237,16 @@ def test_img2img_rejects_qwen_control_without_control_image():
     except ValueError as e:
         raised = "control_image" in str(e)
     assert raised
-    print("[ok] QwenImageImg2Img: qwen_control with no control_image raises, not a silent partial run")
+    print("[ok] QwenImageControlNetImg2Img: qwen_control with no control_image raises, not a silent partial run")
 
 
 def test_img2img_ignores_control_image_without_qwen_control():
-    node = qi.QwenImageImg2Img()
+    node = qi.QwenImageControlNetImg2Img()
     model = _FakeModelPatcher()
     result = node.prepare(model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
                           control_image=torch.rand(1, 8, 8, 3))
     assert result is not None
-    print("[ok] QwenImageImg2Img: control_image with no qwen_control is ignored, not an error")
+    print("[ok] QwenImageControlNetImg2Img: control_image with no qwen_control is ignored, not an error")
 
 
 def test_img2img_control_mode_none_skips_control_even_with_qwen_control_connected():
@@ -254,13 +254,13 @@ def test_img2img_control_mode_none_skips_control_even_with_qwen_control_connecte
     # (auto or manual) always raised - there was no way to skip control for
     # one call. Confirm "none" bypasses that entirely: no raise, no control
     # attached, even though qwen_control is connected.
-    node = qi.QwenImageImg2Img()
+    node = qi.QwenImageControlNetImg2Img()
     model = _FakeModelPatcher()
     result = node.prepare(model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
                           qwen_control=qi.QwenImageControl("controlnet", _FakeControlNet()),
                           control_mode="none")
     assert result is not None
-    print("[ok] QwenImageImg2Img: control_mode=none skips control attachment even "
+    print("[ok] QwenImageControlNetImg2Img: control_mode=none skips control attachment even "
           "though qwen_control is connected, instead of raising")
 
 
@@ -298,7 +298,7 @@ def test_img2img_images_batch_produces_batched_latent():
 
 
 def test_img2img_model_patch_control_attaches_to_model():
-    node = qi.QwenImageImg2Img()
+    node = qi.QwenImageControlNetImg2Img()
     model = _FakeModelPatcher()
     fake_patch = object()
     result_model, positive, negative, _, _ = node.prepare(
@@ -309,11 +309,11 @@ def test_img2img_model_patch_control_attaches_to_model():
     assert result_model is not model  # cloned
     assert len(result_model.double_block_patches) == 1
     assert "control" not in positive[0][1]  # conditioning untouched for this attachment kind
-    print("[ok] QwenImageImg2Img: kind='model_patch' attaches via set_model_double_block_patch on a cloned MODEL")
+    print("[ok] QwenImageControlNetImg2Img: kind='model_patch' attaches via set_model_double_block_patch on a cloned MODEL")
 
 
 def test_img2img_controlnet_control_attaches_to_conditioning():
-    node = qi.QwenImageImg2Img()
+    node = qi.QwenImageControlNetImg2Img()
     model = _FakeModelPatcher()
     control_net = _FakeControlNet()
     result_model, positive, negative, _, _ = node.prepare(
@@ -325,7 +325,7 @@ def test_img2img_controlnet_control_attaches_to_conditioning():
     assert positive[0][1]["control"] is control_net
     assert negative[0][1]["control"] is control_net
     assert not result_model.double_block_patches
-    print("[ok] QwenImageImg2Img: kind='controlnet' attaches via CONDITIONING, MODEL left untouched")
+    print("[ok] QwenImageControlNetImg2Img: kind='controlnet' attaches via CONDITIONING, MODEL left untouched")
 
 
 def test_canny_node_produces_edge_map_matching_input_shape():
