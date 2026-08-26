@@ -270,16 +270,31 @@ def test_img2img_txt2img_empty_latent_shape():
     _, _, _, latent, denoise = node.prepare(model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64)
     assert latent["samples"].shape == (1, 4, 8, 8)
     assert denoise == 1.0
-    print("[ok] QwenImageImg2Img: txt2img (no image) -> empty latent sized off width/height, denoise=1.0")
+    print("[ok] QwenImageImg2Img: txt2img (no images) -> empty latent sized off width/height, denoise=1.0")
 
 
-def test_img2img_with_image_uses_strength_as_denoise():
+def test_img2img_with_images_uses_strength_as_denoise():
     node = qi.QwenImageImg2Img()
     model = _FakeModelPatcher()
     _, _, _, latent, denoise = node.prepare(model, _clip(), _vae(), "prompt", "", 0.37, 1, 64, 64,
-                                            image=torch.rand(1, 64, 64, 3))
+                                            images=torch.rand(1, 64, 64, 3))
     assert denoise == 0.37
-    print("[ok] QwenImageImg2Img: img2img (image given) -> denoise = strength")
+    print("[ok] QwenImageImg2Img: img2img (images given) -> denoise = strength")
+
+
+def test_img2img_images_batch_produces_batched_latent():
+    # A batch of N images naturally becomes N independent img2img
+    # generations via vae.encode()'s own batch handling - the shared
+    # _vae() fixture returns a fixed batch-1 shape regardless of input,
+    # so use a batch-aware fake here to actually exercise this.
+    node = qi.QwenImageImg2Img()
+    model = _FakeModelPatcher()
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(img.shape[0], 16, 8, 8))
+    _, _, _, latent, _ = node.prepare(model, _clip(), vae, "prompt", "", 0.5, 1, 64, 64,
+                                      images=torch.rand(3, 64, 64, 3))
+    assert latent["samples"].shape[0] == 3
+    print("[ok] QwenImageImg2Img: a 3-image batch in `images` produces a batch-3 latent "
+          "(3 independent img2img generations)")
 
 
 def test_img2img_model_patch_control_attaches_to_model():
@@ -288,7 +303,7 @@ def test_img2img_model_patch_control_attaches_to_model():
     fake_patch = object()
     result_model, positive, negative, _, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        image=torch.rand(1, 64, 64, 3),
+        images=torch.rand(1, 64, 64, 3),
         qwen_control=qi.QwenImageControl("model_patch", types.SimpleNamespace(model=fake_patch)),
         control_image=torch.rand(1, 64, 64, 3))
     assert result_model is not model  # cloned
@@ -303,7 +318,7 @@ def test_img2img_controlnet_control_attaches_to_conditioning():
     control_net = _FakeControlNet()
     result_model, positive, negative, _, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        image=torch.rand(1, 64, 64, 3),
+        images=torch.rand(1, 64, 64, 3),
         qwen_control=qi.QwenImageControl("controlnet", control_net),
         control_image=torch.rand(1, 64, 64, 3))
     assert result_model is model  # not cloned - conditioning-based attachment, model untouched
@@ -322,18 +337,6 @@ def test_canny_node_produces_edge_map_matching_input_shape():
     (out,) = node.detect(torch.rand(1, 32, 32, 3))
     assert out.shape == (1, 32, 32, 3)
     print("[ok] QwenImageCanny alias -> shared Canny node: output shape matches input")
-
-
-def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():
-    node = qi.QwenImageImg2Img()
-    model = _FakeModelPatcher()
-    _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        edit_reference=torch.rand(1, 64, 64, 3))
-    assert "reference_latents" in positive[0][1]
-    assert "reference_latents" not in negative[0][1]
-    print("[ok] QwenImageImg2Img: edit_reference attaches reference_latents to "
-          "positive conditioning only")
 
 
 # ── QwenImageKSampler ─────────────────────────────────────────────────────
@@ -386,11 +389,11 @@ if __name__ == "__main__":
     test_img2img_ignores_control_image_without_qwen_control()
     test_img2img_control_mode_none_skips_control_even_with_qwen_control_connected()
     test_img2img_txt2img_empty_latent_shape()
-    test_img2img_with_image_uses_strength_as_denoise()
+    test_img2img_with_images_uses_strength_as_denoise()
+    test_img2img_images_batch_produces_batched_latent()
     test_img2img_model_patch_control_attaches_to_model()
     test_img2img_controlnet_control_attaches_to_conditioning()
     test_canny_node_produces_edge_map_matching_input_shape()
-    test_img2img_edit_reference_attaches_reference_latents_to_positive_only()
     test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
     test_ksampler_diffusers_mode_rejects_zero_denoise()
     test_ksampler_diffusers_mode_slices_sigmas_from_t_start()

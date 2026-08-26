@@ -232,12 +232,22 @@ class QwenImageControlNetLoader:
 class QwenImageImg2Img:
     """Prompts, init latent, and optional control attach for Qwen-Image - one node.
 
-    Leave image unconnected for txt2img. Leave qwen_control/control_image
-    unconnected for plain img2img/txt2img with no ControlNet. Connect
-    qwen_control (from QwenImageControlNetLoader) to apply control - whichever
-    attachment point the loaded checkpoint needs (CONDITIONING for InstantX/
-    Union/Fun, MODEL for DiffSynth) is handled automatically based on what
-    QwenImageControlNetLoader detected.
+    Two image-shaped slots, dead simple: `images` for img2img, `control_image`
+    for ControlNet. Leave `images` unconnected for txt2img. Leave
+    qwen_control/control_image unconnected for plain img2img/txt2img with no
+    ControlNet. Connect qwen_control (from QwenImageControlNetLoader) to
+    apply control - whichever attachment point the loaded checkpoint needs
+    (CONDITIONING for InstantX/Union/Fun, MODEL for DiffSynth) is handled
+    automatically based on what QwenImageControlNetLoader detected.
+
+    `images` is real img2img: VAE-encoded, then partially denoised at
+    `strength`. It's batch-aware - a batch of N photos naturally becomes N
+    independent img2img generations, since `vae.encode()`/`KSampler` already
+    process a batched latent as N parallel runs, no special-casing needed.
+    This is also the only mechanism this node has for "edit this photo" -
+    for a genuine Qwen-Image-Edit checkpoint, connect the photo here and use
+    a real `strength` (not just a control map) so the model is actually
+    denoising from it.
 
     control_mode picks how the control image is produced, since (unlike
     Krea2, which only has one control type) Qwen-Image checkpoints span
@@ -245,27 +255,16 @@ class QwenImageImg2Img:
     loaded file:
       "manual" (default) - control_image must be supplied by hand (a canny
         map, depth map, etc. matching whichever checkpoint you loaded).
-      "auto_canny" - derives a canny edge map from `image` automatically
+      "auto_canny" - derives a canny edge map from `images` automatically
         (plain cv2.Canny, no model, no extra download) - for a canny
         DiffSynth/Union checkpoint.
-      "auto_depth" - derives a depth map from `image` automatically, using
+      "auto_depth" - derives a depth map from `images` automatically, using
         the same Depth Anything V2 model as Krea2DepthMap - for a depth
         DiffSynth/Union checkpoint.
     Connecting control_image explicitly always overrides auto-derivation,
     in any mode. control_image is required even for an inpaint checkpoint;
     connect `mask` alongside it to refine which region gets inpainted -
     mask alone isn't enough, there's no photo-only way to auto-derive one.
-
-    edit_reference is a separate thing from image/control_image: it's for
-    Qwen-Image-Edit checkpoints specifically, which have a real, distinct
-    forward-pass input (`ref_latents` in comfy.ldm.qwen_image.model.py's
-    DiT) for "the photo to edit" - not img2img, not ControlNet. Without it,
-    an Edit checkpoint runs as a plain generator using weights fine-tuned
-    for editing, not a real edit. No custom sampler involved - this is
-    conditioning, same mechanism as `control`: VAE-encode the photo and
-    attach it to positive conditioning as `reference_latents`, the same
-    thing stock comfy's `ReferenceLatent` node does, applied to positive
-    only.
 
     Feed the outputs straight into a stock KSampler.
     """
@@ -278,7 +277,7 @@ class QwenImageImg2Img:
     RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
     FUNCTION = "prepare"
     DESCRIPTION = ("Prompts, init latent and ControlNet attach for Qwen-Image. "
-                   "Leave image unconnected for txt2img. Feed the outputs "
+                   "Leave images unconnected for txt2img. Feed the outputs "
                    "straight into a stock KSampler.")
 
     @classmethod
@@ -291,23 +290,25 @@ class QwenImageImg2Img:
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01,
-                                       "tooltip": "img2img only. How much of the init image "
-                                                  "to discard. Ignored without an image."}),
+                                       "tooltip": "img2img only. How much of the init image(s) "
+                                                  "to discard. Ignored without images."}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
                 "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8,
-                                  "tooltip": "Output size. With an init or control image this resizes it."}),
+                                  "tooltip": "Output size. With init or control image(s) this resizes them."}),
                 "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
             },
             "optional": {
-                "image": ("IMAGE", {"tooltip": "Init image for img2img, and (in auto_canny/"
-                                               "auto_depth modes) the source photo the "
-                                               "control image is derived from. Leave "
+                "images": ("IMAGE", {"tooltip": "One or more init images for img2img "
+                                               "(batch-aware - a batch of N becomes N "
+                                               "independent img2img generations), and (in "
+                                               "auto_canny/auto_depth modes) the source photo "
+                                               "the control image is derived from. Leave "
                                                "unconnected for txt2img."}),
                 "qwen_control": ("QWEN_IMAGE_CONTROL", {
                     "tooltip": "From QwenImageControlNetLoader."}),
                 "control_mode": (["manual", "auto_canny", "auto_depth", "none"], {"default": "manual",
                     "tooltip": "manual: connect control_image yourself. auto_canny/auto_depth: "
-                               "derive it from `image` automatically - pick whichever matches "
+                               "derive it from `images` automatically - pick whichever matches "
                                "the loaded checkpoint. none: skip control attachment entirely "
                                "even if qwen_control is connected - for toggling control off "
                                "without rewiring. Ignored without qwen_control."}),
@@ -322,19 +323,13 @@ class QwenImageImg2Img:
                 "mask": ("MASK", {"tooltip": "For an inpaint checkpoint - the region to "
                                             "inpaint. Not derivable automatically."}),
                 "control_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
-                "edit_reference": ("IMAGE", {"tooltip": "For Qwen-Image-Edit checkpoints: the "
-                                             "photo to edit. Encoded and attached to positive "
-                                             "conditioning as the model's real edit-reference "
-                                             "input (reference_latents) - separate from img2img's "
-                                             "`image` and ControlNet's `control_image`. Leave "
-                                             "unconnected for a non-Edit checkpoint."}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
-                width, height, image=None, qwen_control=None, control_mode="manual",
+                width, height, images=None, qwen_control=None, control_mode="manual",
                 depth_ckpt_name="depth_anything_v2_vitb.pth", control_image=None,
-                mask=None, control_strength=1.0, edit_reference=None):
+                mask=None, control_strength=1.0):
         if control_image is not None and qwen_control is None:
             logger.warning(
                 "QwenImageImg2Img: control_image was given, but no qwen_control was "
@@ -342,26 +337,26 @@ class QwenImageImg2Img:
             control_image = None
 
         if qwen_control is not None and control_image is None and control_mode != "none":
-            if control_mode == "auto_canny" and image is not None:
-                logger.info("Qwen-Image: auto-deriving a canny edge map from image "
+            if control_mode == "auto_canny" and images is not None:
+                logger.info("Qwen-Image: auto-deriving a canny edge map from images "
                             "(control_mode=auto_canny)")
-                control_image = _auto_canny_control_image(image)
-            elif control_mode == "auto_depth" and image is not None:
-                logger.info("Qwen-Image: auto-deriving a depth map from image "
+                control_image = _auto_canny_control_image(images)
+            elif control_mode == "auto_depth" and images is not None:
+                logger.info("Qwen-Image: auto-deriving a depth map from images "
                             "(control_mode=auto_depth)")
-                control_image = _depth_anything_batch(image, depth_ckpt_name)
+                control_image = _depth_anything_batch(images, depth_ckpt_name)
             else:
                 raise ValueError(
                     "qwen_control was given, but no usable control_image is available. "
                     "Connect control_image directly, or set control_mode to auto_canny/"
-                    "auto_depth with an image connected. control_image is required even "
+                    "auto_depth with images connected. control_image is required even "
                     "for an inpaint checkpoint - mask (optional) only refines the region, "
                     "it doesn't replace it.")
         elif qwen_control is not None and control_mode == "none":
             logger.info("Qwen-Image: control_mode=none - skipping control attachment even "
                         "though qwen_control is connected.")
 
-        if image is None:
+        if images is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own
             # sampling path (comfy.sample.fix_empty_latent_channels, called from
             # common_ksampler) corrects channel count and adds the time dimension
@@ -374,7 +369,7 @@ class QwenImageImg2Img:
             logger.info("Qwen-Image: txt2img, empty latent %s", tuple(latent.shape))
         else:
             pixels = comfy.utils.common_upscale(
-                image.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+                images.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
             latent = vae.encode(pixels[:, :, :, :3])
             if batch_size > 1:
                 latent = latent.repeat(batch_size, *([1] * (latent.dim() - 1)))
@@ -383,16 +378,6 @@ class QwenImageImg2Img:
 
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
-
-        if edit_reference is not None:
-            ref_pixels = comfy.utils.common_upscale(
-                edit_reference.movedim(-1, 1), width, height, "lanczos", "disabled"
-            ).movedim(1, -1)[:, :, :, :3]
-            ref_latent = vae.encode(ref_pixels)
-            positive = node_helpers.conditioning_set_values(
-                positive, {"reference_latents": [ref_latent]}, append=True)
-            logger.info("Qwen-Image: edit_reference attached to positive conditioning "
-                        "(reference_latents) - real edit-model conditioning, not ControlNet")
 
         if qwen_control is not None and control_image is not None:
             control_pixels = comfy.utils.common_upscale(

@@ -2111,3 +2111,71 @@ call sites across `tools/smoke_flux_klein.py` to unpack 4 values instead
 of 5, README, and this file's own prior entry. Real-environment check
 confirmed the new `RETURN_TYPES`/`RETURN_NAMES` and that `prepare()`
 returns exactly a 4-tuple against the real VAE/CLIP.
+
+## Krea2Img2Img/QwenImageImg2Img: dead-simple images/control_image, edit_reference removed (2026-08-26)
+
+Same investigation thread as the Klein `control_mode=none` bug, but the
+user reported a fresh symptom on a totally different node
+(`krea2_img2img.json`, Krea2's canny Control LoRA, "change her shirt to
+a plain black top" not applying). Traced the actual saved workflow JSON,
+same discipline as the Klein debugging: found `Krea2Img2Img.denoise`
+output wasn't wired to `KSampler.denoise` at all (KSampler used its own
+literal `1.0` widget, silently ignoring the configured `strength=0.33`),
+and separately that `auto_canny`/`auto_depth` derivation was hardcoded to
+only ever read `image`, with no fallback to `edit_reference` - so moving
+the photo to `edit_reference` (the fix I first suggested) broke the
+Control LoRA auto-derivation entirely (`raise ValueError(...)`, "no image
+was given to derive a control image from").
+
+Confirmed the identical narrow gap exists in `QwenImageImg2Img`
+(`nodes/qwen_image.py:345,349`, hardcoded to `image` only). Started
+patching both with an `image`-else-`edit_reference` fallback, but the
+user stopped mid-edit and pushed for the real fix instead: "edit
+reference goes away that doesn't make sense and isnt working properly.
+klein doesn't have an edit reference slot, it has images and a control
+net image slot. dead simple" / "you need one or more images for img2img
+and a controlnet image for control net, i dont understand what else you
+need."
+
+Had my own understanding of img2img directly challenged and corrected
+mid-conversation: initially conflated "does this node take a photo" with
+"is this img2img" and proposed dropping partial-denoise img2img entirely
+to match Klein's shape - wrong, since (unlike Klein, which never uses
+partial-denoise in any real workflow) Krea2/Qwen-Image's `image`+
+`strength` IS real, legitimate, working img2img (VAE-encode, add noise
+proportional to `1 - strength`, denoise from there) and removing it would
+be a real capability loss, not a naming cleanup. The user's actual
+correction: `images` (renamed from `image`, batch-aware) STAYS real
+img2img - `edit_reference`'s separate reference_latents mechanism is what
+goes away, since it's redundant with `images` doing the actual editing
+job and it wasn't working right anyway.
+
+Applied to both `Krea2Img2Img` and `QwenImageImg2Img`:
+- `image` -> `images` (identical code - `vae.encode()`/`KSampler` already
+  process a batched tensor as N independent parallel generations, no
+  per-image loop needed unlike Klein's reference_latents case, since
+  this is genuine partial-denoise img2img, not reference conditioning).
+- `edit_reference` and its whole `reference_latents`-attachment code
+  block removed entirely from both nodes.
+- `auto_canny`/`auto_depth` derivation now reads `images` (the renamed
+  slot) - the `derive_source`-fallback patch became unnecessary once
+  `edit_reference` was gone, so it was reverted rather than kept as dead
+  code.
+- `Krea2ControlLoRALoader`'s docstring/log line pointed at
+  `edit_reference` for ordinary in-context LoRAs (e.g.
+  `krea2_canny-v0.1.safetensors`) - updated to point at
+  ComfyUI-Flux-Reference-Tools instead, since there's no in-repo
+  reference-conditioning mechanism left on these two nodes for that kind
+  of LoRA.
+
+`tools/smoke_krea2.py`/`tools/smoke_qwen_image.py`: renamed every
+`image=`/`image is not None` test call site to `images=`, dropped both
+`edit_reference` tests, added a batch test per file (a 3-image batch in
+`images` produces a batch-3 latent - `vae.encode()`'s own batch handling
+does the work, confirmed with a batch-aware fake VAE since the shared
+`_vae()` fixture in both files returns a fixed batch-1 shape regardless
+of input). 29/29 (Krea2) and 14/14 (Qwen-Image), no GPU. Real-environment
+check against the real portable ComfyUI: confirmed `INPUT_TYPES` on both
+nodes have `images` and no `image`/`edit_reference`, and exercised the
+`images`-connected/no-Control-LoRA path end to end against real object
+shapes.

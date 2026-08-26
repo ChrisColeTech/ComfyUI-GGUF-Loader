@@ -354,7 +354,7 @@ def test_img2img_rejects_loaded_lora_without_control_image():
     except ValueError as e:
         raised = "control_image" in str(e)
     assert raised
-    print("[ok] Krea2Img2Img: Control LoRA loaded, auto_depth mode, no image or control_image -> raises")
+    print("[ok] Krea2Img2Img: Control LoRA loaded, auto_depth mode, no images or control_image -> raises")
 
 
 def test_img2img_manual_mode_requires_control_image():
@@ -365,16 +365,16 @@ def test_img2img_manual_mode_requires_control_image():
     vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
     try:
         node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
-                     image=torch.rand(1, 32, 32, 3), control_mode="manual")
+                     images=torch.rand(1, 32, 32, 3), control_mode="manual")
         raised = False
     except ValueError as e:
         raised = "manual" in str(e) and "control_image" in str(e)
     assert raised
-    print("[ok] Krea2Img2Img: Control LoRA loaded, manual mode, image given but no "
+    print("[ok] Krea2Img2Img: Control LoRA loaded, manual mode, images given but no "
           "control_image -> raises (manual mode never auto-derives)")
 
 
-def test_img2img_auto_depth_derives_control_image_from_image():
+def test_img2img_auto_depth_derives_control_image_from_images():
     # Auto-derivation goes through depth_anything_v2.DepthAnythingV2Detector,
     # which needs real downloaded weights - not appropriate for an offline
     # smoke test. Swap in a fake detector to verify the wiring/control flow
@@ -399,15 +399,15 @@ def test_img2img_auto_depth_derives_control_image_from_image():
             encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
         vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
         result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
-                              image=torch.rand(1, 32, 32, 3))
+                              images=torch.rand(1, 32, 32, 3))
         assert result is not None
     finally:
         krea2.depth_anything_v2.DepthAnythingV2Detector = original
     print("[ok] Krea2Img2Img: auto_depth mode (default) derives control_image from "
-          "image automatically - one photo, one slot")
+          "images automatically - one photo, one slot")
 
 
-def test_img2img_auto_canny_derives_control_image_from_image():
+def test_img2img_auto_canny_derives_control_image_from_images():
     # cv2.Canny is real, deterministic, no model - no fake needed, unlike auto_depth.
     node = krea2.Krea2Img2Img()
     model = _FakeModelPatcher(attachments={krea2.WRAPPER_KEY: {}})
@@ -415,9 +415,9 @@ def test_img2img_auto_canny_derives_control_image_from_image():
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
     vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
     result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
-                          image=torch.rand(1, 32, 32, 3), control_mode="auto_canny")
+                          images=torch.rand(1, 32, 32, 3), control_mode="auto_canny")
     assert result is not None
-    print("[ok] Krea2Img2Img: auto_canny mode derives control_image from image "
+    print("[ok] Krea2Img2Img: auto_canny mode derives control_image from images "
           "automatically via cv2.Canny")
 
 
@@ -439,7 +439,7 @@ def test_img2img_control_mode_none_skips_control_even_with_lora_loaded():
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
     vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
     result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
-                          image=torch.rand(1, 32, 32, 3), control_mode="none")
+                          images=torch.rand(1, 32, 32, 3), control_mode="none")
     assert result is not None
     print("[ok] Krea2Img2Img: control_mode=none skips control attachment even "
           "though a Control LoRA is loaded, instead of raising")
@@ -462,7 +462,7 @@ def test_img2img_explicit_control_image_overrides_auto_depth():
             encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
         vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
         result = node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 32, 32,
-                              image=torch.rand(1, 32, 32, 3),
+                              images=torch.rand(1, 32, 32, 3),
                               control_image=torch.rand(1, 32, 32, 3))
         assert result is not None
     finally:
@@ -481,35 +481,35 @@ def test_img2img_txt2img_empty_latent_shape():
         model, clip, vae, "prompt", "", 0.6, 1, 64, 64)
     assert latent["samples"].shape == (1, 4, 8, 8)
     assert denoise == 1.0
-    print("[ok] Krea2Img2Img: txt2img (no image) -> empty latent sized off width/height, denoise=1.0")
+    print("[ok] Krea2Img2Img: txt2img (no images) -> empty latent sized off width/height, denoise=1.0")
 
 
-def test_img2img_with_image_uses_strength_as_denoise():
+def test_img2img_with_images_uses_strength_as_denoise():
     node = krea2.Krea2Img2Img()
     model = _FakeModelPatcher()
     clip = types.SimpleNamespace(
         encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
     vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
     _, _, _, latent, denoise = node.prepare(
-        model, clip, vae, "prompt", "", 0.42, 1, 64, 64, image=torch.rand(1, 64, 64, 3))
+        model, clip, vae, "prompt", "", 0.42, 1, 64, 64, images=torch.rand(1, 64, 64, 3))
     assert denoise == 0.42
-    print("[ok] Krea2Img2Img: img2img (image given) -> denoise = strength")
+    print("[ok] Krea2Img2Img: img2img (images given) -> denoise = strength")
 
 
-def test_img2img_edit_reference_attaches_reference_latents_to_positive_only():
+def test_img2img_images_batch_produces_batched_latent():
+    # A batch of N images naturally becomes N independent img2img
+    # generations via vae.encode()'s own batch handling - no per-image
+    # loop needed here, unlike Klein's reference_latents attachment.
     node = krea2.Krea2Img2Img()
     model = _FakeModelPatcher()
     clip = types.SimpleNamespace(
-        encode_from_tokens_scheduled=lambda t: [[torch.zeros(1, 1, 4), {}]],
-        tokenize=lambda s: s)
-    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(1, 16, 1, 8, 8))
-    _, positive, negative, _, _ = node.prepare(
-        model, clip, vae, "prompt", "", 0.6, 1, 64, 64,
-        edit_reference=torch.rand(1, 64, 64, 3))
-    assert "reference_latents" in positive[0][1]
-    assert "reference_latents" not in negative[0][1]
-    print("[ok] Krea2Img2Img: edit_reference attaches reference_latents to "
-          "positive conditioning only")
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s: s)
+    vae = types.SimpleNamespace(encode=lambda img: torch.zeros(img.shape[0], 16, 1, 8, 8))
+    _, _, _, latent, denoise = node.prepare(
+        model, clip, vae, "prompt", "", 0.5, 1, 64, 64, images=torch.rand(3, 64, 64, 3))
+    assert latent["samples"].shape[0] == 3
+    print("[ok] Krea2Img2Img: a 3-image batch in `images` produces a batch-3 latent "
+          "(3 independent img2img generations)")
 
 
 # ── Krea2KSampler ─────────────────────────────────────────────────────────
@@ -581,14 +581,14 @@ if __name__ == "__main__":
     test_img2img_ignores_control_image_without_loaded_lora()
     test_img2img_rejects_loaded_lora_without_control_image()
     test_img2img_manual_mode_requires_control_image()
-    test_img2img_auto_depth_derives_control_image_from_image()
-    test_img2img_auto_canny_derives_control_image_from_image()
+    test_img2img_auto_depth_derives_control_image_from_images()
+    test_img2img_auto_canny_derives_control_image_from_images()
     test_auto_canny_control_image_produces_edge_map_matching_input_shape()
     test_img2img_control_mode_none_skips_control_even_with_lora_loaded()
     test_img2img_explicit_control_image_overrides_auto_depth()
     test_img2img_txt2img_empty_latent_shape()
-    test_img2img_with_image_uses_strength_as_denoise()
-    test_img2img_edit_reference_attaches_reference_latents_to_positive_only()
+    test_img2img_with_images_uses_strength_as_denoise()
+    test_img2img_images_batch_produces_batched_latent()
     test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
     test_ksampler_diffusers_mode_rejects_zero_denoise()
     test_ksampler_diffusers_mode_slices_sigmas_from_t_start()
