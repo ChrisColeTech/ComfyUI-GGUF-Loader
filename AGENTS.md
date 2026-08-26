@@ -2319,11 +2319,13 @@ wrapper landed in `model_options["transformer_options"]["wrappers"]`.
 
 Ported `krea2_edit_forward` + its helpers (`_imgids`, `_imgids_offset`,
 `_to_4d`, `_fit_src`, `_fit_encode_image`, `_ref_attn_bias`) and both
-node classes near-verbatim into `nodes/krea2.py`, keeping the exact same
-`NODE_CLASS_MAPPINGS` keys (`Krea2EditModelPatch`, `Krea2EditGroundedEncode`)
-the source pack uses, so any workflow already built against
-comfyui-krea2edit keeps resolving if that pack is swapped out for this
-one. `print(..., flush=True)` debug statements replaced with this
+node classes near-verbatim into `nodes/krea2.py`. Originally registered
+under the source pack's own `NODE_CLASS_MAPPINGS` keys (`Krea2EditModelPatch`,
+`Krea2EditGroundedEncode`) so a workflow built against comfyui-krea2edit
+would keep resolving if that pack were swapped out for this one -
+superseded 2026-08-26 below once that turned out to actively collide
+with the original pack when BOTH are installed at once (the more common
+case in practice). `print(..., flush=True)` debug statements replaced with this
 repo's own `logger.info`/`logger.warning` convention; two dead imports
 (`apply_rope`, `optimized_attention_masked` - confirmed unused via grep,
 vestigial from a larger file this distribution was trimmed from) were
@@ -2426,3 +2428,34 @@ pytest suite. Real-environment check against the actual portable
 ComfyUI: all six classes register, plain nodes have exactly zero of the
 control-related keys, and each `*ControlNetImg2Img`'s `INPUT_TYPES` is
 confirmed a strict superset of its plain sibling's.
+
+## Fix: Krea2EditModelPatch/Krea2EditGroundedEncode invisible with comfyui-krea2edit installed (2026-08-26)
+
+User reported not being able to find these two nodes in Add Node at
+all, despite the server log showing the package importing cleanly and
+both classes present in `nodes/krea2.py`'s `NODE_CLASS_MAPPINGS`.
+Traced it to the deliberate choice made when porting them (see the
+entry above): they were registered under the exact same
+`NODE_CLASS_MAPPINGS` string keys (`"Krea2EditModelPatch"`,
+`"Krea2EditGroundedEncode"`) as the original `comfyui-krea2edit`
+package they were ported from. ComfyUI merges every installed custom
+node package's `NODE_CLASS_MAPPINGS` into one process-wide dict keyed
+by that string - not namespaced per package - so with BOTH packs
+installed (the user's actual setup, confirmed via their server log:
+`comfyui-gguf-loader` imports first, `[krea2edit] nodes v1.2.5 loaded`
+right after it), whichever pack's `__init__.py` runs later silently
+overwrites the earlier pack's dict entry for that key. Ours lost:
+`comfyui-krea2edit` loads second, so Add Node only ever surfaced its
+version, even though our code was fully imported and registered too -
+no error, no warning, just a quiet dict overwrite.
+
+Fix: renamed only the two colliding registration keys to
+`"CCTechKrea2EditModelPatch"`/`"CCTechKrea2EditGroundedEncode"` in
+`nodes/krea2.py`'s `NODE_CLASS_MAPPINGS`/`NODE_DISPLAY_NAME_MAPPINGS`.
+The Python class names (`Krea2EditModelPatch`, `Krea2EditGroundedEncode`)
+are untouched - they live in this repo's own module namespace and were
+never actually part of the collision; only the registration key is a
+process-wide shared namespace across every installed pack. Every other
+node in this file already uses a `Krea2`-prefixed (not bare) id and
+was never at risk - these two were the only ones a straight verbatim
+port left un-namespaced.

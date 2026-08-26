@@ -1687,8 +1687,16 @@ NODE_CLASS_MAPPINGS = {
     "Krea2Img2Img": Krea2Img2Img,
     "Krea2ControlNetImg2Img": Krea2ControlNetImg2Img,
     "Krea2KSampler": Krea2KSampler,
-    "Krea2EditModelPatch": Krea2EditModelPatch,
-    "Krea2EditGroundedEncode": Krea2EditGroundedEncode,
+    # Namespaced (not "Krea2EditModelPatch"/"Krea2EditGroundedEncode"): those
+    # ids collide with the original comfyui-krea2edit package's own nodes of
+    # the same name (this pack is a faithful port of them) - when both packs
+    # are installed, ComfyUI's global NODE_CLASS_MAPPINGS dict is keyed by id
+    # string across ALL custom node packages, so whichever pack's __init__.py
+    # runs last silently overwrites the other's entry for that id. Prefixing
+    # ours keeps both packs' nodes selectable side by side instead of one
+    # invisibly shadowing the other.
+    "CCTechKrea2EditModelPatch": Krea2EditModelPatch,
+    "CCTechKrea2EditGroundedEncode": Krea2EditGroundedEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1697,7 +1705,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2DepthMap": "Krea2 Depth Map ⚡",
     "Krea2Img2Img": Krea2Img2Img.TITLE,
     "Krea2ControlNetImg2Img": Krea2ControlNetImg2Img.TITLE,
-    "Krea2EditModelPatch": Krea2EditModelPatch.TITLE,
-    "Krea2EditGroundedEncode": Krea2EditGroundedEncode.TITLE,
+    "CCTechKrea2EditModelPatch": Krea2EditModelPatch.TITLE,
+    "CCTechKrea2EditGroundedEncode": Krea2EditGroundedEncode.TITLE,
     "Krea2KSampler": Krea2KSampler.TITLE,
 }
