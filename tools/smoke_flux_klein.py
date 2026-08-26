@@ -102,34 +102,27 @@ def _vae():
 
 # ── FluxKleinImg2Img ─────────────────────────────────────────────────────
 
-def test_img2img_txt2img_uses_flux2_real_empty_latent_shape():
+def test_img2img_always_uses_flux2_real_empty_latent_shape_and_full_denoise():
     node = fk.FluxKleinImg2Img()
     model = object()
     _, _, _, latent, denoise = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 128, 128)
+        model, _clip(), _vae(), "prompt", "", 1, 128, 128)
     # width=height=128 -> //16 = 8; 128 channels is Flux.2's real channel
     # count (comfy_extras/nodes_flux.py's EmptyFlux2LatentImage), NOT the
     # generic 4-channel/8-downscale placeholder used for Krea2/Qwen-Image.
+    # denoise is always 1.0 now - there is no partial-denoise img2img path,
+    # since no real Klein edit example ever uses one.
     assert latent["samples"].shape == (1, 128, 8, 8)
     assert denoise == 1.0
-    print("[ok] FluxKleinImg2Img: txt2img -> empty latent uses Flux.2's real "
-          "128-channel/16-downscale shape, denoise=1.0")
+    print("[ok] FluxKleinImg2Img: empty latent uses Flux.2's real 128-channel/"
+          "16-downscale shape, denoise is always 1.0 (pure-noise start)")
 
 
-def test_img2img_with_image_uses_strength_as_denoise():
-    node = fk.FluxKleinImg2Img()
-    model = object()
-    _, _, _, latent, denoise = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.42, 1, 64, 64, image=torch.rand(1, 64, 64, 3))
-    assert denoise == 0.42
-    print("[ok] FluxKleinImg2Img: img2img (image given) -> denoise = strength")
-
-
-def test_img2img_batch_size_repeats_txt2img_latent():
+def test_img2img_batch_size_repeats_empty_latent():
     node = fk.FluxKleinImg2Img()
     model = object()
     _, _, _, latent, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 3, 128, 128)
+        model, _clip(), _vae(), "prompt", "", 3, 128, 128)
     assert latent["samples"].shape == (3, 128, 8, 8)
     print("[ok] FluxKleinImg2Img: batch_size repeats the empty latent correctly")
 
@@ -152,9 +145,9 @@ def test_scale_to_megapixels_square_input_stays_square():
     print("[ok] _scale_to_megapixels: square input stays square")
 
 
-def test_img2img_canvas_derives_from_reference_image_aspect_ratio_not_widget_defaults():
+def test_img2img_canvas_derives_from_images_aspect_ratio_not_widget_defaults():
     # Widget width/height default to a square 1024x1024 budget, but a
-    # non-square reference_image must reshape the canvas to match its own
+    # non-square `images` input must reshape the canvas to match its own
     # aspect ratio - this was the actual bug: previously the reference image
     # got center-cropped to whatever aspect ratio the widgets said, silently
     # distorting it.
@@ -162,71 +155,89 @@ def test_img2img_canvas_derives_from_reference_image_aspect_ratio_not_widget_def
     model = object()
     wide_ref = torch.rand(1, 512, 1024, 3)  # 2:1 landscape
     _, _, _, latent, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 1024, 1024,
-        reference_image=wide_ref, control_mode="manual")
+        model, _clip(), _vae(), "prompt", "", 1, 1024, 1024,
+        images=wide_ref, control_mode="manual")
     lat_h, lat_w = latent["samples"].shape[-2], latent["samples"].shape[-1]
     # Landscape reference -> landscape (or at least non-square) latent, not
     # forced into the widgets' square 1024x1024 default.
     assert lat_w > lat_h
-    print("[ok] FluxKleinImg2Img: canvas aspect ratio derives from reference_image, "
+    print("[ok] FluxKleinImg2Img: canvas aspect ratio derives from `images`, "
           "not the square widget defaults")
 
 
-def test_img2img_canvas_prioritizes_image_over_reference_image_for_sizing():
+def test_img2img_canvas_prioritizes_images_over_control_source_image_for_sizing():
     node = fk.FluxKleinImg2Img()
     model = object()
-    tall_image = torch.rand(1, 1024, 512, 3)   # 1:2 portrait (the actual img2img target)
-    wide_ref = torch.rand(1, 512, 1024, 3)     # 2:1 landscape (just a reference)
+    tall_images = torch.rand(1, 1024, 512, 3)      # 1:2 portrait
+    wide_control = torch.rand(1, 512, 1024, 3)     # 2:1 landscape (just a control source)
     encoded_shapes = []
     vae = types.SimpleNamespace(encode=lambda pixels: (
         encoded_shapes.append(tuple(pixels.shape)) or torch.zeros(1, 128, 8, 8)))
-    node.prepare(model, _clip(), vae, "prompt", "", 0.6, 1, 1024, 1024,
-                 image=tall_image, reference_image=wide_ref, control_mode="manual")
-    # First encode() call is `image` (the actual canvas) - its own pixel
-    # shape must be portrait (h > w), not reshaped to reference_image's
+    node.prepare(model, _clip(), vae, "prompt", "", 1, 1024, 1024,
+                 images=tall_images, control_source_image=wide_control, control_mode="manual")
+    # First encode() call is `images` (sizing priority) - its own pixel
+    # shape must be portrait (h > w), not reshaped to control_source_image's
     # landscape aspect ratio or the widgets' square default.
     img_h, img_w = encoded_shapes[0][1], encoded_shapes[0][2]
     assert img_h > img_w
-    print("[ok] FluxKleinImg2Img: `image` takes priority over `reference_image` for "
+    print("[ok] FluxKleinImg2Img: `images` takes priority over `control_source_image` for "
           "canvas sizing when both are connected")
 
 
-def test_img2img_reference_image_2_attaches_raw_alongside_reference_image():
+def test_img2img_images_batch_attaches_one_reference_latent_per_image():
     node = fk.FluxKleinImg2Img()
     model = object()
+    batch = torch.rand(2, 64, 64, 3)  # two stacked reference photos, one socket
     _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        reference_image=torch.rand(1, 64, 64, 3),
-        reference_image_2=torch.rand(1, 64, 64, 3), control_mode="manual")
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+        images=batch, control_mode="manual")
     assert len(positive[0][1]["reference_latents"]) == 2
     assert len(negative[0][1]["reference_latents"]) == 2
-    print("[ok] FluxKleinImg2Img: reference_image_2 attaches raw alongside reference_image "
-          "(2 reference_latents total, matching the real dual-reference example workflow)")
+    print("[ok] FluxKleinImg2Img: a 2-image batch in `images` attaches 2 separate "
+          "reference_latents (one per image, matching the real dual-reference example "
+          "workflow's per-image ReferenceLatent chain), not one batched encode")
 
 
-def test_img2img_reference_image_2_alone_works_without_reference_image():
+def test_img2img_images_single_attaches_to_both_conditionings():
     node = fk.FluxKleinImg2Img()
     model = object()
     _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        reference_image_2=torch.rand(1, 64, 64, 3))
-    assert len(positive[0][1]["reference_latents"]) == 1
-    print("[ok] FluxKleinImg2Img: reference_image_2 works standalone without reference_image")
-
-
-def test_img2img_reference_image_manual_attaches_to_both_conditionings():
-    node = fk.FluxKleinImg2Img()
-    model = object()
-    _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        reference_image=torch.rand(1, 64, 64, 3), control_mode="manual")
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+        images=torch.rand(1, 64, 64, 3))
     assert "reference_latents" in positive[0][1]
     assert "reference_latents" in negative[0][1]
-    print("[ok] FluxKleinImg2Img: reference_image (manual) attaches reference_latents "
-          "to positive AND negative conditioning")
+    print("[ok] FluxKleinImg2Img: `images` attaches reference_latents to positive AND "
+          "negative conditioning")
 
 
-def test_img2img_reference_image_auto_depth_uses_depth_helper():
+def test_img2img_control_source_image_manual_attaches_raw():
+    node = fk.FluxKleinImg2Img()
+    model = object()
+    _, positive, negative, _, _ = node.prepare(
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+        control_source_image=torch.rand(1, 64, 64, 3), control_mode="manual")
+    assert "reference_latents" in positive[0][1]
+    assert "reference_latents" in negative[0][1]
+    print("[ok] FluxKleinImg2Img: control_source_image (manual) attaches reference_latents "
+          "raw, standalone without `images`")
+
+
+def test_img2img_images_and_control_source_image_combine():
+    node = fk.FluxKleinImg2Img()
+    model = object()
+    _, positive, negative, _, _ = node.prepare(
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+        images=torch.rand(1, 64, 64, 3),
+        control_source_image=torch.rand(1, 64, 64, 3), control_mode="manual")
+    # One from `images`, one from control_source_image, appended after it -
+    # matching the real dual-reference chain ordering.
+    assert len(positive[0][1]["reference_latents"]) == 2
+    assert len(negative[0][1]["reference_latents"]) == 2
+    print("[ok] FluxKleinImg2Img: `images` and `control_source_image` combine into 2 "
+          "reference_latents, control_source_image appended after images")
+
+
+def test_img2img_control_source_image_auto_depth_uses_depth_helper():
     node = fk.FluxKleinImg2Img()
     model = object()
     calls = []
@@ -235,40 +246,40 @@ def test_img2img_reference_image_auto_depth_uses_depth_helper():
         calls.append((tuple(image.shape), ckpt_name)) or torch.rand(1, 64, 64, 3))
     try:
         _, positive, _, _, _ = node.prepare(
-            model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-            reference_image=torch.rand(1, 64, 64, 3), control_mode="auto_depth")
+            model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+            control_source_image=torch.rand(1, 64, 64, 3), control_mode="auto_depth")
     finally:
         fk._depth_anything_batch = original
     assert len(calls) == 1
     assert "reference_latents" in positive[0][1]
-    print("[ok] FluxKleinImg2Img: control_mode=auto_depth runs reference_image through "
-          "the depth helper before attaching reference_latents")
+    print("[ok] FluxKleinImg2Img: control_mode=auto_depth runs control_source_image "
+          "through the depth helper before attaching reference_latents")
 
 
-def test_img2img_reference_image_auto_canny_derives_edge_map():
+def test_img2img_control_source_image_auto_canny_derives_edge_map():
     # auto_canny needs no model download (plain cv2.Canny) - exercise it
     # for real, confirming FluxKleinImg2Img actually attaches reference_latents.
     node = fk.FluxKleinImg2Img()
     model = object()
     _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        reference_image=torch.rand(1, 64, 64, 3), control_mode="auto_canny")
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+        control_source_image=torch.rand(1, 64, 64, 3), control_mode="auto_canny")
     assert "reference_latents" in positive[0][1]
     assert "reference_latents" in negative[0][1]
     print("[ok] FluxKleinImg2Img: control_mode=auto_canny derives an edge map and "
           "attaches reference_latents")
 
 
-def test_img2img_control_mode_none_skips_reference_attachment_even_if_connected():
+def test_img2img_control_mode_none_skips_control_source_image_even_if_connected():
     node = fk.FluxKleinImg2Img()
     model = object()
     _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64,
-        reference_image=torch.rand(1, 64, 64, 3), control_mode="none")
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64,
+        control_source_image=torch.rand(1, 64, 64, 3), control_mode="none")
     assert "reference_latents" not in positive[0][1]
     assert "reference_latents" not in negative[0][1]
-    print("[ok] FluxKleinImg2Img: control_mode=none skips reference attachment even "
-          "though reference_image is connected")
+    print("[ok] FluxKleinImg2Img: control_mode=none skips control_source_image attachment "
+          "even though it's connected")
 
 
 def test_control_modes_are_the_minimum_set():
@@ -277,14 +288,14 @@ def test_control_modes_are_the_minimum_set():
           "auto_canny/none), matching Krea2Img2Img/QwenImageImg2Img exactly")
 
 
-def test_img2img_no_reference_image_leaves_conditioning_unchanged():
+def test_img2img_nothing_connected_leaves_conditioning_unchanged():
     node = fk.FluxKleinImg2Img()
     model = object()
     _, positive, negative, _, _ = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 0.6, 1, 64, 64)
+        model, _clip(), _vae(), "prompt", "", 1, 64, 64)
     assert "reference_latents" not in positive[0][1]
     assert "reference_latents" not in negative[0][1]
-    print("[ok] FluxKleinImg2Img: no reference_image -> no reference_latents attached")
+    print("[ok] FluxKleinImg2Img: nothing connected -> no reference_latents attached")
 
 
 # ── Flux2KleinDepthMap (backward-compat alias -> shared DepthMap) ───────
@@ -487,19 +498,19 @@ def test_sectioned_encoder_warns_without_tokenizer_but_still_encodes():
 if __name__ == "__main__":
     test_scale_to_megapixels_preserves_aspect_ratio()
     test_scale_to_megapixels_square_input_stays_square()
-    test_img2img_canvas_derives_from_reference_image_aspect_ratio_not_widget_defaults()
-    test_img2img_canvas_prioritizes_image_over_reference_image_for_sizing()
-    test_img2img_reference_image_2_attaches_raw_alongside_reference_image()
-    test_img2img_reference_image_2_alone_works_without_reference_image()
-    test_img2img_txt2img_uses_flux2_real_empty_latent_shape()
-    test_img2img_with_image_uses_strength_as_denoise()
-    test_img2img_batch_size_repeats_txt2img_latent()
-    test_img2img_reference_image_manual_attaches_to_both_conditionings()
-    test_img2img_reference_image_auto_depth_uses_depth_helper()
-    test_img2img_reference_image_auto_canny_derives_edge_map()
-    test_img2img_control_mode_none_skips_reference_attachment_even_if_connected()
+    test_img2img_canvas_derives_from_images_aspect_ratio_not_widget_defaults()
+    test_img2img_canvas_prioritizes_images_over_control_source_image_for_sizing()
+    test_img2img_images_batch_attaches_one_reference_latent_per_image()
+    test_img2img_images_single_attaches_to_both_conditionings()
+    test_img2img_control_source_image_manual_attaches_raw()
+    test_img2img_images_and_control_source_image_combine()
+    test_img2img_always_uses_flux2_real_empty_latent_shape_and_full_denoise()
+    test_img2img_batch_size_repeats_empty_latent()
+    test_img2img_control_source_image_auto_depth_uses_depth_helper()
+    test_img2img_control_source_image_auto_canny_derives_edge_map()
+    test_img2img_control_mode_none_skips_control_source_image_even_if_connected()
     test_control_modes_are_the_minimum_set()
-    test_img2img_no_reference_image_leaves_conditioning_unchanged()
+    test_img2img_nothing_connected_leaves_conditioning_unchanged()
     test_depth_map_node_delegates_to_depth_helper()
     test_identity_transfer_disabled_is_a_noop()
     test_identity_transfer_enabled_registers_output_patch_only_by_default()

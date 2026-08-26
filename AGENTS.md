@@ -1992,3 +1992,105 @@ Flux.2 VAE, and a real loaded Klein CLIP: a 2:1 landscape
 latent instead of the old square default, and `reference_image` +
 `reference_image_2` together produced exactly 2 `reference_latents`
 entries on both positive and negative conditioning.
+
+## Fix: control_mode=none was silently dropping the raw reference too (2026-08-25)
+
+User caught this against a REAL edit attempt, not a review: wired a photo
+into the previous `reference_image` slot, used the exact real Flux2Scheduler
++ CFGGuider + SamplerCustomAdvanced sampler chain (matching the shipped
+example workflow precisely, cfg=5, correct resolution), and still got "a
+coherent image, but not the edit" - same symptom reported the first time,
+with `image` wired instead of `reference_image`. Traced it by re-reading
+the user's saved workflow JSONs directly: `control_mode` was left at
+`'none'` in both graphs (a leftover default), and the previous
+`FluxKleinImg2Img.prepare()` had `if reference_image is not None and
+control_mode == "none": skip` - `none` was implemented to mean "skip
+reference attachment entirely," not "skip only the depth/canny
+preprocessing," so a genuinely-connected `reference_image` got silently
+dropped with zero error/warning surfaced to the user, and the model just
+fell back to prompt-only generation - explaining the "coherent but wrong"
+symptom exactly.
+
+Root cause: `reference_image` was doing double duty as both Klein's raw
+identity/content reference AND the thing `control_mode` decided how to
+preprocess, so there was no way to say "attach raw, skip only
+preprocessing" separately from "skip attaching it at all" - `manual`
+already meant "attach raw," leaving `none` nothing to mean except "don't
+attach." Checked whether `Krea2Img2Img`/`QwenImageImg2Img` have the same
+bug (`nodes/krea2.py:989-994`, `nodes/qwen_image.py:387-395`): they don't
+- both keep `edit_reference` (their raw-reference equivalent) in its own
+independent code block, never touched by `control_mode`, which only ever
+gates `control_image`/`qwen_control`. On those two, `control_mode="none"`
+in the worst case only skips *auto-deriving* a control image when one
+wasn't explicitly supplied (`control_image is None` guards the whole
+branch) - an explicitly-connected `control_image` is never dropped by
+`none`. Klein was the outlier because it never had that two-slot
+separation to begin with.
+
+User pushed on the actual design ("that is not correct... you still need
+a slot for the controlnet image, how else would you attach it" /
+"imagine we took control net out of the picture, which slot would i use
+to reproduce the actual proper workflow" / "so then it should be one
+slot that says images, and accept one or more image nodes") - landed on
+splitting `FluxKleinImg2Img` into the same two-slot shape Krea2/Qwen-
+Image already use, closing the bug by construction rather than just
+fixing the one conditional:
+
+- `images` (single IMAGE socket, batch-aware) - one or more RAW reference
+  photos, always attached to `reference_latents` on positive+negative
+  when connected, with ZERO dependency on `control_mode`. Researched
+  whether comfy has a native "one socket, many wires" mechanism before
+  picking this shape (`io.Autogrow`, `comfy_api/latest/_io.py:1053-1166`)
+  - real, but V3-only, and every node in this pack is still V1-style
+    (`INPUT_TYPES`); migrating just Klein would make it inconsistent with
+    Krea2/Qwen-Image. Went with a single `IMAGE` socket that treats its
+    batch dimension as N separate images internally (`for i in
+    range(images.shape[0]): ...` - each its own `VAEEncode` +
+    `reference_latents` append, never one batched encode) - combine
+    multiple photos upstream via stock ComfyUI's "Batch Images" node.
+    This exactly reproduces the real dual-reference example subgraph's
+    own per-image `ReferenceLatent` chain, confirmed by re-reading its
+    node graph (not assumed).
+- `control_source_image` (single IMAGE) + `control_mode` - a photo to
+  turn INTO a controlnet-style map (Klein has no real ControlNet/
+  Control-LoRA of its own) via this pack's Depth Anything V2/`cv2.Canny`,
+  then attached through the SAME `reference_latents` mechanism as
+  `images`, appended after them. `control_mode` now applies ONLY to this
+  slot - `none` skips `control_source_image` attachment and can no
+  longer reach `images` at all, closing the bug by construction rather
+  than by careful conditional ordering.
+
+Also dropped the `image`/`strength` partial-denoise img2img slot
+entirely, confirmed with the user this was intentional and fine to lose
+("i never said drop denoise dial - but it is redundant because its in
+the ksampler, so thats ok"): no real Klein edit example ever partially
+denoises the source photo, `denoise` is now a fixed `1.0` output. This
+also makes `QwenImageKSampler`/`Krea2KSampler`'s diffusers-vs-comfy
+sigma-slicing fix a non-issue for Klein specifically - that bug only
+applies to `denoise<1.0`, which Klein's node no longer produces.
+
+Investigated and ruled out two other hypotheses before finding the real
+bug, worth recording since they're real, separate, measured facts even
+though they weren't the cause here: (1) `Flux2Scheduler`'s resolution-
+adaptive `compute_empirical_mu(seq_len, steps)` shift
+(`comfy_extras/nodes_flux.py:206-233`) differs from stock `KSampler`'s
+`ModelSamplingFlux` fixed `shift=2.02` (`comfy/supported_models.py:801`)
+- real, but the user's test graph had `Flux2Scheduler`'s width/height
+manually set to match the actual reference photo's size, so this wasn't
+in play; (2) confirmed `clip.tokenize()`+`clip.encode_from_tokens_
+scheduled()` is byte-identical between our node and stock
+`CLIPTextEncode` (`nodes.py:73-77`) - ruled out an encoding difference.
+
+`tools/smoke_flux_klein.py`: same 26 test count, but the `images`/
+`control_source_image` set was rewritten for the new signature - added
+a test asserting a 2-image batch in `images` produces exactly 2
+`reference_latents` (not 1 batched encode), a test asserting `images`+
+`control_source_image` combine correctly with `control_source_image`
+appended after `images`, and critically a test asserting
+`control_mode="none"` skips ONLY `control_source_image` and leaves
+`images` completely untouched - the actual regression test for this bug.
+Real-environment check against the real Flux.2 VAE/CLIP: `INPUT_TYPES`
+confirmed `image`/`reference_image`/`reference_image_2`/`strength` are
+gone and `images`/`control_source_image` are present; a 2-image batch
+produced 2 `reference_latents`; `images`+`control_source_image`
+(auto_canny) combined into 2 `reference_latents` total.
