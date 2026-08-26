@@ -36,7 +36,11 @@ class _FakeCallbacksMP:
 comfy = types.ModuleType("comfy")
 comfy_ldm = types.ModuleType("comfy.ldm")
 comfy_ldm_common_dit = types.ModuleType("comfy.ldm.common_dit")
-comfy_ldm_common_dit.pad_to_patch_size = lambda x, patch: x
+comfy_ldm_common_dit.pad_to_patch_size = lambda x, patch, **kwargs: x
+comfy_ldm_flux = types.ModuleType("comfy.ldm.flux")
+comfy_ldm_flux_layers = types.ModuleType("comfy.ldm.flux.layers")
+comfy_ldm_flux_layers.timestep_embedding = lambda t, dim: torch.zeros(t.shape[0], dim)
+comfy_ldm_flux.layers = comfy_ldm_flux_layers
 comfy_model_management = types.ModuleType("comfy.model_management")
 comfy_model_management.cast_to_device = lambda t, device, dtype: t.to(device=device, dtype=dtype)
 comfy_model_management.intermediate_device = lambda: torch.device("cpu")
@@ -127,6 +131,8 @@ node_helpers.conditioning_set_values = _conditioning_set_values
 sys.modules["comfy"] = comfy
 sys.modules["comfy.ldm"] = comfy_ldm
 sys.modules["comfy.ldm.common_dit"] = comfy_ldm_common_dit
+sys.modules["comfy.ldm.flux"] = comfy_ldm_flux
+sys.modules["comfy.ldm.flux.layers"] = comfy_ldm_flux_layers
 sys.modules["comfy.model_management"] = comfy_model_management
 sys.modules["comfy.patcher_extension"] = comfy_patcher_extension
 sys.modules["comfy.sd"] = comfy_sd
@@ -138,6 +144,8 @@ sys.modules["folder_paths"] = folder_paths
 sys.modules["nodes"] = nodes
 sys.modules["node_helpers"] = node_helpers
 comfy.ldm = comfy_ldm
+comfy_ldm.common_dit = comfy_ldm_common_dit
+comfy_ldm.flux = comfy_ldm_flux
 comfy.model_management = comfy_model_management
 comfy.patcher_extension = comfy_patcher_extension
 comfy.sd = comfy_sd
@@ -562,6 +570,257 @@ def test_ksampler_diffusers_mode_slices_sigmas_from_t_start():
     print("[ok] Krea2KSampler: denoise_mode=diffusers slices sigmas from t_start and returns latent")
 
 
+# ── Krea2EditModelPatch / Krea2EditGroundedEncode ────────────────────────
+
+class _FakeKreaEditModel:
+    def process_latent_in(self, x):
+        return x
+
+
+class _FakeKreaEditModelPatcher:
+    """Minimal stand-in for ModelPatcher - only what Krea2EditModelPatch.patch()
+    touches. wrappers/add_wrapper_with_key mirror the real ModelPatcher method
+    (comfy/model_patcher.py) that comfy/sampler_helpers.py merges into
+    transformer_options at real sampling time."""
+
+    def __init__(self):
+        self.model = _FakeKreaEditModel()
+        self.model_options = {}
+        self.wrappers = {}
+
+    def clone(self):
+        c = _FakeKreaEditModelPatcher()
+        c.model = self.model
+        return c
+
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        self.wrappers.setdefault(wrapper_type, {}).setdefault(key, []).append(wrapper)
+
+
+class _FakeKreaEditVAE:
+    """Records every encode call so tests can assert on timing/count."""
+
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, pixels):  # pixels: (B, H, W, C)
+        self.calls.append(tuple(pixels.shape))
+        b, h, w, _ = pixels.shape
+        return torch.zeros(b, 4, h // 8, w // 8)
+
+
+def _krea2edit_latent(h=64, w=64):
+    return {"samples": torch.zeros(1, 4, h, w)}
+
+
+def _krea2edit_image(px=512):
+    return torch.zeros(1, px, px, 3)
+
+
+def _krea2edit_get_wrapper(m):
+    return m.wrappers["diffusion_model"]["krea2_edit"][0]
+
+
+def _krea2edit_run_wrapper(wrapper, n=1, h=64, w=64):
+    """Drive the wrapper the way a sampler would: same latent shape, n times."""
+    seen = []
+    for _ in range(n):
+        class _Executor:
+            class_obj = object()  # stands in for the SingleStreamDiT instance
+
+        seen.append(wrapper(_Executor(), torch.zeros(1, 4, h, w), None, None, None, {}))
+    return seen
+
+
+def test_krea2edit_patch_clones_and_registers_diffusion_model_wrapper():
+    node = krea2.Krea2EditModelPatch()
+    model = _FakeKreaEditModelPatcher()
+    (m,) = node.patch(model, _krea2edit_latent())
+    assert m is not model  # cloned
+    assert len(m.wrappers["diffusion_model"]["krea2_edit"]) == 1
+    print("[ok] Krea2EditModelPatch: patch() clones the model and registers a "
+          "DIFFUSION_MODEL wrapper under key 'krea2_edit'")
+
+
+def test_krea2edit_wrapper_calls_krea2_edit_forward_with_scaled_source():
+    node = krea2.Krea2EditModelPatch()
+    model = _FakeKreaEditModelPatcher()
+    calls = []
+    original = krea2.krea2_edit_forward
+    krea2.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: calls.append(src) or torch.zeros_like(x)
+    try:
+        (m,) = node.patch(model, _krea2edit_latent(h=32, w=32))
+        wrapper = _krea2edit_get_wrapper(m)
+        _krea2edit_run_wrapper(wrapper, h=32, w=32)
+    finally:
+        krea2.krea2_edit_forward = original
+    assert len(calls) == 1
+    assert calls[0].shape == (1, 4, 32, 32)  # source_latent scaled via process_latent_in (identity fake)
+    print("[ok] Krea2EditModelPatch: wrapper calls krea2_edit_forward with the "
+          "process_latent_in-scaled source latent")
+
+
+def test_krea2edit_target_latent_encodes_before_sampling():
+    """target_latent wired -> encode happens during patch(), not in the wrapper -
+    the whole point of target_latent (see class docstring: avoids evicting the
+    resident diffusion model mid-sampling)."""
+    node = krea2.Krea2EditModelPatch()
+    model = _FakeKreaEditModelPatcher()
+    calls = []
+    original = krea2.krea2_edit_forward
+    krea2.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: calls.append(src) or torch.zeros_like(x)
+    try:
+        vae = _FakeKreaEditVAE()
+        (m,) = node.patch(model, _krea2edit_latent(), vae=vae, source_image=_krea2edit_image(),
+                          target_latent=_krea2edit_latent())
+        assert len(vae.calls) == 1, "source should be encoded during patch(), not later"
+        wrapper = _krea2edit_get_wrapper(m)
+        _krea2edit_run_wrapper(wrapper, n=3)
+        assert len(vae.calls) == 1, "sampling must reuse the pre-encode, never re-encode"
+    finally:
+        krea2.krea2_edit_forward = original
+    print("[ok] Krea2EditModelPatch: target_latent pre-encodes the pixel-path "
+          "source during patch(), before any sampling step")
+
+
+def test_krea2edit_without_target_latent_encode_lands_in_wrapper():
+    node = krea2.Krea2EditModelPatch()
+    model = _FakeKreaEditModelPatcher()
+    original = krea2.krea2_edit_forward
+    krea2.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: torch.zeros_like(x)
+    try:
+        vae = _FakeKreaEditVAE()
+        (m,) = node.patch(model, _krea2edit_latent(), vae=vae, source_image=_krea2edit_image())
+        assert vae.calls == [], "nothing to encode yet without a known target resolution"
+        wrapper = _krea2edit_get_wrapper(m)
+        _krea2edit_run_wrapper(wrapper)
+        assert len(vae.calls) == 1, "encode happens on the first sampling step, then caches"
+    finally:
+        krea2.krea2_edit_forward = original
+    print("[ok] Krea2EditModelPatch: legacy path (no target_latent) - pixel-path "
+          "encode happens on the first wrapper call, then is cached")
+
+
+def test_krea2edit_both_references_are_pre_encoded():
+    node = krea2.Krea2EditModelPatch()
+    model = _FakeKreaEditModelPatcher()
+    calls = []
+    original = krea2.krea2_edit_forward
+    krea2.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: calls.append(src) or torch.zeros_like(x)
+    try:
+        vae = _FakeKreaEditVAE()
+        (m,) = node.patch(model, _krea2edit_latent(), vae=vae, source_image=_krea2edit_image(),
+                          source_image_b=_krea2edit_image(), target_latent=_krea2edit_latent())
+        assert len(vae.calls) == 2, "scene and subject refs both pre-encoded"
+        wrapper = _krea2edit_get_wrapper(m)
+        _krea2edit_run_wrapper(wrapper)
+        assert len(vae.calls) == 2
+        assert isinstance(calls[0], list) and len(calls[0]) == 2
+    finally:
+        krea2.krea2_edit_forward = original
+    print("[ok] Krea2EditModelPatch: source_latent_b/source_image_b -> both "
+          "references pre-encoded, passed as a 2-element list to krea2_edit_forward")
+
+
+def test_krea2edit_forward_pure_noise_shape_roundtrips():
+    # No fakes here - exercise the real krea2_edit_forward math against a tiny
+    # synthetic SingleStreamDiT-shaped model, confirming the [text | source |
+    # target] concatenation and final crop produce the expected output shape.
+    patch, channels, tdim, txtlayers, txtdim = 2, 4, 8, 12, 2560
+    features = 8  # shared hidden dim `first`/`txtmlp` both project into
+    h_tok, w_tok = 4, 4
+    H, W = h_tok * patch, w_tok * patch
+
+    class _FakeBlock:
+        def __call__(self, combined, tvec, freqs, attn_bias, transformer_options=None):
+            return combined
+
+    class _FakeDiT:
+        def __init__(self):
+            self.patch = patch
+            self.channels = channels
+            self.tdim = tdim
+            self.blocks = [_FakeBlock()]
+            self.first = torch.nn.Linear(channels * patch * patch, features)
+            self.last = lambda combined, t: torch.zeros(
+                combined.shape[0], combined.shape[1], channels * patch * patch)
+            self.tmlp = torch.nn.Identity()
+            self.tproj = torch.nn.Identity()
+            self.txtfusion = lambda ctx, mask=None, transformer_options=None: ctx.mean(dim=2)
+            self.txtmlp = torch.nn.Linear(txtdim, features)
+            self.pe_embedder = lambda pos: pos
+
+        def _unpack_context(self, context):
+            b, seq, fused = context.shape
+            return context.reshape(b, seq, txtlayers, txtdim)
+
+    dm = _FakeDiT()
+    x = torch.zeros(1, channels, H, W)
+    context = torch.zeros(1, 3, txtlayers * txtdim)
+    src = torch.zeros(1, channels, H, W)
+    out = krea2.krea2_edit_forward(dm, x, torch.zeros(1), context, src, {})
+    assert out.shape == (1, channels, H, W)
+    print("[ok] krea2_edit_forward: [text | source(frame=1) | target(frame=0)] "
+          "concatenation round-trips to the original (B,C,H,W) shape")
+
+
+def test_krea2edit_grounded_encode_text_only_fallback_without_image():
+    node = krea2.Krea2EditGroundedEncode()
+    calls = []
+    clip = types.SimpleNamespace(
+        tokenize=lambda text, **kw: calls.append((text, kw)) or text,
+        encode_from_tokens_scheduled=lambda t: "cond")
+    out, = node.encode(clip, "a test prompt")
+    assert out == "cond"
+    assert calls == [("a test prompt", {})]
+    print("[ok] Krea2EditGroundedEncode: no image -> plain text-only tokenize, "
+          "same as stock CLIPTextEncode")
+
+
+def test_krea2edit_grounded_encode_with_image_passes_images_and_template():
+    node = krea2.Krea2EditGroundedEncode()
+    calls = []
+    clip = types.SimpleNamespace(
+        tokenize=lambda text, **kw: calls.append((text, kw)) or text,
+        encode_from_tokens_scheduled=lambda t: "cond")
+    node.encode(clip, "recolor the car", image=_krea2edit_image(64))
+    assert len(calls) == 1
+    text, kw = calls[0]
+    assert text == "recolor the car"
+    assert len(kw["images"]) == 1
+    assert kw["images"][0].shape[0] == 1 and kw["images"][0].shape[-1] == 3
+    assert kw["llama_template"].count("<|vision_start|>") == 1
+    print("[ok] Krea2EditGroundedEncode: image connected -> clip.tokenize gets "
+          "images= and a llama_template with one vision block")
+
+
+def test_krea2edit_grounded_encode_two_images_two_vision_blocks():
+    node = krea2.Krea2EditGroundedEncode()
+    calls = []
+    clip = types.SimpleNamespace(
+        tokenize=lambda text, **kw: calls.append((text, kw)) or text,
+        encode_from_tokens_scheduled=lambda t: "cond")
+    node.encode(clip, "place the person in the scene",
+               image=_krea2edit_image(64), image_b=_krea2edit_image(64))
+    text, kw = calls[0]
+    assert len(kw["images"]) == 2
+    assert kw["llama_template"].count("<|vision_start|>") == 2
+    print("[ok] Krea2EditGroundedEncode: image + image_b -> two vision blocks, "
+          "training order (scene, subject)")
+
+
+def test_krea2edit_grounded_encode_downscales_above_grounding_px():
+    node = krea2.Krea2EditGroundedEncode()
+    calls = []
+    clip = types.SimpleNamespace(
+        tokenize=lambda text, **kw: calls.append((text, kw)) or text,
+        encode_from_tokens_scheduled=lambda t: "cond")
+    node.encode(clip, "prompt", image=_krea2edit_image(2048), grounding_px=768)
+    _, kw = calls[0]
+    assert max(kw["images"][0].shape[1], kw["images"][0].shape[2]) <= 768
+    print("[ok] Krea2EditGroundedEncode: grounding_px caps the longest side fed to Qwen3-VL")
+
+
 if __name__ == "__main__":
     test_prepare_control_image_grayscale_repeats_to_three_channels()
     test_prepare_control_image_minmax_normalizes_to_0_1()
@@ -592,4 +851,14 @@ if __name__ == "__main__":
     test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
     test_ksampler_diffusers_mode_rejects_zero_denoise()
     test_ksampler_diffusers_mode_slices_sigmas_from_t_start()
+    test_krea2edit_patch_clones_and_registers_diffusion_model_wrapper()
+    test_krea2edit_wrapper_calls_krea2_edit_forward_with_scaled_source()
+    test_krea2edit_target_latent_encodes_before_sampling()
+    test_krea2edit_without_target_latent_encode_lands_in_wrapper()
+    test_krea2edit_both_references_are_pre_encoded()
+    test_krea2edit_forward_pure_noise_shape_roundtrips()
+    test_krea2edit_grounded_encode_text_only_fallback_without_image()
+    test_krea2edit_grounded_encode_with_image_passes_images_and_template()
+    test_krea2edit_grounded_encode_two_images_two_vision_blocks()
+    test_krea2edit_grounded_encode_downscales_above_grounding_px()
     print("[ok] all nodes_krea2 smoke tests passed")

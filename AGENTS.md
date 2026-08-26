@@ -2246,3 +2246,106 @@ something this repo's loader code can fix - the real remedy is to use a
 non-fp8-scaled (bf16/fp16 safetensors, or GGUF) Krea2 diffusion-model
 checkpoint instead, since GGUF quantization uses a different ops path
 (`GGMLOps`, not `_scaled_mm`) that doesn't hit this constraint.
+
+## Port: Krea2EditModelPatch + Krea2EditGroundedEncode from comfyui-krea2edit (2026-08-26)
+
+Continuation of the same debugging thread: after the GGUF/fp8 fixes above,
+user reported the actual instructed edit still wasn't taking effect even
+with "the edit lora baked in." Traced it back to the wrong LoRA entirely
+at first (I assumed `krea2_canny-v0.1.safetensors`, the ordinary in-
+context Control-adjacent LoRA already documented in this file) - user
+corrected: "i didnt say the controlnet lora i said the edit lora." The
+real LoRA is `krea2_identity_edit_v1_2.safetensors` ("Krea 2 Identity
+Edit," licensed separately under Krea AI's own Community License
+Agreement), and user pointed at a local reference install for how it's
+actually driven: "should we follow their convention
+'D:\Projects\ComfyUI\comfyui-krea2edit-main'."
+
+Read that pack directly rather than guessing. Confirmed it does NOT use
+`reference_latents`/`ReferenceLatent` at all - comfy's native Krea2
+forward (`comfy/ldm/krea2/model.py`) only ever builds `[text | target]`,
+with reference_latents (`ref_method`/`ref_latents` kwarg) concatenating
+into the IMAGE token stream at whatever frame index the CALLER chooses,
+but with no built-in "this is the clean appearance-preservation source"
+semantics. The Identity Edit LoRA was trained (via `ai-toolkit`'s
+`predict_velocity_edit`) against a SPECIFIC sequence shape -
+`[text | source(frame=1) | target(frame=0)]` - that nothing in comfy or
+this pack could reproduce without wrapping the diffusion model's forward
+directly. This explains why neither the old `edit_reference` mechanism
+(removed earlier this session) nor anything reference_latents-based
+could ever have worked correctly for this LoRA - wrong mechanism, not a
+config mistake.
+
+Before porting, spawned a research fork to verify every comfy API the
+source pack calls against the REAL installed comfy at
+`N:\ComfyUI_windows_portable_nvidia\ComfyUI`, since comfy APIs drift
+across versions and this session's own established discipline is
+"verify against real source, don't trust another pack's assumptions."
+All five verified clean, no drift:
+`comfy.patcher_extension.add_wrapper_with_key`/`WrappersMP.DIFFUSION_MODEL`
+exist as used; `SingleStreamDiT` (`comfy/ldm/krea2/model.py:232`) has
+every attribute the port reads (`patch`, `channels`, `tdim`,
+`pe_embedder`, `first`, `blocks`, `tmlp`, `txtfusion`, `txtmlp`, `last`,
+`tproj`, `_unpack_context`) 1:1; `process_latent_in` is inherited from
+`BaseModel` unchanged; `Krea2Tokenizer.tokenize_with_weights`
+(`comfy/text_encoders/krea2.py:28-30`) genuinely accepts
+`llama_template=`/`images=` and `CLIP.tokenize` forwards `**kwargs`
+straight through; `pad_to_patch_size` accepts `padding_mode` as called.
+
+Found and resolved one real ambiguity mid-port: the source pack's own
+production code calls the MODULE-LEVEL
+`comfy.patcher_extension.add_wrapper_with_key(type, key, wrapper,
+transformer_options_dict)`, writing into
+`model.model_options["transformer_options"]["wrappers"]` - but this
+repo's OWN existing `Krea2ControlLoRALoader` wrapper registration (real-
+environment verified working in an earlier session) uses the
+ModelPatcher INSTANCE METHOD `model.add_wrapper_with_key(type, key,
+wrapper)` (3 args, no options dict), writing into `self.wrappers`
+instead - a genuinely different storage location. Traced the bridge by
+hand rather than assuming either was wrong: `comfy/ldm/krea2/model.py:280`
+reads wrappers via `get_all_wrappers(DIFFUSION_MODEL, transformer_options)`
+off the plain `transformer_options` dict threaded through the forward
+call, and `comfy/sampler_helpers.py:224`'s `prepare_model_patcher` (run
+on every real sample) explicitly merges `model.wrappers` into
+`model_options["transformer_options"]["wrappers"]` before sampling
+starts - so BOTH registration styles converge to the same place at
+sampling time. Kept the method-based style to match this file's existing
+proven convention rather than introducing a second style. Confirmed the
+bridge for real (not just by reading code): built a real
+`comfy.model_patcher.ModelPatcher`, called
+`Krea2EditModelPatch.patch()`, then called the real
+`comfy.sampler_helpers.prepare_model_patcher()` and confirmed the
+wrapper landed in `model_options["transformer_options"]["wrappers"]`.
+
+Ported `krea2_edit_forward` + its helpers (`_imgids`, `_imgids_offset`,
+`_to_4d`, `_fit_src`, `_fit_encode_image`, `_ref_attn_bias`) and both
+node classes near-verbatim into `nodes/krea2.py`, keeping the exact same
+`NODE_CLASS_MAPPINGS` keys (`Krea2EditModelPatch`, `Krea2EditGroundedEncode`)
+the source pack uses, so any workflow already built against
+comfyui-krea2edit keeps resolving if that pack is swapped out for this
+one. `print(..., flush=True)` debug statements replaced with this
+repo's own `logger.info`/`logger.warning` convention; two dead imports
+(`apply_rope`, `optimized_attention_masked` - confirmed unused via grep,
+vestigial from a larger file this distribution was trimmed from) were
+dropped rather than carried over.
+
+`tools/smoke_krea2.py` gained 11 new tests (39/39 total, no GPU):
+wrapper registration on a fake ModelPatcher, the wrapper calling
+`krea2_edit_forward` with the `process_latent_in`-scaled source, the
+`target_latent` pre-encode timing (before sampling vs. on-first-step,
+mirroring the source pack's own `test_pre_encode.py` regression tests
+almost exactly), dual-reference pre-encoding, `krea2_edit_forward`'s
+real math exercised against a shape-accurate synthetic DiT (a real
+`[text | source | target]` concatenation round-tripping to the original
+shape, not a stub), and `Krea2EditGroundedEncode`'s text-only fallback,
+image-grounded `images=`/`llama_template=` kwargs, two-image vision-
+block count, and `grounding_px` downscaling. Needed two new module
+stubs in the offline harness (`comfy.ldm.flux.layers.timestep_embedding`,
+plus explicitly wiring `comfy_ldm.common_dit`/`comfy_ldm.flux` as
+attributes - discovered because `Krea2ControlLoRALoader`'s own
+`pad_to_patch_size` call had never been offline-tested before, only
+verified in real-environment checks). Real-environment check against the
+actual portable ComfyUI: both nodes register with the documented
+`INPUT_TYPES`, and the wrapper-registration-to-`transformer_options`
+bridge was confirmed against real `comfy.model_patcher.ModelPatcher`/
+`comfy.sampler_helpers` objects, not fakes.
