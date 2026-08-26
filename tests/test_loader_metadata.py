@@ -181,6 +181,29 @@ def test_mmproj_sibling_match_ignores_punctuation(tmp_path):
     assert any(k.startswith("visual.") for k in vsd)
 
 
+def test_gguf_clip_loader_merges_mmproj_even_when_te_arch_is_the_base_llm_tag(tmp_path):
+    # Real-world bug: a quantizer tagged a genuine Qwen3-VL-4B text-encoder
+    # conversion with general.architecture="qwen3" (the base LLM arch)
+    # instead of "qwen3vl", even though it ships beside a matching mmproj
+    # and needs the vision merge - confirmed against the user's actual file
+    # (Qwen3-VL-4B-Q4_K_M.gguf). gguf_clip_loader()'s dispatch used to only
+    # attempt the mmproj merge for arch in {"qwen2vl", "qwen3vl"}, so a
+    # "qwen3"-tagged VL conversion silently never got its vision weights,
+    # and comfy's detect_te_model() then misdetected it as plain Qwen3-4B -
+    # producing a 2560-feature embedding instead of Krea2's required
+    # 12x2560=30720 stack, with no error until the model forward pass.
+    te = tmp_path / "Qwen3-VL-4B-Q4_K_M.gguf"
+    _write_te_gguf(te, "qwen3")
+    _write_qwen2vl_mmproj(tmp_path / "Qwen3-VL-4B-Instruct-mmproj-BF16.gguf")
+
+    assert loader.read_gguf_arch(str(te)) == "qwen3"
+
+    sd = loader.gguf_clip_loader(str(te))
+    assert any("visual." in k for k in sd), (
+        "mmproj was not merged for a 'qwen3'-tagged TE with a matching "
+        "sibling mmproj file")
+
+
 def test_squash_name_does_not_match_a_different_model(tmp_path):
     # Punctuation-insensitive must not become model-insensitive.
     te = tmp_path / "qwen3vl_4b_Q4_K_M.gguf"

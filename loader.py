@@ -854,7 +854,18 @@ def gguf_clip_loader(path):
             # L3 / Mistral / qwen2-compat. Head counts come from the file: the
             # 32/8 that fits L3-8B silently corrupts anything shaped otherwise.
             sd = llama_permute(sd, *llama_head_counts(extra.get("metadata", {}), arch))
-        if arch in {"qwen2vl", "qwen3vl"}:
+        if arch in {"qwen2", "qwen2vl", "qwen3", "qwen3vl"}:
+            # Some quantizers tag a VL model's text-only conversion with the
+            # base LLM arch string ("qwen3") instead of the VL one
+            # ("qwen3vl") - confirmed in the wild: a real Qwen3-VL-4B GGUF
+            # (Qwen3-VL-4B-Q4_K_M.gguf) reports general.architecture="qwen3"
+            # even though it ships beside a matching mmproj vision tower and
+            # needs the merge for VL-only detection (e.g. Krea2's 12-layer
+            # conditioning tap) to work at all. Attempt the sibling-mmproj
+            # lookup for the plain archs too, not just the "vl"-tagged ones -
+            # gguf_mmproj_loader() already no-ops safely (empty dict, just a
+            # warning) when no matching mmproj file exists nearby, so this
+            # can't break a genuinely text-only checkpoint.
             vsd = gguf_mmproj_loader(path)
             sd.update(vsd)
     else:

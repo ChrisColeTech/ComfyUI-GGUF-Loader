@@ -2179,3 +2179,70 @@ check against the real portable ComfyUI: confirmed `INPUT_TYPES` on both
 nodes have `images` and no `image`/`edit_reference`, and exercised the
 `images`-connected/no-Control-LoRA path end to end against real object
 shapes.
+
+## Fix: GGUF text-encoder mmproj merge skipped for "qwen3"-tagged VL conversions (2026-08-26)
+
+User reported the redesigned Krea2 nodes broke, but the actual error
+("Krea2 expects conditioning with 12x2560=30720 features... but got
+2560. Load the text encoder with CLIPLoader type 'krea2'.") traced back
+to a real bug in `loader.py`, unrelated to any node redesign this
+session - confirmed by checking `Krea2ModelLoader.load()`
+(`nodes/krea2.py:654-673`) is completely unchanged and already correctly
+passes `clip_type=CLIPType.KREA2`.
+
+Root cause, confirmed by reading the user's actual GGUF file's header
+metadata directly (`loader.read_gguf_arch()`), not guessed: their
+`Qwen3-VL-4B-Q4_K_M.gguf` reports `general.architecture = "qwen3"` (the
+base LLM arch), not `"qwen3vl"`, even though it's genuinely a Qwen3-VL-4B
+text-encoder conversion shipped beside a matching mmproj vision-tower
+file (`Qwen3-VL-4B-Instruct-mmproj-BF16.gguf`) - some quantizers tag the
+text-only conversion with the base LLM arch string. `loader.py`'s
+`gguf_clip_loader()` only attempted the sibling-mmproj auto-merge for
+`arch in {"qwen2vl", "qwen3vl"}` (`loader.py:857`, pre-fix) - so a
+"qwen3"-tagged VL conversion never got its vision weights merged, and
+comfy's own `detect_te_model()` (which requires
+`model.visual.deepstack_merger_list.0.norm.weight` to recognize
+`TEModel.QWEN3VL_4B`) fell through to misdetecting it as plain
+`TEModel.QWEN3_4B` - producing a single-layer 2560-feature embedding
+instead of Krea2's required 12-layer 30720-feature stack, with no error
+until the model's own forward-pass validation in
+`comfy/ldm/krea2/model.py`'s `_unpack_context()`.
+
+Verified the mmproj-matching logic itself was never broken - called
+`gguf_mmproj_loader()` directly against the real file pair and it found
+and loaded all 315 vision-tower keys correctly by filename match; the
+bug was purely the arch-string gate deciding whether to even attempt
+that lookup. Fixed by widening `loader.py:857`'s condition to
+`arch in {"qwen2", "qwen2vl", "qwen3", "qwen3vl"}` - safe by
+construction since `gguf_mmproj_loader()` already no-ops (empty dict,
+just a warning) when no matching mmproj file exists nearby, so this
+can't affect a genuinely text-only Qwen2/Qwen3 checkpoint.
+
+Verified end to end against the real files: `gguf_clip_loader()` on the
+real `Qwen3-VL-4B-Q4_K_M.gguf` now returns 713 keys including 19
+visual/deepstack keys (was 0), `comfy.sd.detect_te_model()` now returns
+`TEModel.QWEN3VL_4B` (was misdetecting `QWEN3_4B`), and
+`Krea2ModelLoader.load()` end-to-end through the real portable ComfyUI
+now produces a CLIP whose `encode_from_tokens_scheduled()` output has
+exactly `(1, 8, 30720)` shape - the real number Krea2's DiT expects.
+Added `test_gguf_clip_loader_merges_mmproj_even_when_te_arch_is_the_base_llm_tag`
+to `tests/test_loader_metadata.py` (84/84 full pytest suite passes) as
+the regression test, reproducing the real arch/filename pair with
+synthetic GGUF fixtures.
+
+Separately investigated (but NOT fixed, and not fixable in this repo) a
+second error the user hit with the non-GGUF safetensors CLIP path
+(`qwen3vl_4b_fp8_scaled.safetensors`): `ValueError: Expected trailing
+dimension of mat1 to be divisible by 16 but got mat1 shape:
+(25600x12)`. Traced to `comfy/ldm/krea2/model.py`'s `txtfusion` module,
+which fuses Krea2's 12 tapped Qwen3-VL layers per-token via a linear
+layer with 12 input features - inherent to Krea2's architecture, not a
+bug. PyTorch's FP8 scaled-matmul kernel requires the contracted
+dimension to be a multiple of 16, which 12 can never satisfy - a hard
+incompatibility between Krea2's 12-layer-fusion design and running the
+DiT as an `fp8_scaled` checkpoint (`krea2_turbo_uncensored_refined-
+fp8_scaled.safetensors`), regardless of which CLIP is used. Not
+something this repo's loader code can fix - the real remedy is to use a
+non-fp8-scaled (bf16/fp16 safetensors, or GGUF) Krea2 diffusion-model
+checkpoint instead, since GGUF quantization uses a different ops path
+(`GGMLOps`, not `_scaled_mm`) that doesn't hit this constraint.
