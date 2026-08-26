@@ -102,26 +102,25 @@ def _vae():
 
 # ── FluxKleinImg2Img ─────────────────────────────────────────────────────
 
-def test_img2img_always_uses_flux2_real_empty_latent_shape_and_full_denoise():
+def test_img2img_always_uses_flux2_real_empty_latent_shape():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, _, _, latent, denoise = node.prepare(
+    _, _, _, latent = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 128, 128)
     # width=height=128 -> //16 = 8; 128 channels is Flux.2's real channel
     # count (comfy_extras/nodes_flux.py's EmptyFlux2LatentImage), NOT the
     # generic 4-channel/8-downscale placeholder used for Krea2/Qwen-Image.
-    # denoise is always 1.0 now - there is no partial-denoise img2img path,
-    # since no real Klein edit example ever uses one.
+    # No denoise output - it would always be 1.0 (there is no partial-
+    # denoise img2img path), which is already stock KSampler's own default.
     assert latent["samples"].shape == (1, 128, 8, 8)
-    assert denoise == 1.0
     print("[ok] FluxKleinImg2Img: empty latent uses Flux.2's real 128-channel/"
-          "16-downscale shape, denoise is always 1.0 (pure-noise start)")
+          "16-downscale shape (pure-noise start, no denoise output)")
 
 
 def test_img2img_batch_size_repeats_empty_latent():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, _, _, latent, _ = node.prepare(
+    _, _, _, latent = node.prepare(
         model, _clip(), _vae(), "prompt", "", 3, 128, 128)
     assert latent["samples"].shape == (3, 128, 8, 8)
     print("[ok] FluxKleinImg2Img: batch_size repeats the empty latent correctly")
@@ -154,7 +153,7 @@ def test_img2img_canvas_derives_from_images_aspect_ratio_not_widget_defaults():
     node = fk.FluxKleinImg2Img()
     model = object()
     wide_ref = torch.rand(1, 512, 1024, 3)  # 2:1 landscape
-    _, _, _, latent, _ = node.prepare(
+    _, _, _, latent = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 1024, 1024,
         images=wide_ref, control_mode="manual")
     lat_h, lat_w = latent["samples"].shape[-2], latent["samples"].shape[-1]
@@ -188,7 +187,7 @@ def test_img2img_images_batch_attaches_one_reference_latent_per_image():
     node = fk.FluxKleinImg2Img()
     model = object()
     batch = torch.rand(2, 64, 64, 3)  # two stacked reference photos, one socket
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64,
         images=batch, control_mode="manual")
     assert len(positive[0][1]["reference_latents"]) == 2
@@ -201,7 +200,7 @@ def test_img2img_images_batch_attaches_one_reference_latent_per_image():
 def test_img2img_images_single_attaches_to_both_conditionings():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64,
         images=torch.rand(1, 64, 64, 3))
     assert "reference_latents" in positive[0][1]
@@ -213,7 +212,7 @@ def test_img2img_images_single_attaches_to_both_conditionings():
 def test_img2img_control_source_image_manual_attaches_raw():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64,
         control_source_image=torch.rand(1, 64, 64, 3), control_mode="manual")
     assert "reference_latents" in positive[0][1]
@@ -225,7 +224,7 @@ def test_img2img_control_source_image_manual_attaches_raw():
 def test_img2img_images_and_control_source_image_combine():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64,
         images=torch.rand(1, 64, 64, 3),
         control_source_image=torch.rand(1, 64, 64, 3), control_mode="manual")
@@ -245,7 +244,7 @@ def test_img2img_control_source_image_auto_depth_uses_depth_helper():
     fk._depth_anything_batch = lambda image, ckpt_name, resolution=512: (
         calls.append((tuple(image.shape), ckpt_name)) or torch.rand(1, 64, 64, 3))
     try:
-        _, positive, _, _, _ = node.prepare(
+        _, positive, _, _ = node.prepare(
             model, _clip(), _vae(), "prompt", "", 1, 64, 64,
             control_source_image=torch.rand(1, 64, 64, 3), control_mode="auto_depth")
     finally:
@@ -261,7 +260,7 @@ def test_img2img_control_source_image_auto_canny_derives_edge_map():
     # for real, confirming FluxKleinImg2Img actually attaches reference_latents.
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64,
         control_source_image=torch.rand(1, 64, 64, 3), control_mode="auto_canny")
     assert "reference_latents" in positive[0][1]
@@ -273,7 +272,7 @@ def test_img2img_control_source_image_auto_canny_derives_edge_map():
 def test_img2img_control_mode_none_skips_control_source_image_even_if_connected():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64,
         control_source_image=torch.rand(1, 64, 64, 3), control_mode="none")
     assert "reference_latents" not in positive[0][1]
@@ -291,7 +290,7 @@ def test_control_modes_are_the_minimum_set():
 def test_img2img_nothing_connected_leaves_conditioning_unchanged():
     node = fk.FluxKleinImg2Img()
     model = object()
-    _, positive, negative, _, _ = node.prepare(
+    _, positive, negative, _ = node.prepare(
         model, _clip(), _vae(), "prompt", "", 1, 64, 64)
     assert "reference_latents" not in positive[0][1]
     assert "reference_latents" not in negative[0][1]
@@ -504,7 +503,7 @@ if __name__ == "__main__":
     test_img2img_images_single_attaches_to_both_conditionings()
     test_img2img_control_source_image_manual_attaches_raw()
     test_img2img_images_and_control_source_image_combine()
-    test_img2img_always_uses_flux2_real_empty_latent_shape_and_full_denoise()
+    test_img2img_always_uses_flux2_real_empty_latent_shape()
     test_img2img_batch_size_repeats_empty_latent()
     test_img2img_control_source_image_auto_depth_uses_depth_helper()
     test_img2img_control_source_image_auto_canny_derives_edge_map()

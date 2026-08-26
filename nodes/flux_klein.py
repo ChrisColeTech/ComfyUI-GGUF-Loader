@@ -5,8 +5,8 @@ conditioning tools.
   FluxKleinModelLoader        unet / clip / vae by name -> MODEL, CLIP, VAE
   FluxKleinImg2Img            model, clip, vae, prompts (+ optional
                                reference images / controlnet-style source
-                               image) -> model, positive, negative, latent,
-                               denoise -> stock KSampler or FluxKleinKSampler
+                               image) -> model, positive, negative, latent
+                               -> stock KSampler or FluxKleinKSampler
   Flux2KleinMultiReferenceLatent  up to 8 reference latents -> CONDITIONING
 
 Flux.2 Klein is natively supported by ComfyUI core (unet_config.image_model
@@ -246,11 +246,12 @@ class FluxKleinImg2Img:
     real /16 downscale would otherwise silently produce a latent twice
     the correct spatial size.
 
-    `denoise` is a fixed 1.0 output, kept only for graph-wiring convenience
-    (feed it straight into a stock KSampler's `denoise` input) - it's
-    always 1.0 because every real Klein edit example starts from pure
-    noise; KSampler's own `denoise` widget already exists for anyone who
-    genuinely wants a different value for some other reason.
+    No `denoise` output - it would always be a constant 1.0 (every real
+    Klein edit example starts from pure noise), which is already stock
+    KSampler's own default `denoise` value, so an output that never
+    varies would carry zero information and just be a dangling wire.
+    Leave KSampler's `denoise` input disconnected (or set it to 1.0
+    yourself if you genuinely want a non-default value for some reason).
 
     Feed the outputs straight into a stock KSampler or FluxKleinKSampler.
     """
@@ -259,8 +260,8 @@ class FluxKleinImg2Img:
     TITLE = "Flux Klein img2img ⚡"
     SEARCH_ALIASES = ['image to image', 'img2img', 'text to image', 'txt2img', 'encode image',
                        'reference image', 'edit reference', 'pose transfer']
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
-    RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent")
     FUNCTION = "prepare"
     DESCRIPTION = ("Prompts, init latent, and reference images for FLUX.2 "
                    "Klein's real edit mechanism (always a pure-noise start). "
@@ -338,7 +339,6 @@ class FluxKleinImg2Img:
         latent = torch.zeros(
             [batch_size, 128, height // 16, width // 16],
             device=comfy.model_management.intermediate_device())
-        denoise = 1.0
         logger.info("Flux Klein: empty latent %s (pure noise - Klein's real edit "
                     "mechanism never partially denoises an existing photo)", tuple(latent.shape))
 
@@ -376,7 +376,7 @@ class FluxKleinImg2Img:
             logger.info("Flux Klein: control_source_image (%s) attached to positive+negative "
                         "conditioning as reference_latents", control_mode)
 
-        return (model, positive, negative, {"samples": latent}, denoise)
+        return (model, positive, negative, {"samples": latent})
 
 
 # ── Part D: Flux2KleinIdentityFeatureTransfer (ported from

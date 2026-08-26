@@ -2094,3 +2094,20 @@ confirmed `image`/`reference_image`/`reference_image_2`/`strength` are
 gone and `images`/`control_source_image` are present; a 2-image batch
 produced 2 `reference_latents`; `images`+`control_source_image`
 (auto_canny) combined into 2 `reference_latents` total.
+
+**Follow-up in the same pass**: user asked why the node still had a
+`denoise` output slot at all, given it was now a hardcoded constant
+`1.0` ("im confused, what is it passing out? why would you hardcode the
+outlet"). Checked stock `KSampler`'s own `denoise` widget default
+(`nodes.py:1610`) - it's already `1.0`. A `FLOAT` output that never
+varies and matches the downstream node's own default carries zero
+information - it was leftover from when this output used to pass the
+real `strength` value, and that reasoning stopped applying once the
+partial-denoise path was removed. Dropped the `denoise` output
+entirely: `RETURN_TYPES`/`RETURN_NAMES` shrink from 5 to 4 (`MODEL,
+CONDITIONING, CONDITIONING, LATENT` / `model, positive, negative,
+latent`), `prepare()` returns a 4-tuple. Updated all 11 `node.prepare()`
+call sites across `tools/smoke_flux_klein.py` to unpack 4 values instead
+of 5, README, and this file's own prior entry. Real-environment check
+confirmed the new `RETURN_TYPES`/`RETURN_NAMES` and that `prepare()`
+returns exactly a 4-tuple against the real VAE/CLIP.
