@@ -2459,3 +2459,53 @@ process-wide shared namespace across every installed pack. Every other
 node in this file already uses a `Krea2`-prefixed (not bare) id and
 was never at risk - these two were the only ones a straight verbatim
 port left un-namespaced.
+
+## Fix: rename the CLASSES too, not just the registration ids (2026-08-26)
+
+The id-only fix above was scoped correctly for what it fixed (the
+collision is entirely about the registration key, never the Python
+class name), but it left something the user flagged as a real problem
+on its own: `Krea2EditModelPatch`/`Krea2EditGroundedEncode` are the
+exact same class names as `comfyui-krea2edit`'s own nodes (expected -
+they're a verbatim port) - and every other node in this pack (`Krea2Img2Img`,
+`Krea2KSampler`, `Krea2ModelLoader`, ...) is an ORIGINAL name, not a
+copy of some other installed pack's class name. Leaving these two as
+the one pair that's literally indistinguishable from a different
+author's code - by name alone, with no way to tell which is which
+in conversation or in a stack trace - was never actually resolved by
+namespacing the id; the id is invisible (nobody ever sees
+`CCTechKrea2EditModelPatch` printed anywhere), while the class name is
+what shows up in every docstring, every smoke-test assertion, every
+AGENTS.md entry, and every conversation about this code.
+
+Renamed the classes themselves:
+- `Krea2EditModelPatch` -> `Krea2IdentityEditSourcePatch`
+- `Krea2EditGroundedEncode` -> `Krea2IdentityEditGroundedEncode`
+
+`IdentityEdit` names the actual LoRA/feature these two nodes exist for
+(the Krea 2 Identity Edit LoRA) rather than the generic word "Edit" the
+source pack used; `SourcePatch`/`GroundedEncode` describe each node's
+actual job (source-image injection vs. image-grounded prompt encode) -
+words already used in this file's own `TITLE` strings
+(`"Krea2 Identity Edit (source patch) ⚡"` /
+`"Krea2 Identity Edit (grounded encode) ⚡"`), so the class name and the
+display title now share the same vocabulary by construction instead of
+being two independently-invented strings that happened to both refer
+to the same node. Registration ids renamed to match
+(`CCTechKrea2IdentityEditSourcePatch`/`CCTechKrea2IdentityEditGroundedEncode`),
+keeping the `CCTech`-prefix convention `nodes/extra.py`'s
+`CCTechDualVAELoader`/`CCTechClipProjLoader` already established for
+collision-prone names in this pack.
+
+`tools/smoke_krea2.py` updated to instantiate the renamed classes
+(`krea2.Krea2IdentityEditSourcePatch()`/
+`krea2.Krea2IdentityEditGroundedEncode()`); assertions/print-message
+text updated to match. All 39 Krea2 smoke tests and the full 84-test
+suite pass unchanged otherwise (pure rename, no logic touched).
+`README.md`'s node-name references updated to
+`Krea2 Identity Edit (source patch)`/`Krea2 Identity Edit (grounded
+encode)` to match the new `TITLE`. Two already-saved real workflows on
+the portable ComfyUI install (`Krea 2 Edit (Full Context).json`,
+`krea2_img2img.json`) that reference the old `CCTechKrea2Edit*` type
+ids from the previous fix were updated in place to the new ids -
+otherwise both would fail to resolve their node type on next load.

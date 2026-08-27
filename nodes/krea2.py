@@ -39,7 +39,9 @@ loudly if a Control LoRA is loaded with no control_image (or vice versa) -
 the same "never silently run a half-configured model" guarantee the original
 pack's separate Apply node existed for, kept without a second required node.
 
-Krea2EditModelPatch + Krea2EditGroundedEncode are a faithful port of
+Krea2IdentityEditSourcePatch + Krea2IdentityEditGroundedEncode (comfyui-
+krea2edit's own Krea2EditModelPatch/Krea2EditGroundedEncode, renamed here -
+see the "Fix: rename..." AGENTS.md entry) are a faithful port of
 comfyui-krea2edit (Apache-2.0, lbouaraba, https://github.com/lbouaraba/
 comfyui-krea2edit) - the node pack behind the separately-licensed "Krea 2
 Identity Edit" LoRA (krea2_identity_edit_v1_2.safetensors, Krea 2 Community
@@ -1418,7 +1420,7 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     return out
 
 
-class Krea2EditModelPatch:
+class Krea2IdentityEditSourcePatch:
     """Adds krea2_edit's in-context source-preservation path to a Krea2 model.
 
     Ported from comfyui-krea2edit's Krea2EditModelPatch (Apache-2.0, lbouaraba).
@@ -1435,12 +1437,12 @@ class Krea2EditModelPatch:
 
     Wiring: LoadImage -> VAEEncode -> source_latent (or vae+source_image for
     the blur-proof pixel-space path) -> this node's model output -> KSampler.
-    Pair with Krea2EditGroundedEncode for positive/negative conditioning -
+    Pair with Krea2IdentityEditGroundedEncode for positive/negative conditioning -
     both are required for correct results (see that class's docstring).
     """
 
     CATEGORY = KREA2_CATEGORY
-    TITLE = "Krea2 Edit (source patch) ⚡"
+    TITLE = "Krea2 Identity Edit (source patch) ⚡"
     SEARCH_ALIASES = ['krea2 edit', 'identity edit', 'image edit', 'instruction edit',
                        'in-context edit', 'source preservation']
     RETURN_TYPES = ("MODEL",)
@@ -1586,7 +1588,7 @@ class Krea2EditModelPatch:
         return (m,)
 
 
-class Krea2EditGroundedEncode:
+class Krea2IdentityEditGroundedEncode:
     """Image-grounded instruction encode - the SEMANTIC path of krea2_edit.
 
     Ported from comfyui-krea2edit's Krea2EditGroundedEncode (Apache-2.0,
@@ -1594,7 +1596,7 @@ class Krea2EditGroundedEncode:
     source image through Qwen3-VL (user turn = <vision tokens: source> +
     instruction) and taps 12 layers. Stock CLIPTextEncode is text-only, so
     encoding without this node runs with the grounding half of the recipe
-    missing (Krea2EditModelPatch's VAE source tokens carry appearance; THIS
+    missing (Krea2IdentityEditSourcePatch's VAE source tokens carry appearance; THIS
     carries scene semantics: "the man on the left", "the sign in the back").
     Both nodes are required for correct results with the Krea 2 Identity
     Edit LoRA.
@@ -1615,7 +1617,7 @@ class Krea2EditGroundedEncode:
     )
 
     CATEGORY = KREA2_CATEGORY
-    TITLE = "Krea2 Edit (grounded encode) ⚡"
+    TITLE = "Krea2 Identity Edit (grounded encode) ⚡"
     SEARCH_ALIASES = ['krea2 edit', 'identity edit', 'grounded encode', 'image grounded prompt',
                        'text prompt', 'positive prompt', 'negative prompt']
     RETURN_TYPES = ("CONDITIONING",)
@@ -1687,16 +1689,20 @@ NODE_CLASS_MAPPINGS = {
     "Krea2Img2Img": Krea2Img2Img,
     "Krea2ControlNetImg2Img": Krea2ControlNetImg2Img,
     "Krea2KSampler": Krea2KSampler,
-    # Namespaced (not "Krea2EditModelPatch"/"Krea2EditGroundedEncode"): those
-    # ids collide with the original comfyui-krea2edit package's own nodes of
-    # the same name (this pack is a faithful port of them) - when both packs
-    # are installed, ComfyUI's global NODE_CLASS_MAPPINGS dict is keyed by id
-    # string across ALL custom node packages, so whichever pack's __init__.py
-    # runs last silently overwrites the other's entry for that id. Prefixing
-    # ours keeps both packs' nodes selectable side by side instead of one
-    # invisibly shadowing the other.
-    "CCTechKrea2EditModelPatch": Krea2EditModelPatch,
-    "CCTechKrea2EditGroundedEncode": Krea2EditGroundedEncode,
+    # Class AND id both renamed away from the source pack's own
+    # "Krea2EditModelPatch"/"Krea2EditGroundedEncode" (see the dated AGENTS.md
+    # entry): those were originally kept identical to comfyui-krea2edit's own
+    # names on purpose, for drop-in compat if that pack were swapped out for
+    # this one - but ComfyUI's NODE_CLASS_MAPPINGS dict is keyed by id string
+    # across ALL installed packages, so with both packs installed at once,
+    # whichever one's __init__.py ran last silently overwrote the other's
+    # entry, with no error. A real rename (not just an id prefix) removes the
+    # collision at the root and gives the class its own identity - matches
+    # this file's CCTech-prefixed-id convention already used for
+    # collision-prone names elsewhere in this pack (nodes/extra.py's
+    # CCTechDualVAELoader/CCTechClipProjLoader).
+    "CCTechKrea2IdentityEditSourcePatch": Krea2IdentityEditSourcePatch,
+    "CCTechKrea2IdentityEditGroundedEncode": Krea2IdentityEditGroundedEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1705,7 +1711,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2DepthMap": "Krea2 Depth Map ⚡",
     "Krea2Img2Img": Krea2Img2Img.TITLE,
     "Krea2ControlNetImg2Img": Krea2ControlNetImg2Img.TITLE,
-    "CCTechKrea2EditModelPatch": Krea2EditModelPatch.TITLE,
-    "CCTechKrea2EditGroundedEncode": Krea2EditGroundedEncode.TITLE,
+    "CCTechKrea2IdentityEditSourcePatch": Krea2IdentityEditSourcePatch.TITLE,
+    "CCTechKrea2IdentityEditGroundedEncode": Krea2IdentityEditGroundedEncode.TITLE,
     "Krea2KSampler": Krea2KSampler.TITLE,
 }

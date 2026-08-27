@@ -570,7 +570,7 @@ def test_ksampler_diffusers_mode_slices_sigmas_from_t_start():
     print("[ok] Krea2KSampler: denoise_mode=diffusers slices sigmas from t_start and returns latent")
 
 
-# ── Krea2EditModelPatch / Krea2EditGroundedEncode ────────────────────────
+# ── Krea2IdentityEditSourcePatch / Krea2IdentityEditGroundedEncode ───────
 
 class _FakeKreaEditModel:
     def process_latent_in(self, x):
@@ -578,7 +578,7 @@ class _FakeKreaEditModel:
 
 
 class _FakeKreaEditModelPatcher:
-    """Minimal stand-in for ModelPatcher - only what Krea2EditModelPatch.patch()
+    """Minimal stand-in for ModelPatcher - only what Krea2IdentityEditSourcePatch.patch()
     touches. wrappers/add_wrapper_with_key mirror the real ModelPatcher method
     (comfy/model_patcher.py) that comfy/sampler_helpers.py merges into
     transformer_options at real sampling time."""
@@ -633,17 +633,17 @@ def _krea2edit_run_wrapper(wrapper, n=1, h=64, w=64):
 
 
 def test_krea2edit_patch_clones_and_registers_diffusion_model_wrapper():
-    node = krea2.Krea2EditModelPatch()
+    node = krea2.Krea2IdentityEditSourcePatch()
     model = _FakeKreaEditModelPatcher()
     (m,) = node.patch(model, _krea2edit_latent())
     assert m is not model  # cloned
     assert len(m.wrappers["diffusion_model"]["krea2_edit"]) == 1
-    print("[ok] Krea2EditModelPatch: patch() clones the model and registers a "
+    print("[ok] Krea2IdentityEditSourcePatch: patch() clones the model and registers a "
           "DIFFUSION_MODEL wrapper under key 'krea2_edit'")
 
 
 def test_krea2edit_wrapper_calls_krea2_edit_forward_with_scaled_source():
-    node = krea2.Krea2EditModelPatch()
+    node = krea2.Krea2IdentityEditSourcePatch()
     model = _FakeKreaEditModelPatcher()
     calls = []
     original = krea2.krea2_edit_forward
@@ -656,7 +656,7 @@ def test_krea2edit_wrapper_calls_krea2_edit_forward_with_scaled_source():
         krea2.krea2_edit_forward = original
     assert len(calls) == 1
     assert calls[0].shape == (1, 4, 32, 32)  # source_latent scaled via process_latent_in (identity fake)
-    print("[ok] Krea2EditModelPatch: wrapper calls krea2_edit_forward with the "
+    print("[ok] Krea2IdentityEditSourcePatch: wrapper calls krea2_edit_forward with the "
           "process_latent_in-scaled source latent")
 
 
@@ -664,7 +664,7 @@ def test_krea2edit_target_latent_encodes_before_sampling():
     """target_latent wired -> encode happens during patch(), not in the wrapper -
     the whole point of target_latent (see class docstring: avoids evicting the
     resident diffusion model mid-sampling)."""
-    node = krea2.Krea2EditModelPatch()
+    node = krea2.Krea2IdentityEditSourcePatch()
     model = _FakeKreaEditModelPatcher()
     calls = []
     original = krea2.krea2_edit_forward
@@ -679,12 +679,12 @@ def test_krea2edit_target_latent_encodes_before_sampling():
         assert len(vae.calls) == 1, "sampling must reuse the pre-encode, never re-encode"
     finally:
         krea2.krea2_edit_forward = original
-    print("[ok] Krea2EditModelPatch: target_latent pre-encodes the pixel-path "
+    print("[ok] Krea2IdentityEditSourcePatch: target_latent pre-encodes the pixel-path "
           "source during patch(), before any sampling step")
 
 
 def test_krea2edit_without_target_latent_encode_lands_in_wrapper():
-    node = krea2.Krea2EditModelPatch()
+    node = krea2.Krea2IdentityEditSourcePatch()
     model = _FakeKreaEditModelPatcher()
     original = krea2.krea2_edit_forward
     krea2.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: torch.zeros_like(x)
@@ -697,12 +697,12 @@ def test_krea2edit_without_target_latent_encode_lands_in_wrapper():
         assert len(vae.calls) == 1, "encode happens on the first sampling step, then caches"
     finally:
         krea2.krea2_edit_forward = original
-    print("[ok] Krea2EditModelPatch: legacy path (no target_latent) - pixel-path "
+    print("[ok] Krea2IdentityEditSourcePatch: legacy path (no target_latent) - pixel-path "
           "encode happens on the first wrapper call, then is cached")
 
 
 def test_krea2edit_both_references_are_pre_encoded():
-    node = krea2.Krea2EditModelPatch()
+    node = krea2.Krea2IdentityEditSourcePatch()
     model = _FakeKreaEditModelPatcher()
     calls = []
     original = krea2.krea2_edit_forward
@@ -718,7 +718,7 @@ def test_krea2edit_both_references_are_pre_encoded():
         assert isinstance(calls[0], list) and len(calls[0]) == 2
     finally:
         krea2.krea2_edit_forward = original
-    print("[ok] Krea2EditModelPatch: source_latent_b/source_image_b -> both "
+    print("[ok] Krea2IdentityEditSourcePatch: source_latent_b/source_image_b -> both "
           "references pre-encoded, passed as a 2-element list to krea2_edit_forward")
 
 
@@ -765,7 +765,7 @@ def test_krea2edit_forward_pure_noise_shape_roundtrips():
 
 
 def test_krea2edit_grounded_encode_text_only_fallback_without_image():
-    node = krea2.Krea2EditGroundedEncode()
+    node = krea2.Krea2IdentityEditGroundedEncode()
     calls = []
     clip = types.SimpleNamespace(
         tokenize=lambda text, **kw: calls.append((text, kw)) or text,
@@ -773,12 +773,12 @@ def test_krea2edit_grounded_encode_text_only_fallback_without_image():
     out, = node.encode(clip, "a test prompt")
     assert out == "cond"
     assert calls == [("a test prompt", {})]
-    print("[ok] Krea2EditGroundedEncode: no image -> plain text-only tokenize, "
+    print("[ok] Krea2IdentityEditGroundedEncode: no image -> plain text-only tokenize, "
           "same as stock CLIPTextEncode")
 
 
 def test_krea2edit_grounded_encode_with_image_passes_images_and_template():
-    node = krea2.Krea2EditGroundedEncode()
+    node = krea2.Krea2IdentityEditGroundedEncode()
     calls = []
     clip = types.SimpleNamespace(
         tokenize=lambda text, **kw: calls.append((text, kw)) or text,
@@ -790,12 +790,12 @@ def test_krea2edit_grounded_encode_with_image_passes_images_and_template():
     assert len(kw["images"]) == 1
     assert kw["images"][0].shape[0] == 1 and kw["images"][0].shape[-1] == 3
     assert kw["llama_template"].count("<|vision_start|>") == 1
-    print("[ok] Krea2EditGroundedEncode: image connected -> clip.tokenize gets "
+    print("[ok] Krea2IdentityEditGroundedEncode: image connected -> clip.tokenize gets "
           "images= and a llama_template with one vision block")
 
 
 def test_krea2edit_grounded_encode_two_images_two_vision_blocks():
-    node = krea2.Krea2EditGroundedEncode()
+    node = krea2.Krea2IdentityEditGroundedEncode()
     calls = []
     clip = types.SimpleNamespace(
         tokenize=lambda text, **kw: calls.append((text, kw)) or text,
@@ -805,12 +805,12 @@ def test_krea2edit_grounded_encode_two_images_two_vision_blocks():
     text, kw = calls[0]
     assert len(kw["images"]) == 2
     assert kw["llama_template"].count("<|vision_start|>") == 2
-    print("[ok] Krea2EditGroundedEncode: image + image_b -> two vision blocks, "
+    print("[ok] Krea2IdentityEditGroundedEncode: image + image_b -> two vision blocks, "
           "training order (scene, subject)")
 
 
 def test_krea2edit_grounded_encode_downscales_above_grounding_px():
-    node = krea2.Krea2EditGroundedEncode()
+    node = krea2.Krea2IdentityEditGroundedEncode()
     calls = []
     clip = types.SimpleNamespace(
         tokenize=lambda text, **kw: calls.append((text, kw)) or text,
@@ -818,7 +818,7 @@ def test_krea2edit_grounded_encode_downscales_above_grounding_px():
     node.encode(clip, "prompt", image=_krea2edit_image(2048), grounding_px=768)
     _, kw = calls[0]
     assert max(kw["images"][0].shape[1], kw["images"][0].shape[2]) <= 768
-    print("[ok] Krea2EditGroundedEncode: grounding_px caps the longest side fed to Qwen3-VL")
+    print("[ok] Krea2IdentityEditGroundedEncode: grounding_px caps the longest side fed to Qwen3-VL")
 
 
 if __name__ == "__main__":
