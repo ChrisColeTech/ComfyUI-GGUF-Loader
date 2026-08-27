@@ -70,6 +70,7 @@ from einops import rearrange
 import comfy.ldm.common_dit
 import comfy.model_management
 import comfy.patcher_extension
+import comfy.sample
 import comfy.sd
 import comfy.utils
 from comfy.ldm.flux.layers import timestep_embedding
@@ -948,9 +949,18 @@ class Krea2Img2Img:
                 logger.info("Krea2: identity_edit=True ignores strength=%.2f - full noise "
                            "target, source preservation comes from the injected context "
                            "instead", strength)
+            # A plain 4-channel placeholder isn't safe here the way it is for
+            # txt2img below: that one is only ever touched by comfy's own
+            # common_ksampler (which runs fix_empty_latent_channels first) -
+            # this one is fed straight into _apply_identity_edit_patch, which
+            # calls model.model.process_latent_in() on it immediately, at
+            # node-execution time, before any sampler gets a chance to
+            # correct it. Fix the channel/dim count here instead, matching
+            # what Krea2KSampler's diffusers-mode path already does.
             latent = torch.zeros(
                 [batch_size, 4, height // 8, width // 8],
                 device=comfy.model_management.intermediate_device())
+            latent = comfy.sample.fix_empty_latent_channels(model, latent)
             denoise = 1.0
             target_latent = {"samples": latent}
             model = _apply_identity_edit_patch(

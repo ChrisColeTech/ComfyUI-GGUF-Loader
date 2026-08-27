@@ -89,7 +89,7 @@ comfy_samplers.calculate_sigmas = lambda model_sampling, scheduler, steps: torch
 comfy_samplers.sampler_object = lambda name: name
 
 comfy_sample_mod = types.ModuleType("comfy.sample")
-comfy_sample_mod.fix_empty_latent_channels = lambda model, samples, a, b: samples
+comfy_sample_mod.fix_empty_latent_channels = lambda model, samples, a=None, b=None: samples
 comfy_sample_mod.prepare_noise = lambda samples, seed, batch_index=None: torch.zeros_like(samples)
 
 
@@ -564,6 +564,29 @@ def test_img2img_identity_edit_patches_model_and_grounds_conditioning():
           "both positive/negative on `images` instead of plain text encoding")
 
 
+def test_img2img_identity_edit_batch_size_2_does_not_crash():
+    # Regression: identity_edit=True built its empty latent with a hardcoded
+    # 4 channels and fed it straight into _apply_identity_edit_patch (which
+    # calls model.model.process_latent_in() on it immediately, at node-
+    # execution time) - unlike txt2img's own 4-channel placeholder, which is
+    # only ever touched by comfy's common_ksampler (channel-corrected there
+    # first). Real batch_size=2 use hit this as a RuntimeError mid-sampling;
+    # comfy.sample.fix_empty_latent_channels() now runs right after building
+    # the placeholder, same as Krea2KSampler's diffusers-mode path already
+    # does, before anything else touches it.
+    node = krea2.Krea2Img2Img()
+    model = _FakeKreaEditModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: t, tokenize=lambda s, **kw: (s, kw))
+    vae = _FakeKreaEditVAE()
+    _, _, _, latent, _ = node.prepare(
+        model, clip, vae, "prompt", "", 1.0, 2, 64, 64,
+        images=_krea2edit_image(), identity_edit=True)
+    assert latent["samples"].shape[0] == 2
+    print("[ok] Krea2Img2Img: identity_edit=True with batch_size=2 doesn't crash - "
+          "fix_empty_latent_channels runs before the latent is touched by the patch")
+
+
 def test_img2img_identity_edit_ignores_strength():
     node = krea2.Krea2Img2Img()
     model = _FakeKreaEditModelPatcher()
@@ -907,6 +930,7 @@ if __name__ == "__main__":
     test_img2img_images_batch_produces_batched_latent()
     test_img2img_identity_edit_requires_images()
     test_img2img_identity_edit_patches_model_and_grounds_conditioning()
+    test_img2img_identity_edit_batch_size_2_does_not_crash()
     test_img2img_identity_edit_ignores_strength()
     test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
     test_ksampler_diffusers_mode_rejects_zero_denoise()

@@ -2566,3 +2566,64 @@ call kwargs), and `identity_edit=True` produces `denoise=1.0` even when
 `README.md`'s "Krea2 img2img" section gained a paragraph documenting the
 toggle and pointing at the standalone nodes for the advanced cases it
 doesn't cover.
+
+## Fix: identity_edit=True crashed with batch_size>1 (2026-08-27)
+
+Real-environment test (`batch_size=2`, `identity_edit=True`) hit
+`RuntimeError: The size of tensor a (2) must match the size of tensor b
+(16) at non-singleton dimension 1`, inside sampling. Root cause: the
+`identity_edit` branch above built its empty target latent with a
+hardcoded 4 channels -
+
+```python
+latent = torch.zeros([batch_size, 4, height // 8, width // 8], ...)
+```
+
+- copying the exact same placeholder pattern the txt2img branch already
+uses a few lines down. That pattern is safe in txt2img ONLY because the
+placeholder is returned as-is and never touched again until it reaches
+comfy's own `common_ksampler`, which runs `comfy.sample.
+fix_empty_latent_channels()` first and corrects the channel/dim count for
+whatever model is actually attached (Krea2/Qwen-Image-family VAEs use 16
+latent channels, not 4 - `EmptyLatentImage` relies on this same correction
+pass across every architecture, so nothing in this pack has ever needed to
+get the channel count right by hand). The `identity_edit` branch broke that
+assumption: it feeds the placeholder straight into
+`_apply_identity_edit_patch()`, which calls `model.model.process_latent_in()`
+on it immediately, at *node-execution time* - before any sampler, and
+therefore before `fix_empty_latent_channels`, ever runs. The still-4-channel
+tensor was being used, uncorrected, as the DiT's own "target" through the
+entire krea2_edit_forward path.
+
+Fix: call `comfy.sample.fix_empty_latent_channels(model, latent)` right
+after building the placeholder, mirroring what `Krea2KSampler`'s
+`denoise_mode="diffusers"` path already does for the exact same reason
+(same file, same pattern, already proven correct there). Also moved
+`import comfy.sample` from a local import inside `Krea2KSampler.sample()`'s
+diffusers branch to a real module-level import: a first attempt at this fix
+added `import comfy.sample` *locally inside* `Krea2Img2Img.prepare()`, which
+silently broke the txt2img and plain-img2img branches of that same function
+with `UnboundLocalError: cannot access local variable 'comfy'` - a local
+`import comfy.sample` binds the name `comfy` as local for the ENTIRE
+enclosing function in Python (any assignment anywhere in a function body
+makes that name local throughout, not just after the assignment line),
+shadowing the module-level `comfy` import in every other branch of
+`prepare()` that never executes that particular import line. `Krea2KSampler
+.sample()`'s own pre-existing local `import comfy.sample` never hit this
+because every `comfy.` reference in that function already comes after its
+local imports; `prepare()`'s multi-branch `if`/`elif`/`else` shape doesn't
+have that guarantee, so it needed the module-level import instead.
+
+`tools/smoke_krea2.py`'s fake `comfy.sample.fix_empty_latent_channels`
+stub required 4 positional args with no defaults
+(`lambda model, samples, a, b: samples`) - the real function's last two
+params are optional, and this call only passes `(model, latent)`. Updated
+the stub to match (`a=None, b=None`) rather than pass unnecessary args
+just to satisfy an inaccurate test double. Added a new regression test,
+`test_img2img_identity_edit_batch_size_2_does_not_crash`, reusing the
+existing `_FakeKreaEditModelPatcher`/`_FakeKreaEditVAE` fakes - the offline
+harness's stub is a passthrough (can't verify real channel-correction
+math), so this test's job is narrower but real: catching exactly the class
+of bug that shipped here, a call path that raises before it ever reaches
+comfy's real channel-fixing code. 43/43 Krea2 smoke tests, 84/84 full
+suite.
