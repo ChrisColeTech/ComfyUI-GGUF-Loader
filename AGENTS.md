@@ -2509,3 +2509,60 @@ the portable ComfyUI install (`Krea 2 Edit (Full Context).json`,
 `krea2_img2img.json`) that reference the old `CCTechKrea2Edit*` type
 ids from the previous fix were updated in place to the new ids -
 otherwise both would fail to resolve their node type on next load.
+
+## Krea2Img2Img gains identity_edit=True - one node instead of three (2026-08-27)
+
+Real-world test of the split identity-edit port (`Krea2IdentityEditSourcePatch`
++ `Krea2IdentityEditGroundedEncode`, wired manually alongside `Krea2Img2Img`
+in a saved workflow) surfaced a genuine usability problem, not a bug: the
+Identity Edit LoRA needs its own three-node graph (patch the model, ground
+the conditioning, and still keep `Krea2Img2Img` around for the VAE-encode/
+latent-shape plumbing) just to do what should be a single toggle. The
+original defense for keeping them separate - "`Krea2Img2Img` can't detect
+whether the LoRA is loaded, since LoRA weights are already merged into the
+model tensor by the time it reaches the node" - is real, but it's a reason
+to make the behavior *opt-in*, not a reason it can't live in the same node.
+A plain boolean widget solves exactly that: the user tells the node what
+they're doing instead of the node trying to infer it.
+
+Added `identity_edit` (BOOLEAN, default `False`) to `Krea2Img2Img`. When
+`True`: `images` stops feeding the partial-denoise img2img path and becomes
+the Identity Edit LoRA's source photo instead - the target always starts at
+full noise (`strength` is ignored and logged as such, since source
+preservation now comes from the injected in-context tokens, not from
+partially denoising a copy of the source - mixing both fights the LoRA's
+own trained recipe), the model gets the exact same
+`comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL` wrapper
+`Krea2IdentityEditSourcePatch` registers, and `prompt`/`negative_prompt`
+both go through the grounded (image + text, Qwen3-VL) encode path instead
+of plain `clip.tokenize()` - negative included, matching
+`Krea2IdentityEditGroundedEncode`'s own documented recommendation to ground
+the unconditional too. `identity_edit=True` with no `images` connected
+raises immediately (nothing to drive the LoRA with) rather than silently
+falling through to plain txt2img.
+
+Refactored rather than duplicated: extracted `_apply_identity_edit_patch()`
+and `_identity_edit_grounded_encode()`/`_identity_edit_prep_image()`/
+`_identity_edit_template()` as module-level functions holding the exact
+logic that used to live only inside `Krea2IdentityEditSourcePatch.patch()`/
+`Krea2IdentityEditGroundedEncode.encode()`. Both standalone node classes now
+call the same shared functions `Krea2Img2Img.prepare()` calls, so the three
+call sites can never drift out of sync - fixing one fixes all three.
+Standalone `Krea2IdentityEditSourcePatch`/`Krea2IdentityEditGroundedEncode`
+stay exactly as they were (same inputs, same behavior, same use case: full
+manual control - dual-reference, `ref_boost_mask`, `fit_mode="crop
+(legacy)"`, custom `system_prompt` - none of which `Krea2Img2Img`'s toggle
+exposes, by design, to keep the common case a 3-widget addition instead of
+an 11-input one).
+
+`tools/smoke_krea2.py` gained 3 new tests reusing the existing
+`_FakeKreaEditModelPatcher`/`_FakeKreaEditVAE` fakes (no new fakes needed,
+confirming the refactor genuinely shares one code path): `identity_edit=True`
+with no `images` raises, `identity_edit=True` patches the model (same
+wrapper key/count as the standalone node) and grounds both positive/negative
+conditioning (asserted via `images=` present in the fake `clip.tokenize()`
+call kwargs), and `identity_edit=True` produces `denoise=1.0` even when
+`strength` is set low. 42/42 Krea2 smoke tests, 84/84 full suite.
+`README.md`'s "Krea2 img2img" section gained a paragraph documenting the
+toggle and pointing at the standalone nodes for the advanced cases it
+doesn't cover.

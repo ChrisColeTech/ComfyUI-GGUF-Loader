@@ -849,6 +849,23 @@ class Krea2Img2Img:
     generations, since `vae.encode()`/`KSampler` already process a batched
     latent as N parallel runs, no special-casing needed.
 
+    `identity_edit=True` switches `images` to a completely different job:
+    instead of partial-denoise img2img, `images` becomes the source photo for
+    the Krea 2 Identity Edit LoRA's in-context recipe - the same mechanism
+    Krea2IdentityEditSourcePatch/Krea2IdentityEditGroundedEncode provide as
+    standalone nodes, applied here internally so this one node works with or
+    without that LoRA loaded (this toggle only adds the driving mechanism -
+    the LoRA itself still needs to be loaded upstream, e.g. via
+    LoraLoaderModelOnly; with identity_edit=True and no such LoRA loaded, the
+    extra context tokens are simply inert - not incorrect, just no LoRA to
+    respond to them). When on: `strength` is ignored (the target always
+    starts at full noise - source preservation comes from the injected
+    context, not from partial denoising, and mixing both fights the LoRA's
+    trained recipe), and `prompt`/`negative_prompt` are grounded on `images`
+    through Qwen3-VL instead of encoded as plain text. Needs a krea2-type
+    CLIP checkpoint WITH the vision tower for identity_edit - see
+    Krea2IdentityEditGroundedEncode's docstring.
+
     Feed the outputs straight into a stock KSampler.
     """
 
@@ -860,9 +877,10 @@ class Krea2Img2Img:
     RETURN_NAMES = ("model", "positive", "negative", "latent", "denoise")
     FUNCTION = "prepare"
     DESCRIPTION = ("Prompts and init latent for Krea2, no ControlNet. Leave "
-                   "images unconnected for txt2img. For ControlNet-guided "
-                   "generation use Krea2ControlNetImg2Img instead. Feed the "
-                   "outputs straight into a stock KSampler.")
+                   "images unconnected for txt2img. identity_edit=True drives "
+                   "the Krea 2 Identity Edit LoRA (needs it loaded upstream). "
+                   "For ControlNet-guided generation use Krea2ControlNetImg2Img "
+                   "instead. Feed the outputs straight into a stock KSampler.")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -884,14 +902,66 @@ class Krea2Img2Img:
             "optional": {
                 "images": ("IMAGE", {"tooltip": "One or more init images for img2img "
                                                "(batch-aware - a batch of N becomes N "
-                                               "independent img2img generations). Leave "
+                                               "independent img2img generations). With "
+                                               "identity_edit=True this is instead the "
+                                               "Identity Edit LoRA's source photo. Leave "
                                                "unconnected for txt2img."}),
+                "identity_edit": ("BOOLEAN", {"default": False,
+                                  "tooltip": "Drive the Krea 2 Identity Edit LoRA correctly: "
+                                             "injects `images` as in-context source tokens "
+                                             "and grounds prompt/negative_prompt on the same "
+                                             "image through Qwen3-VL, instead of plain "
+                                             "text-only encoding. Needs `images` connected "
+                                             "and the LoRA loaded upstream (e.g. via "
+                                             "LoraLoaderModelOnly) - this toggle only adds "
+                                             "the driving mechanism, it doesn't load the LoRA "
+                                             "itself. Forces a full-noise target (ignores "
+                                             "strength) - see the class docstring."}),
+                "ref_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01,
+                              "round": 0.001,
+                              "tooltip": "identity_edit only. Reference-fidelity dial: how hard "
+                                         "the target locks onto images's appearance. 1.0 = off "
+                                         "(neutral), >1 pulls harder, <1 loosens."}),
+                "grounding_px": ("INT", {"default": 768, "min": 0, "max": 4096, "step": 64,
+                                 "tooltip": "identity_edit only. Cap longest side fed to "
+                                            "Qwen3-VL for grounding; 0 = native. Lower = "
+                                            "stronger edit adherence, higher = stronger "
+                                            "identity/likeness."}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, strength, batch_size,
-                width, height, images=None):
-        if images is None:
+                width, height, images=None, identity_edit=False, ref_boost=1.0,
+                grounding_px=768):
+        if identity_edit and images is None:
+            raise ValueError(
+                "Krea2Img2Img: identity_edit=True needs `images` connected - it's the source "
+                "photo injected as in-context tokens for the Identity Edit LoRA. Without it "
+                "there's nothing to drive the LoRA with.")
+
+        if identity_edit:
+            # Source preservation comes from the injected context tokens, not from
+            # partially denoising a copy of the source - mixing both fights the
+            # LoRA's trained recipe (see Krea2IdentityEditSourcePatch's docstring),
+            # so the target always starts at full noise here regardless of strength.
+            if strength != 1.0:
+                logger.info("Krea2: identity_edit=True ignores strength=%.2f - full noise "
+                           "target, source preservation comes from the injected context "
+                           "instead", strength)
+            latent = torch.zeros(
+                [batch_size, 4, height // 8, width // 8],
+                device=comfy.model_management.intermediate_device())
+            denoise = 1.0
+            target_latent = {"samples": latent}
+            model = _apply_identity_edit_patch(
+                model, source_latent=target_latent, vae=vae, source_image=images,
+                target_latent=target_latent, ref_boost=ref_boost)
+            positive = _identity_edit_grounded_encode(
+                clip, prompt, image=images, grounding_px=grounding_px)
+            negative = _identity_edit_grounded_encode(
+                clip, negative_prompt, image=images, grounding_px=grounding_px)
+            logger.info("Krea2: identity_edit active, empty latent %s", tuple(latent.shape))
+        elif images is None:
             # txt2img: a plain, architecture-agnostic empty latent - comfy's own
             # sampling path (comfy.sample.fix_empty_latent_channels, called from
             # common_ksampler) corrects channel count and adds the time dimension
@@ -901,6 +971,8 @@ class Krea2Img2Img:
                 [batch_size, 4, height // 8, width // 8],
                 device=comfy.model_management.intermediate_device())
             denoise = 1.0
+            positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+            negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
             logger.info("Krea2: txt2img, empty latent %s", tuple(latent.shape))
         else:
             pixels = comfy.utils.common_upscale(
@@ -909,10 +981,9 @@ class Krea2Img2Img:
             if batch_size > 1:
                 latent = latent.repeat(batch_size, *([1] * (latent.dim() - 1)))
             denoise = strength
+            positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+            negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
             logger.info("Krea2: img2img, latent %s, strength %.2f", tuple(latent.shape), strength)
-
-        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
-        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
 
         return (model, positive, negative, {"samples": latent}, denoise)
 
@@ -1420,6 +1491,100 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     return out
 
 
+def _apply_identity_edit_patch(model, source_latent, source_latent_b=None, ref_boost=1.0,
+                                ref_boost_a=1.0, ref_boost_mask=None, vae=None, source_image=None,
+                                source_image_b=None, fit_mode="fit", target_latent=None):
+    """krea2_edit's in-context source-preservation path, as a standalone
+    ModelPatcher operation - shared by Krea2IdentityEditSourcePatch.patch()
+    (below) and Krea2Img2Img's identity_edit=True path, so the two never
+    drift out of sync. See Krea2IdentityEditSourcePatch's docstring for what
+    this does and why it has to be a model-forward wrapper, not a latent-prep
+    step."""
+    m = model.clone()
+    # The target latent reaches the diffusion model already scaled (process_latent_in);
+    # scale the source(s) the same way so all share one latent space.
+    src_samples = model.model.process_latent_in(source_latent["samples"])
+    if source_latent_b is not None:
+        src_samples = [src_samples, model.model.process_latent_in(source_latent_b["samples"])]
+
+    px_cache = {}   # pixel-path encoded sources, keyed per target resolution
+    mm = model.model  # for process_latent_in on the pixel path
+    state = {"announced": False}
+    fit_mode_key = "fit" if fit_mode == "fit" else "crop"
+
+    if fit_mode_key == "fit" and (vae is None or source_image is None):
+        logger.warning("Krea2Edit: fit_mode='fit' has NO EFFECT - it needs both "
+                       "'vae' and 'source_image' connected (the pixel path). "
+                       "Falling back to the latent crop path.")
+
+    # Pre-encode OUTSIDE the sampling window. vae.encode -> load_models_gpu ->
+    # free_memory(keep_loaded=[]), which partially unloads whatever is resident -
+    # including the diffusion model, if the first call lands inside the sampler.
+    # Nothing re-expands it (sampler_helpers loads once, before the loop), so the
+    # rest of the run streams weights from CPU every step. Running the encode here,
+    # at node-execution time, restores the ordinary VAEEncode -> KSampler order
+    # where the sampler evicts the VAE instead of the reverse.
+    primed = None
+    if vae is not None and source_image is not None:
+        if target_latent is not None:
+            Hh, Ww = target_latent["samples"].shape[-2], target_latent["samples"].shape[-1]
+            logger.info("Krea2Edit: pre-encoding sources at target %dx%dpx "
+                       "(before sampling, fit_mode=%s)", Hh * 8, Ww * 8, fit_mode_key)
+            _fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode_key)
+            if source_image_b is not None:
+                _fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode_key)
+            primed = (Hh, Ww)
+        else:
+            logger.info("Krea2Edit: connect 'target_latent' (the same latent that feeds "
+                       "KSampler.latent_image) to pre-encode the source here instead of "
+                       "on the first sampling step. Without it the VAE is loaded mid-"
+                       "sampling and can evict part of the diffusion model, slowing "
+                       "every remaining step.")
+
+    def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
+        # ComfyUI's SingleStreamDiT.forward signature (comfy/ldm/krea2/model.py):
+        #   execute(x, t, ctx, attention_mask, ref_latents, transformer_options, **kwargs)
+        # Accept extra trailing positionals defensively in case that signature
+        # drifts again - transformer_options is always the trailing dict.
+        transformer_options = kwargs.pop("transformer_options", None)
+        if transformer_options is None:
+            transformer_options = {}
+            for a in reversed(wargs):
+                if isinstance(a, dict):
+                    transformer_options = a
+                    break
+        dm = executor.class_obj  # the SingleStreamDiT instance
+        src = src_samples
+        if vae is not None and source_image is not None:
+            xx = _to_4d(x)
+            Hh, Ww = xx.shape[-2], xx.shape[-1]
+            # not `if not px_cache` - the cache is already primed when target_latent
+            # is wired, so an explicit one-shot flag is needed to announce once.
+            if not state["announced"]:
+                state["announced"] = True
+                logger.info("Krea2Edit: pixel path ACTIVE (fit_mode=%s)", fit_mode_key)
+                if primed is not None and primed != (Hh, Ww):
+                    logger.warning("Krea2Edit: 'target_latent' is %dx%dpx but sampling "
+                                   "is at %dx%dpx - the pre-encode is unused and the VAE "
+                                   "will run mid-sampling. Wire the SAME latent that "
+                                   "feeds KSampler.", primed[0] * 8, primed[1] * 8, Hh * 8, Ww * 8)
+            lat = mm.process_latent_in(_fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode_key))
+            if source_image_b is not None:
+                lat = [lat, mm.process_latent_in(_fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode_key))]
+            src = lat
+        v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
+                               ref_boost=ref_boost, ref_boost_a=ref_boost_a,
+                               ref_boost_mask=ref_boost_mask,
+                               ref_native=(fit_mode_key == "fit" and vae is not None
+                                           and source_image is not None),
+                               pos_mode=("stride1" if fit_mode_key == "fit" else "anchor"))
+        return v
+
+    m.add_wrapper_with_key(
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit", wrapper)
+    return m
+
+
 class Krea2IdentityEditSourcePatch:
     """Adds krea2_edit's in-context source-preservation path to a Krea2 model.
 
@@ -1431,14 +1596,17 @@ class Krea2IdentityEditSourcePatch:
     the Krea 2 Identity Edit LoRA (krea2_identity_edit_v1_2.safetensors,
     licensed separately under Krea AI's own Community License Agreement - not
     bundled here) was trained. Comfy's native Krea2 forward only ever builds
-    `[text | target]`; this pack has no other mechanism (not Krea2Img2Img's
-    control_image path, not reference_latents) that can drive this LoRA
-    correctly.
+    `[text | target]`; this pack has no other mechanism (not reference_latents)
+    that can drive this LoRA correctly.
 
-    Wiring: LoadImage -> VAEEncode -> source_latent (or vae+source_image for
-    the blur-proof pixel-space path) -> this node's model output -> KSampler.
-    Pair with Krea2IdentityEditGroundedEncode for positive/negative conditioning -
-    both are required for correct results (see that class's docstring).
+    Standalone use, wiring: LoadImage -> VAEEncode -> source_latent (or
+    vae+source_image for the blur-proof pixel-space path) -> this node's
+    model output -> KSampler. Pair with Krea2IdentityEditGroundedEncode for
+    positive/negative conditioning - both are required for correct results
+    (see that class's docstring). For the common case (partial-denoise
+    img2img blended with identity-edit conditioning, all in one node), use
+    Krea2Img2Img's own identity_edit=True instead - it applies this exact
+    same patch internally, reusing its own images/vae inputs.
     """
 
     CATEGORY = KREA2_CATEGORY
@@ -1503,89 +1671,52 @@ class Krea2IdentityEditSourcePatch:
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
               source_image_b=None, fit_mode="fit", target_latent=None):
-        m = model.clone()
-        # The target latent reaches the diffusion model already scaled (process_latent_in);
-        # scale the source(s) the same way so all share one latent space.
-        src_samples = model.model.process_latent_in(source_latent["samples"])
-        if source_latent_b is not None:
-            src_samples = [src_samples, model.model.process_latent_in(source_latent_b["samples"])]
-
-        px_cache = {}   # pixel-path encoded sources, keyed per target resolution
-        mm = model.model  # for process_latent_in on the pixel path
-        state = {"announced": False}
-        fit_mode_key = "fit" if fit_mode == "fit" else "crop"
-
-        if fit_mode_key == "fit" and (vae is None or source_image is None):
-            logger.warning("Krea2Edit: fit_mode='fit' has NO EFFECT - it needs both "
-                           "'vae' and 'source_image' connected (the pixel path). "
-                           "Falling back to the latent crop path.")
-
-        # Pre-encode OUTSIDE the sampling window. vae.encode -> load_models_gpu ->
-        # free_memory(keep_loaded=[]), which partially unloads whatever is resident -
-        # including the diffusion model, if the first call lands inside the sampler.
-        # Nothing re-expands it (sampler_helpers loads once, before the loop), so the
-        # rest of the run streams weights from CPU every step. Running the encode here,
-        # at node-execution time, restores the ordinary VAEEncode -> KSampler order
-        # where the sampler evicts the VAE instead of the reverse.
-        primed = None
-        if vae is not None and source_image is not None:
-            if target_latent is not None:
-                Hh, Ww = target_latent["samples"].shape[-2], target_latent["samples"].shape[-1]
-                logger.info("Krea2Edit: pre-encoding sources at target %dx%dpx "
-                           "(before sampling, fit_mode=%s)", Hh * 8, Ww * 8, fit_mode_key)
-                _fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode_key)
-                if source_image_b is not None:
-                    _fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode_key)
-                primed = (Hh, Ww)
-            else:
-                logger.info("Krea2Edit: connect 'target_latent' (the same latent that feeds "
-                           "KSampler.latent_image) to pre-encode the source here instead of "
-                           "on the first sampling step. Without it the VAE is loaded mid-"
-                           "sampling and can evict part of the diffusion model, slowing "
-                           "every remaining step.")
-
-        def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
-            # ComfyUI's SingleStreamDiT.forward signature (comfy/ldm/krea2/model.py):
-            #   execute(x, t, ctx, attention_mask, ref_latents, transformer_options, **kwargs)
-            # Accept extra trailing positionals defensively in case that signature
-            # drifts again - transformer_options is always the trailing dict.
-            transformer_options = kwargs.pop("transformer_options", None)
-            if transformer_options is None:
-                transformer_options = {}
-                for a in reversed(wargs):
-                    if isinstance(a, dict):
-                        transformer_options = a
-                        break
-            dm = executor.class_obj  # the SingleStreamDiT instance
-            src = src_samples
-            if vae is not None and source_image is not None:
-                xx = _to_4d(x)
-                Hh, Ww = xx.shape[-2], xx.shape[-1]
-                # not `if not px_cache` - the cache is already primed when target_latent
-                # is wired, so an explicit one-shot flag is needed to announce once.
-                if not state["announced"]:
-                    state["announced"] = True
-                    logger.info("Krea2Edit: pixel path ACTIVE (fit_mode=%s)", fit_mode_key)
-                    if primed is not None and primed != (Hh, Ww):
-                        logger.warning("Krea2Edit: 'target_latent' is %dx%dpx but sampling "
-                                       "is at %dx%dpx - the pre-encode is unused and the VAE "
-                                       "will run mid-sampling. Wire the SAME latent that "
-                                       "feeds KSampler.", primed[0] * 8, primed[1] * 8, Hh * 8, Ww * 8)
-                lat = mm.process_latent_in(_fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode_key))
-                if source_image_b is not None:
-                    lat = [lat, mm.process_latent_in(_fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode_key))]
-                src = lat
-            v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
-                                   ref_boost=ref_boost, ref_boost_a=ref_boost_a,
-                                   ref_boost_mask=ref_boost_mask,
-                                   ref_native=(fit_mode_key == "fit" and vae is not None
-                                               and source_image is not None),
-                                   pos_mode=("stride1" if fit_mode_key == "fit" else "anchor"))
-            return v
-
-        m.add_wrapper_with_key(
-            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit", wrapper)
+        m = _apply_identity_edit_patch(
+            model, source_latent, source_latent_b=source_latent_b, ref_boost=ref_boost,
+            ref_boost_a=ref_boost_a, ref_boost_mask=ref_boost_mask, vae=vae,
+            source_image=source_image, source_image_b=source_image_b, fit_mode=fit_mode,
+            target_latent=target_latent)
         return (m,)
+
+
+_IDENTITY_EDIT_DEFAULT_SYSTEM = (
+    "Describe the image by detailing the color, shape, size, "
+    "texture, quantity, text, spatial relationships of the objects and background:"
+)
+
+
+def _identity_edit_template(nimg, system_prompt=""):
+    sp = system_prompt.strip() or _IDENTITY_EDIT_DEFAULT_SYSTEM
+    vis = "<|vision_start|><|image_pad|><|vision_end|>" * nimg
+    return ("<|im_start|>system\n" + sp + "<|im_end|>\n<|im_start|>user\n"
+            + vis + "{}<|im_end|>\n<|im_start|>assistant\n")
+
+
+def _identity_edit_prep_image(image, grounding_px):
+    samples = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
+    h, w = samples.shape[2], samples.shape[3]
+    if grounding_px and max(h, w) > grounding_px:
+        s = grounding_px / max(h, w)
+        samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
+    return samples.movedim(1, -1)[:, :, :, :3]
+
+
+def _identity_edit_grounded_encode(clip, prompt, image=None, image_b=None, grounding_px=768,
+                                    system_prompt=""):
+    """Image-grounded instruction encode, standalone - shared by
+    Krea2IdentityEditGroundedEncode.encode() (below) and Krea2Img2Img's
+    identity_edit=True path, so the two never drift out of sync. See
+    Krea2IdentityEditGroundedEncode's docstring for why this differs from
+    stock CLIPTextEncode."""
+    if image is None:  # text-only fallback = old behavior
+        tokens = clip.tokenize(prompt)
+        return clip.encode_from_tokens_scheduled(tokens)
+    imgs = [_identity_edit_prep_image(image, grounding_px)]
+    if image_b is not None:
+        imgs.append(_identity_edit_prep_image(image_b, grounding_px))
+    template = _identity_edit_template(len(imgs), system_prompt)
+    tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
+    return clip.encode_from_tokens_scheduled(tokens)
 
 
 class Krea2IdentityEditGroundedEncode:
@@ -1611,10 +1742,7 @@ class Krea2IdentityEditGroundedEncode:
     unconditional).
     """
 
-    DEFAULT_SYSTEM = (
-        "Describe the image by detailing the color, shape, size, "
-        "texture, quantity, text, spatial relationships of the objects and background:"
-    )
+    DEFAULT_SYSTEM = _IDENTITY_EDIT_DEFAULT_SYSTEM
 
     CATEGORY = KREA2_CATEGORY
     TITLE = "Krea2 Identity Edit (grounded encode) ⚡"
@@ -1624,13 +1752,6 @@ class Krea2IdentityEditGroundedEncode:
     FUNCTION = "encode"
     DESCRIPTION = ("Encodes the edit instruction grounded on the source image "
                    "(training-matched semantic path for the Krea 2 Identity Edit LoRA).")
-
-    @classmethod
-    def _template(cls, nimg, system_prompt=""):
-        sp = system_prompt.strip() or cls.DEFAULT_SYSTEM
-        vis = "<|vision_start|><|image_pad|><|vision_end|>" * nimg
-        return ("<|im_start|>system\n" + sp + "<|im_end|>\n<|im_start|>user\n"
-                + vis + "{}<|im_end|>\n<|im_start|>assistant\n")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1659,24 +1780,10 @@ class Krea2IdentityEditGroundedEncode:
             },
         }
 
-    def _prep(self, image, grounding_px):
-        samples = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
-        h, w = samples.shape[2], samples.shape[3]
-        if grounding_px and max(h, w) > grounding_px:
-            s = grounding_px / max(h, w)
-            samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
-        return samples.movedim(1, -1)[:, :, :, :3]
-
     def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt=""):
-        if image is None:  # text-only fallback = old behavior
-            tokens = clip.tokenize(prompt)
-            return (clip.encode_from_tokens_scheduled(tokens),)
-        imgs = [self._prep(image, grounding_px)]
-        if image_b is not None:
-            imgs.append(self._prep(image_b, grounding_px))
-        template = self._template(len(imgs), system_prompt)
-        tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
-        return (clip.encode_from_tokens_scheduled(tokens),)
+        return (_identity_edit_grounded_encode(
+            clip, prompt, image=image, image_b=image_b,
+            grounding_px=grounding_px, system_prompt=system_prompt),)
 
 
 NODE_CLASS_MAPPINGS = {

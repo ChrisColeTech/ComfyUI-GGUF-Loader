@@ -520,6 +520,63 @@ def test_img2img_images_batch_produces_batched_latent():
           "(3 independent img2img generations)")
 
 
+def test_img2img_identity_edit_requires_images():
+    node = krea2.Krea2Img2Img()
+    model = _FakeKreaEditModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: "cond", tokenize=lambda s, **kw: s)
+    vae = _FakeKreaEditVAE()
+    try:
+        node.prepare(model, clip, vae, "prompt", "", 0.6, 1, 64, 64, identity_edit=True)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+    print("[ok] Krea2Img2Img: identity_edit=True with no images -> raises "
+          "(nothing to drive the LoRA with)")
+
+
+def test_img2img_identity_edit_patches_model_and_grounds_conditioning():
+    node = krea2.Krea2Img2Img()
+    model = _FakeKreaEditModelPatcher()
+    tokenize_calls = []
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: t,
+        tokenize=lambda s, **kw: tokenize_calls.append((s, kw)) or (s, kw))
+    vae = _FakeKreaEditVAE()
+    result_model, positive, negative, latent, denoise = node.prepare(
+        model, clip, vae, "make the shirt red", "", 1.0, 1, 64, 64,
+        images=_krea2edit_image(), identity_edit=True)
+
+    # model got the same DIFFUSION_MODEL wrapper Krea2IdentityEditSourcePatch registers
+    assert result_model is not model
+    assert len(result_model.wrappers["diffusion_model"]["krea2_edit"]) == 1
+    # full-noise target, not a VAE-encoded partial-denoise latent
+    assert latent["samples"].shape == (1, 4, 8, 8)
+    assert denoise == 1.0
+    # both positive and negative went through the grounded (images=) path, not plain tokenize
+    assert len(tokenize_calls) == 2
+    assert all("images" in kw for _s, kw in tokenize_calls)
+    assert tokenize_calls[0][0] == "make the shirt red"
+    assert tokenize_calls[1][0] == ""  # negative_prompt default, grounded too (matches training's unconditional)
+    print("[ok] Krea2Img2Img: identity_edit=True patches the model (same wrapper as "
+          "Krea2IdentityEditSourcePatch), forces a full-noise target, and grounds "
+          "both positive/negative on `images` instead of plain text encoding")
+
+
+def test_img2img_identity_edit_ignores_strength():
+    node = krea2.Krea2Img2Img()
+    model = _FakeKreaEditModelPatcher()
+    clip = types.SimpleNamespace(
+        encode_from_tokens_scheduled=lambda t: t, tokenize=lambda s, **kw: (s, kw))
+    vae = _FakeKreaEditVAE()
+    _, _, _, _, denoise = node.prepare(
+        model, clip, vae, "prompt", "", 0.2, 1, 64, 64,
+        images=_krea2edit_image(), identity_edit=True)
+    assert denoise == 1.0  # strength=0.2 ignored - identity_edit always starts at full noise
+    print("[ok] Krea2Img2Img: identity_edit=True ignores `strength` - always full-noise target")
+
+
 # ── Krea2KSampler ─────────────────────────────────────────────────────────
 
 class _FakeSamplerModel:
@@ -848,6 +905,9 @@ if __name__ == "__main__":
     test_img2img_txt2img_empty_latent_shape()
     test_img2img_with_images_uses_strength_as_denoise()
     test_img2img_images_batch_produces_batched_latent()
+    test_img2img_identity_edit_requires_images()
+    test_img2img_identity_edit_patches_model_and_grounds_conditioning()
+    test_img2img_identity_edit_ignores_strength()
     test_ksampler_comfy_mode_delegates_to_common_ksampler_unchanged()
     test_ksampler_diffusers_mode_rejects_zero_denoise()
     test_ksampler_diffusers_mode_slices_sigmas_from_t_start()
