@@ -962,16 +962,21 @@ class LTXV23VidToVideo:
     trained jointly) add LTX-2.3's EditAnything reference-conditioning
     patch to `model` in this same node - mirrors Krea2Img2Img's own
     `identity_edit` toggle (patch built into the main conditioning node,
-    not a separate one), except the LoRA half is now ALSO loaded here
-    (same `LoraLoaderModelOnly` delegation as `ic_lora` above, at
-    `editanything_lora_strength`) instead of requiring external wiring.
-    Needs `reference_image` (the person/subject to inject) too; see
-    `_apply_editanything_patch`'s docstring for the full mechanism and what
-    `reference_mode` controls. Wire the SAME photo into `reference_image`
-    and `image` for the intended full recipe - the returned `model` is the
-    patched clone (or the original, unpatched, if neither selector is set);
-    always take `model` from THIS node's output, not the original upstream
-    model, whenever any selector here is used.
+    reusing the SAME `images`-equivalent input for both purposes rather
+    than a second reference-photo slot - `identity_edit=True` switches
+    what `images` means there instead of adding a new input; this node
+    does the same with `image` instead of a separate `reference_image`),
+    except the LoRA half is now ALSO loaded here (same `LoraLoaderModelOnly`
+    delegation as `ic_lora` above, at `editanything_lora_strength`) instead
+    of requiring external wiring. Needs `image` connected too (the person/
+    subject to inject - the SAME photo drives both the ordinary i2v hold,
+    if `image_strength` > 0, AND the EditAnything reference; set
+    `image_strength=0` to use `image` for EditAnything only, with no
+    first-frame hold effect) - see `_apply_editanything_patch`'s docstring
+    for the full mechanism and what `reference_mode` controls. The
+    returned `model` is the patched clone (or the original, unpatched, if
+    neither selector is set); always take `model` from THIS node's output,
+    not the original upstream model, whenever any selector here is used.
 
     All three LoRA-adjacent selectors (`ic_lora`, `editanything_lora`,
     `editanything_module_path`) list comfy's real `loras` folder_paths
@@ -1049,8 +1054,12 @@ class LTXV23VidToVideo:
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "First frame for image-to-video (ordinary "
-                                    "i2v hold, independent of video/ic_lora below). "
-                                    "Resized and CENTER-CROPPED to width x height."}),
+                                    "i2v hold, independent of video/ic_lora below) - "
+                                    "resized and CENTER-CROPPED to width x height. Also the "
+                                    "EditAnything reference photo when "
+                                    "editanything_module_path is set (see reference_mode for "
+                                    "how a batch is used there) - set image_strength=0 for a "
+                                    "pure EditAnything reference with no i2v-hold effect."}),
                 "image_strength": ("FLOAT", {
                     "default": I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "image only. How much of the init image to keep. 0.7 is "
@@ -1109,21 +1118,18 @@ class LTXV23VidToVideo:
                     "tooltip": "The EditAnything .module.safetensors file (NOT a LoRA - real "
                                "extra layers, loaded by this pack's own patch mechanism), "
                                "from the loras folder. \"none\" = off. Needs "
-                               "editanything_lora and reference_image set too."}),
-                "reference_image": ("IMAGE", {"tooltip": "Needs editanything_module_path set. "
-                                    "The person/subject to inject. A batch of N images gives "
-                                    "N distinct references, one per generation in the "
-                                    "sampling batch (tiled/truncated to fit) - see "
-                                    "reference_mode. Wire the SAME image into `image` too."}),
+                               "editanything_lora and `image` connected too."}),
                 "reference_mode": (["per_batch_item", "first_frame_only"], {
                     "default": "first_frame_only",
-                    "tooltip": "Needs editanything_module_path set. per_batch_item: each "
-                               "image in reference_image's batch is encoded and used as its "
-                               "OWN distinct reference (not blended) - image i drives sample "
-                               "i of the sampling batch, tiled/truncated if the counts don't "
-                               "match. first_frame_only (default here): use only "
-                               "reference_image[0], ignore the rest - the vid2vid recipe "
-                               "(one clean reference identity against a single video)."}),
+                    "tooltip": "Needs editanything_module_path set. Controls how `image`'s "
+                               "batch is used as the EditAnything reference (independent of "
+                               "its ordinary i2v-hold use). per_batch_item: each image in "
+                               "the batch is encoded and used as its OWN distinct reference "
+                               "(not blended) - image i drives sample i of the sampling "
+                               "batch, tiled/truncated if the counts don't match. "
+                               "first_frame_only (default here): use only image[0], ignore "
+                               "the rest - the vid2vid recipe (one clean reference identity "
+                               "against a single video)."}),
             },
         }
 
@@ -1133,20 +1139,11 @@ class LTXV23VidToVideo:
                 video=None, ic_lora="none", ic_lora_strength=1.0, guide_strength=1.0,
                 keep_original_audio=True, latent_downscale_factor=1.0, reference_audio=None,
                 length_from_audio=True, editanything_lora="none", editanything_lora_strength=1.0,
-                editanything_module_path="none", reference_image=None,
-                reference_mode="first_frame_only"):
+                editanything_module_path="none", reference_mode="first_frame_only"):
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
             raise ValueError("audio_vae is not an LTX audio VAE; use the kit's "
                              "*_audio_vae.safetensors in the audio_vae slot.")
-
-        if mode == "t2v" and (image is not None or video is not None):
-            raise ValueError("LTX-2.3 v2v: mode=t2v but image/video is connected - disconnect "
-                             "them or pick i2v/v2v.")
-        if mode == "i2v" and image is None:
-            raise ValueError("LTX-2.3 v2v: mode=i2v needs image connected.")
-        if mode == "v2v" and video is None:
-            raise ValueError("LTX-2.3 v2v: mode=v2v needs video connected.")
 
         ic_lora_attached = ic_lora not in (None, "none", "")
         editanything_lora_attached = editanything_lora not in (None, "none", "")
@@ -1156,6 +1153,24 @@ class LTXV23VidToVideo:
                              "be set together (both \"none\" or both a real file) - either "
                              "alone does nothing, they're trained jointly.")
 
+        # image is dual-purpose: ordinary i2v hold AND (when edit_anything is
+        # on) the EditAnything reference photo - mode=t2v only forbids it
+        # when it would otherwise ONLY be doing the (unwanted, in t2v) i2v
+        # hold job; with edit_anything on, image connected under t2v is the
+        # "no first-frame hold, just inject this identity" recipe (pair
+        # with image_strength=0 to suppress the hold entirely).
+        if mode == "t2v" and video is not None:
+            raise ValueError("LTX-2.3 v2v: mode=t2v but video is connected - disconnect it "
+                             "or pick v2v.")
+        if mode == "t2v" and image is not None and not edit_anything:
+            raise ValueError("LTX-2.3 v2v: mode=t2v but image is connected - disconnect it, "
+                             "pick i2v, or set editanything_lora/editanything_module_path if "
+                             "image is meant as an EditAnything reference, not an i2v hold.")
+        if mode == "i2v" and image is None:
+            raise ValueError("LTX-2.3 v2v: mode=i2v needs image connected.")
+        if mode == "v2v" and video is None:
+            raise ValueError("LTX-2.3 v2v: mode=v2v needs video connected.")
+
         if ic_lora_attached:
             model = nodes.LoraLoaderModelOnly().load_lora_model_only(
                 model, ic_lora, ic_lora_strength)[0]
@@ -1163,11 +1178,12 @@ class LTXV23VidToVideo:
             model = nodes.LoraLoaderModelOnly().load_lora_model_only(
                 model, editanything_lora, editanything_lora_strength)[0]
         if edit_anything:
-            if reference_image is None:
+            if image is None:
                 raise ValueError("LTX-2.3 v2v: editanything_module_path is set but "
-                                 "reference_image isn't connected.")
+                                 "image isn't connected (image doubles as the EditAnything "
+                                 "reference photo here - no separate reference_image slot).")
             model = _apply_editanything_patch(
-                model, vae, reference_image, editanything_module_path, reference_mode)
+                model, vae, image, editanything_module_path, reference_mode)
 
         video_frames = video_audio = None
         if video is not None:

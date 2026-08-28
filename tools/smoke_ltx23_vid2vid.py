@@ -277,6 +277,37 @@ def test_mode_validates_required_socket_is_connected():
           "i2v/v2v demand their required socket, t2v rejects either being connected")
 
 
+def test_mode_t2v_allows_image_when_editanything_active():
+    # image is dual-purpose: an i2v hold under i2v/v2v, but ALSO the
+    # EditAnything reference photo when editanything_module_path is set -
+    # under mode=t2v specifically, image connected must be rejected UNLESS
+    # EditAnything is active, in which case it's legitimate (a pure
+    # "inject this identity, no first-frame hold" recipe).
+    node = ltx23.LTXV23VidToVideo()
+    vae = _FakeVideoVAE()
+    audio_vae = _FakeAudioVAE()
+    clip = _fake_clip()
+    image = torch.rand(1, 256, 448, 3)
+
+    orig_apply = ltx23._apply_editanything_patch
+    orig_loader = ltx23.nodes.LoraLoaderModelOnly
+    ltx23._apply_editanything_patch = lambda *a, **kw: "patched"
+    ltx23.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
+    try:
+        out_model, *_ = node.prepare(
+            None, clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
+            image=image, image_strength=0.0,
+            editanything_lora="standard.safetensors", editanything_module_path="module.safetensors")
+    finally:
+        ltx23._apply_editanything_patch = orig_apply
+        ltx23.nodes.LoraLoaderModelOnly = orig_loader
+
+    assert out_model == "patched"
+    print("[ok] LTXV23VidToVideo: mode=t2v + image connected is accepted when "
+          "editanything_module_path is set (image doubling as the EditAnything reference, "
+          "not an i2v hold) - still rejected under t2v without EditAnything active")
+
+
 def test_editanything_lora_and_module_path_must_be_set_together():
     node = ltx23.LTXV23VidToVideo()
     vae = _FakeVideoVAE()
@@ -303,9 +334,9 @@ def test_editanything_lora_and_module_path_must_be_set_together():
         node.prepare(None, clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
                      editanything_lora="standard.safetensors",
                      editanything_module_path="module.safetensors")
-        assert False, "expected ValueError for missing reference_image"
+        assert False, "expected ValueError for missing image (doubles as the reference photo)"
     except ValueError as e:
-        assert "reference_image" in str(e)
+        assert "image" in str(e)
     finally:
         ltx23.nodes.LoraLoaderModelOnly = orig_loader
     print("[ok] LTXV23VidToVideo: editanything_lora/editanything_module_path must both be "
@@ -319,7 +350,9 @@ def test_editanything_selectors_chain_lora_then_patch_helper():
     # proves LTXV23VidToVideo's selectors route into comfy-core's real
     # LoraLoaderModelOnly for the LoRA half, THEN the same shared
     # _apply_editanything_patch helper for the module half (not
-    # reimplementations), in the right order, with the right args.
+    # reimplementations), in the right order, with the right args - and
+    # that `image` (not a separate reference_image slot) is what's passed
+    # through as the reference photo.
     node = ltx23.LTXV23VidToVideo()
     vae = _FakeVideoVAE()
     audio_vae = _FakeAudioVAE()
@@ -340,9 +373,9 @@ def test_editanything_selectors_chain_lora_then_patch_helper():
     try:
         out_model, *_ = node.prepare(
             "base-model", clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
+            image=image, image_strength=0.0,
             editanything_lora="standard.safetensors", editanything_lora_strength=0.9,
-            editanything_module_path="module.safetensors", reference_image=image,
-            reference_mode="per_batch_item")
+            editanything_module_path="module.safetensors", reference_mode="per_batch_item")
     finally:
         ltx23._apply_editanything_patch = orig_apply
         ltx23.nodes.LoraLoaderModelOnly = orig_loader
@@ -369,6 +402,7 @@ if __name__ == "__main__":
     test_image_only_is_ordinary_i2v_hold_no_video_needed()
     test_image_and_ic_lora_combine_independently()
     test_mode_validates_required_socket_is_connected()
+    test_mode_t2v_allows_image_when_editanything_active()
     test_editanything_lora_and_module_path_must_be_set_together()
     test_editanything_selectors_chain_lora_then_patch_helper()
     print("[ok] all smoke_ltx23_vid2vid tests passed")

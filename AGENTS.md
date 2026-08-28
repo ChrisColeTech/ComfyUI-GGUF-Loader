@@ -3032,3 +3032,44 @@ rewritten with 7 tests covering the new `mode`/`ic_lora`/
 delegation order, mode validation, must-be-set-together error, chaining
 through to `_apply_editanything_patch`); 84/84 `pytest tests/`
 unaffected. `README.md`'s vid2vid section rewritten to match.
+
+## LTXV23VidToVideo: reference_image merged into image (2026-08-28)
+
+Same session, same root cause repeating: "this isnt correct. where do i
+plug in the batch images node. why is there a separarte reference image
+slot." I'd given `LTXV23VidToVideo` its OWN `reference_image` input for
+the EditAnything half, separate from the existing `image` input used for
+the ordinary i2v hold - meaning the same photo had to be wired into TWO
+sockets to use both mechanisms together. Checked the real precedent
+directly this time (not assumed): `Krea2Img2Img`'s docstring
+(`nodes/krea2.py:853-868`) - `identity_edit=True` "switches `images` to a
+completely different job" - REUSES the single `images` input for both
+img2img and the identity-edit source, never adds a second slot. Same
+mistake shape as the toggle-vs-node-shape correction earlier this
+session: verified the mechanism, didn't check the actual input-count
+precedent before shipping.
+
+Removed `reference_image` from `LTXV23VidToVideo` (kept on the standalone
+`LTXV23EditAnythingPatch` node, which has no other `image` input to reuse
+- correct there). `image` now doubles as the EditAnything reference
+whenever `editanything_module_path` is set, threaded straight into
+`_apply_editanything_patch` in place of the old separate parameter.
+Since the ordinary i2v-hold effect and the EditAnything reference use are
+independent (governed by `image_strength` vs `editanything_module_path`
+respectively), no behavior conflict: `image_strength=0` gives a pure
+"inject this identity, no first-frame lock" recipe using the exact same
+`image` socket. `mode=t2v`'s validation (previously a flat "image
+connected -> error") now permits `image` connected specifically when
+`edit_anything` is active - t2v + EditAnything-only (no i2v hold) is a
+real, intended combination that reusing the slot makes trivial instead
+of impossible.
+
+`tools/smoke_ltx23_vid2vid.py` updated: removed `reference_image=` from
+all EditAnything-selector test calls in favor of `image=`, added
+`test_mode_t2v_allows_image_when_editanything_active` covering the new
+t2v-with-EditAnything-image exception explicitly. 8/8 pass; 6/6
+`smoke_ltx23_editanything.py` and 84/84 `pytest tests/` unaffected (the
+standalone patch node/shared helper's own `reference_image` parameter
+name is untouched - only the vid2vid node's wiring changed).
+`README.md`'s EditAnything paragraph updated to describe the reused
+`image` input and the `image_strength=0` pure-reference recipe.
