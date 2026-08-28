@@ -188,7 +188,7 @@ def test_image_only_is_ordinary_i2v_hold_no_video_needed():
 
     out_model, positive, negative, latent, frame_rate = node.prepare(
         None, clip, vae, audio_vae, "i2v", "prompt", "", 448, 256, 121, 30.0, 1,
-        image=image, image_strength=0.7)
+        images=image, image_strength=0.7)
 
     assert out_model is None
     assert frame_rate == 30.0  # widget value used - no video connected to override it
@@ -220,7 +220,7 @@ def test_image_and_ic_lora_combine_independently():
     try:
         _, positive, negative, latent, _ = node.prepare(
             "base-model", clip, vae, audio_vae, "i2v", "prompt", "", 448, 256, 121, 24.0, 1,
-            image=image, image_strength=0.7, video=video, ic_lora="task.safetensors",
+            images=image, image_strength=0.7, video=video, ic_lora="task.safetensors",
             keep_original_audio=False)
     finally:
         ltx23.nodes.LoraLoaderModelOnly = orig_loader
@@ -262,7 +262,7 @@ def test_mode_validates_required_socket_is_connected():
 
     try:
         node.prepare(None, clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
-                     image=image)
+                     images=image)
         assert False, "expected ValueError for mode=t2v with image connected"
     except ValueError as e:
         assert "t2v" in str(e)
@@ -296,7 +296,7 @@ def test_mode_t2v_allows_image_when_editanything_active():
     try:
         out_model, *_ = node.prepare(
             None, clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
-            image=image, image_strength=0.0,
+            images=image, image_strength=0.0,
             editanything_lora="standard.safetensors", editanything_module_path="module.safetensors")
     finally:
         ltx23._apply_editanything_patch = orig_apply
@@ -373,7 +373,7 @@ def test_editanything_selectors_chain_lora_then_patch_helper():
     try:
         out_model, *_ = node.prepare(
             "base-model", clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
-            image=image, image_strength=0.0,
+            images=image, image_strength=0.0,
             editanything_lora="standard.safetensors", editanything_lora_strength=0.9,
             editanything_module_path="module.safetensors", reference_mode="per_batch_item")
     finally:

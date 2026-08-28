@@ -3073,3 +3073,38 @@ standalone patch node/shared helper's own `reference_image` parameter
 name is untouched - only the vid2vid node's wiring changed).
 `README.md`'s EditAnything paragraph updated to describe the reused
 `image` input and the `image_strength=0` pure-reference recipe.
+
+## LTXV23VidToVideo: image renamed to images (2026-08-28)
+
+Same session, immediate follow-up after the `reference_image` merge
+above: "it should say images since it accepts more than one." Checked
+the real precedent (Krea2Img2Img's own input really is named `images`,
+plural, confirmed directly this time rather than assumed) and renamed
+`LTXV23VidToVideo`'s `image` -> `images` throughout (`INPUT_TYPES` key,
+`prepare()` parameter, all docstring/tooltip references, the VAE-encode
+body, the log line). `LTXV23ImgToVideo` and the standalone
+`LTXV23EditAnythingPatch`/`_apply_editanything_patch` keep their own
+`image`/`reference_image` names unchanged - this rename is scoped to
+`LTXV23VidToVideo` only, since that's the node whose input now
+genuinely accepts a batch for two different purposes (i2v hold +
+EditAnything reference) and was the one actually raised.
+
+Also fixed, same pass: `LTX-2.3_V2V_Simple.json` (the real user
+workflow this whole EditAnything thread has been testing against) had
+gone stale across the LAST TWO redesigns - still had `ic_lora_attached`
+as a widget (removed from the code entirely), was missing the new
+required `mode` input altogether, and its instant-shave IC-LoRA was
+still loaded through a separate external `LoraLoaderModelOnly` node
+(node 5) that would now DOUBLE-APPLY the LoRA once `ic_lora` also loads
+it internally. Fixed by: renaming `image`->`images` and
+`ic_lora_attached`->`ic_lora` (repurposed in place - same widget slot,
+now holds the real lora filename instead of a bool) on the saved node,
+appending the six brand-new optional widgets, REMOVING node 5 entirely
+and rewiring node 7's `model` input to come directly from node 4 (the
+always-on distilled LoRA loader) instead, with `mode="v2v"` and
+`ic_lora` set to the real instant-shave filename/strength migrated
+from the removed node. Verified structurally consistent via the same
+link/slot-crosscheck script used for the earlier `model`-input fix.
+`tools/smoke_ltx23_vid2vid.py` call sites updated (`image=` ->
+`images=`); 8/8 pass; 6/6 `smoke_ltx23_editanything.py` and 84/84
+`pytest tests/` unaffected.

@@ -923,8 +923,8 @@ class LTXV23VidToVideo:
     model straight through, if nothing was selected).
 
     `mode` (required) declares which of the three base behaviors this call
-    is: `t2v` (image/video must be disconnected - pure text-to-video),
-    `i2v` (`image` required - ordinary first-frame hold, VAE-encoded and
+    is: `t2v` (images/video must be disconnected - pure text-to-video),
+    `i2v` (`images` required - ordinary first-frame hold, VAE-encoded and
     held at `image_strength` via the noise mask), or `v2v` (`video`
     required - IC-LoRA guide injection, see `ic_lora` below). `i2v`/`v2v`
     can still layer on top of each other exactly as before (image hold +
@@ -938,12 +938,12 @@ class LTXV23VidToVideo:
     tokens the model attends to at the SAME timeline position as what it's
     generating (comfy-core's keyframe_idxs RoPE mechanism,
     comfy_extras/nodes_lt.py's LTXVAddGuide) - a genuinely different thing
-    from `image`'s first-frame hold, and from Krea2Img2Img's partial-denoise
+    from `images`'s first-frame hold, and from Krea2Img2Img's partial-denoise
     img2img. `ic_lora="none"` (default): `video`, if connected, is only
     used for length/frame_rate/original audio, ignored for guidance. When
     `video` is connected, `length`/`frame_rate` are taken FROM it
     (overriding the widgets, logged); `width`/`height` always come from the
-    widgets regardless of source, same as `image`. `keep_original_audio`
+    widgets regardless of source, same as `images`. `keep_original_audio`
     (default on, only relevant with `video`) keeps the source clip's own
     audio unchanged in the output using this file's own already-proven
     `_encode_reference_audio`/`_fit_audio_latent` helpers - mechanically
@@ -962,16 +962,17 @@ class LTXV23VidToVideo:
     trained jointly) add LTX-2.3's EditAnything reference-conditioning
     patch to `model` in this same node - mirrors Krea2Img2Img's own
     `identity_edit` toggle (patch built into the main conditioning node,
-    reusing the SAME `images`-equivalent input for both purposes rather
-    than a second reference-photo slot - `identity_edit=True` switches
-    what `images` means there instead of adding a new input; this node
-    does the same with `image` instead of a separate `reference_image`),
-    except the LoRA half is now ALSO loaded here (same `LoraLoaderModelOnly`
-    delegation as `ic_lora` above, at `editanything_lora_strength`) instead
-    of requiring external wiring. Needs `image` connected too (the person/
-    subject to inject - the SAME photo drives both the ordinary i2v hold,
-    if `image_strength` > 0, AND the EditAnything reference; set
-    `image_strength=0` to use `image` for EditAnything only, with no
+    reusing the SAME `images` input for both purposes rather than a
+    second reference-photo slot - `identity_edit=True` switches what
+    `images` means there instead of adding a new input; this node does
+    the same), except the LoRA half is now ALSO loaded here (same
+    `LoraLoaderModelOnly` delegation as `ic_lora` above, at
+    `editanything_lora_strength`) instead of requiring external wiring.
+    Needs `images` connected too (the person/subject to inject - one or
+    more photos, see `reference_mode` below for what a batch means here;
+    the SAME photo(s) drive both the ordinary i2v hold, if
+    `image_strength` > 0, AND the EditAnything reference; set
+    `image_strength=0` to use `images` for EditAnything only, with no
     first-frame hold effect) - see `_apply_editanything_patch`'s docstring
     for the full mechanism and what `reference_mode` controls. The
     returned `model` is the patched clone (or the original, unpatched, if
@@ -1023,10 +1024,10 @@ class LTXV23VidToVideo:
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
                 "mode": (["t2v", "i2v", "v2v"], {"default": "t2v",
-                          "tooltip": "Which base behavior this call is. t2v: image/video "
-                                     "must be disconnected. i2v: image required (video may "
+                          "tooltip": "Which base behavior this call is. t2v: images/video "
+                                     "must be disconnected. i2v: images required (video may "
                                      "still layer on top as an IC-LoRA guide). v2v: video "
-                                     "required (image may still layer on top as a first-"
+                                     "required (images may still layer on top as a first-"
                                      "frame hold)."}),
                 "vae": ("VAE", {"tooltip": "The loader's video_vae output."}),
                 "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
@@ -1053,16 +1054,16 @@ class LTXV23VidToVideo:
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
             },
             "optional": {
-                "image": ("IMAGE", {"tooltip": "First frame for image-to-video (ordinary "
+                "images": ("IMAGE", {"tooltip": "First frame(s) for image-to-video (ordinary "
                                     "i2v hold, independent of video/ic_lora below) - "
                                     "resized and CENTER-CROPPED to width x height. Also the "
-                                    "EditAnything reference photo when "
+                                    "EditAnything reference photo(s) when "
                                     "editanything_module_path is set (see reference_mode for "
                                     "how a batch is used there) - set image_strength=0 for a "
                                     "pure EditAnything reference with no i2v-hold effect."}),
                 "image_strength": ("FLOAT", {
                     "default": I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "image only. How much of the init image to keep. 0.7 is "
+                    "tooltip": "images only. How much of the init image(s) to keep. 0.7 is "
                                "the official value; 1.0 locks the first frames hard."}),
                 "video": ("VIDEO", {"tooltip": "Source clip for IC-LoRA video-to-video "
                                     "(see ic_lora) and/or its original audio (see "
@@ -1118,16 +1119,16 @@ class LTXV23VidToVideo:
                     "tooltip": "The EditAnything .module.safetensors file (NOT a LoRA - real "
                                "extra layers, loaded by this pack's own patch mechanism), "
                                "from the loras folder. \"none\" = off. Needs "
-                               "editanything_lora and `image` connected too."}),
+                               "editanything_lora and `images` connected too."}),
                 "reference_mode": (["per_batch_item", "first_frame_only"], {
                     "default": "first_frame_only",
-                    "tooltip": "Needs editanything_module_path set. Controls how `image`'s "
+                    "tooltip": "Needs editanything_module_path set. Controls how `images`'s "
                                "batch is used as the EditAnything reference (independent of "
                                "its ordinary i2v-hold use). per_batch_item: each image in "
                                "the batch is encoded and used as its OWN distinct reference "
                                "(not blended) - image i drives sample i of the sampling "
                                "batch, tiled/truncated if the counts don't match. "
-                               "first_frame_only (default here): use only image[0], ignore "
+                               "first_frame_only (default here): use only images[0], ignore "
                                "the rest - the vid2vid recipe (one clean reference identity "
                                "against a single video)."}),
             },
@@ -1135,7 +1136,7 @@ class LTXV23VidToVideo:
 
     @torch.inference_mode()
     def prepare(self, model, clip, vae, audio_vae, mode, prompt, negative_prompt, width, height,
-                length, frame_rate, batch_size, image=None, image_strength=I2V_STRENGTH,
+                length, frame_rate, batch_size, images=None, image_strength=I2V_STRENGTH,
                 video=None, ic_lora="none", ic_lora_strength=1.0, guide_strength=1.0,
                 keep_original_audio=True, latent_downscale_factor=1.0, reference_audio=None,
                 length_from_audio=True, editanything_lora="none", editanything_lora_strength=1.0,
@@ -1153,21 +1154,22 @@ class LTXV23VidToVideo:
                              "be set together (both \"none\" or both a real file) - either "
                              "alone does nothing, they're trained jointly.")
 
-        # image is dual-purpose: ordinary i2v hold AND (when edit_anything is
-        # on) the EditAnything reference photo - mode=t2v only forbids it
-        # when it would otherwise ONLY be doing the (unwanted, in t2v) i2v
-        # hold job; with edit_anything on, image connected under t2v is the
-        # "no first-frame hold, just inject this identity" recipe (pair
-        # with image_strength=0 to suppress the hold entirely).
+        # images is dual-purpose: ordinary i2v hold AND (when edit_anything
+        # is on) the EditAnything reference photo(s) - mode=t2v only
+        # forbids it when it would otherwise ONLY be doing the (unwanted,
+        # in t2v) i2v hold job; with edit_anything on, images connected
+        # under t2v is the "no first-frame hold, just inject this
+        # identity" recipe (pair with image_strength=0 to suppress the
+        # hold entirely).
         if mode == "t2v" and video is not None:
             raise ValueError("LTX-2.3 v2v: mode=t2v but video is connected - disconnect it "
                              "or pick v2v.")
-        if mode == "t2v" and image is not None and not edit_anything:
-            raise ValueError("LTX-2.3 v2v: mode=t2v but image is connected - disconnect it, "
+        if mode == "t2v" and images is not None and not edit_anything:
+            raise ValueError("LTX-2.3 v2v: mode=t2v but images is connected - disconnect it, "
                              "pick i2v, or set editanything_lora/editanything_module_path if "
-                             "image is meant as an EditAnything reference, not an i2v hold.")
-        if mode == "i2v" and image is None:
-            raise ValueError("LTX-2.3 v2v: mode=i2v needs image connected.")
+                             "images is meant as an EditAnything reference, not an i2v hold.")
+        if mode == "i2v" and images is None:
+            raise ValueError("LTX-2.3 v2v: mode=i2v needs images connected.")
         if mode == "v2v" and video is None:
             raise ValueError("LTX-2.3 v2v: mode=v2v needs video connected.")
 
@@ -1178,12 +1180,12 @@ class LTXV23VidToVideo:
             model = nodes.LoraLoaderModelOnly().load_lora_model_only(
                 model, editanything_lora, editanything_lora_strength)[0]
         if edit_anything:
-            if image is None:
+            if images is None:
                 raise ValueError("LTX-2.3 v2v: editanything_module_path is set but "
-                                 "image isn't connected (image doubles as the EditAnything "
-                                 "reference photo here - no separate reference_image slot).")
+                                 "images isn't connected (images doubles as the EditAnything "
+                                 "reference photo(s) here - no separate reference_image slot).")
             model = _apply_editanything_patch(
-                model, vae, image, editanything_module_path, reference_mode)
+                model, vae, images, editanything_module_path, reference_mode)
 
         video_frames = video_audio = None
         if video is not None:
@@ -1212,9 +1214,9 @@ class LTXV23VidToVideo:
              height // VIDEO_SPATIAL_RATIO, width // VIDEO_SPATIAL_RATIO], device=device)
         video_mask = torch.ones((batch_size, 1, t_latent, 1, 1),
                                 dtype=torch.float32, device=device)
-        if image is not None:
+        if images is not None:
             pixels = comfy.utils.common_upscale(
-                image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+                images.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             t = _match_batch(vae.encode(pixels[:, :, :, :3]), batch_size)
             video_samples[:, :, :t.shape[2]] = t.to(video_samples.device, video_samples.dtype)
             video_mask[:, :, :t.shape[2]] = 1.0 - image_strength
@@ -1287,7 +1289,7 @@ class LTXV23VidToVideo:
         logger.info("LTX-2.3 v2v prep: video %s mask %s, audio %s mask %s%s%s",
                     tuple(video_samples.shape), tuple(video_mask.shape),
                     tuple(audio_latent.shape), tuple(audio_mask.shape),
-                    ", image held @ %.2f" % image_strength if image is not None else "",
+                    ", image held @ %.2f" % image_strength if images is not None else "",
                     ", audio held" if (video is not None and keep_original_audio and video_audio is not None)
                     or (video is None and reference_audio is not None) else "")
         return (model, positive, negative, latent, frame_rate)
