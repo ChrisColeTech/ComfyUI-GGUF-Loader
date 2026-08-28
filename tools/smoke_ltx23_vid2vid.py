@@ -96,7 +96,7 @@ def _target_t(n_frames):
     return ((ltx23._align_length(n_frames) - 1) // 8) + 1
 
 
-def test_video_guide_appends_and_crops_cleanly():
+def test_ic_lora_attached_appends_and_crops_cleanly():
     node = ltx23.LTXV23VidToVideo()
     video = _FakeVideo()
     vae = _FakeVideoVAE()
@@ -105,7 +105,7 @@ def test_video_guide_appends_and_crops_cleanly():
 
     positive, negative, latent, frame_rate = node.prepare(
         clip, vae, audio_vae, "prompt", "", 448, 256, 121, 24.0, 1,
-        video=video, video_guide=True, hold_audio=False)
+        video=video, ic_lora_attached=True, hold_audio=False)
 
     assert frame_rate == 24.0  # taken from the (fake) video, overriding the 24.0 widget too
     samples = latent["samples"]
@@ -128,12 +128,12 @@ def test_video_guide_appends_and_crops_cleanly():
 
     _, num_keyframes_after = nodes_lt.get_keyframe_idxs(cpos, cropped_video.shape)
     assert num_keyframes_after == 0
-    print("[ok] LTXV23VidToVideo: video_guide=True appends real IC-LoRA guide frames "
+    print("[ok] LTXV23VidToVideo: ic_lora_attached=True appends real IC-LoRA guide frames "
           "(real comfy_extras.nodes_lt.LTXVAddGuide) and takes length/frame_rate from "
           "the clip; LTXV23CropVideoGuide removes exactly them back off")
 
 
-def test_video_without_guide_is_plain_shape():
+def test_video_without_ic_lora_attached_is_plain_shape():
     node = ltx23.LTXV23VidToVideo()
     video = _FakeVideo()
     vae = _FakeVideoVAE()
@@ -142,7 +142,7 @@ def test_video_without_guide_is_plain_shape():
 
     positive, negative, latent, _ = node.prepare(
         clip, vae, audio_vae, "prompt", "", 448, 256, 121, 24.0, 1,
-        video=video, video_guide=False, hold_audio=False)
+        video=video, ic_lora_attached=False, hold_audio=False)
 
     samples = latent["samples"]
     video_latent, _ = samples.unbind()
@@ -151,8 +151,8 @@ def test_video_without_guide_is_plain_shape():
     crop_node = ltx23.LTXV23CropVideoGuide()
     _, _, cropped = crop_node.crop(positive, negative, latent)
     assert cropped is latent  # no-op passthrough, nothing to crop
-    print("[ok] LTXV23VidToVideo: video_guide=False -> plain shape (video only used for "
-          "length/frame_rate), LTXV23CropVideoGuide is a no-op passthrough")
+    print("[ok] LTXV23VidToVideo: ic_lora_attached=False -> plain shape (video only used "
+          "for length/frame_rate), LTXV23CropVideoGuide is a no-op passthrough")
 
 
 def test_image_only_is_ordinary_i2v_hold_no_video_needed():
@@ -177,12 +177,12 @@ def test_image_only_is_ordinary_i2v_hold_no_video_needed():
 
     crop_node = ltx23.LTXV23CropVideoGuide()
     _, _, cropped = crop_node.crop(positive, negative, latent)
-    assert cropped is latent  # no video_guide ever ran -> nothing to crop
+    assert cropped is latent  # no ic_lora_attached path ever ran -> nothing to crop
     print("[ok] LTXV23VidToVideo: image only (no video connected) -> ordinary i2v "
           "first-frame hold, width/height/length/frame_rate all from the widgets")
 
 
-def test_image_and_video_guide_combine_independently():
+def test_image_and_ic_lora_attached_combine_independently():
     node = ltx23.LTXV23VidToVideo()
     video = _FakeVideo()
     vae = _FakeVideoVAE()
@@ -192,7 +192,7 @@ def test_image_and_video_guide_combine_independently():
 
     positive, negative, latent, _ = node.prepare(
         clip, vae, audio_vae, "prompt", "", 448, 256, 121, 24.0, 1,
-        image=image, image_strength=0.7, video=video, video_guide=True, hold_audio=False)
+        image=image, image_strength=0.7, video=video, ic_lora_attached=True, hold_audio=False)
 
     samples = latent["samples"]
     video_latent, _ = samples.unbind()
@@ -209,8 +209,8 @@ def test_image_and_video_guide_combine_independently():
 
 
 if __name__ == "__main__":
-    test_video_guide_appends_and_crops_cleanly()
-    test_video_without_guide_is_plain_shape()
+    test_ic_lora_attached_appends_and_crops_cleanly()
+    test_video_without_ic_lora_attached_is_plain_shape()
     test_image_only_is_ordinary_i2v_hold_no_video_needed()
-    test_image_and_video_guide_combine_independently()
+    test_image_and_ic_lora_attached_combine_independently()
     print("[ok] all smoke_ltx23_vid2vid tests passed")

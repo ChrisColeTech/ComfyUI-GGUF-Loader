@@ -518,10 +518,11 @@ class LTXV23VidToVideo:
       timeline position as what it's generating (comfy-core's keyframe_idxs
       RoPE mechanism, comfy_extras/nodes_lt.py's LTXVAddGuide) - a
       genuinely different thing from `image`'s first-frame hold, and from
-      Krea2Img2Img's partial-denoise img2img. `video_guide=True` (default)
-      is what actually applies this; without a matching IC-LoRA loaded on
-      `model` (stock LoraLoaderModelOnly, loaded separately - this node
-      never touches `model`), the extra reference is inert, same as
+      Krea2Img2Img's partial-denoise img2img. `ic_lora_attached=True`
+      (default) is what actually applies this - it declares "an IC-LoRA is
+      loaded on model, drive it"; without a matching IC-LoRA actually
+      loaded there (stock LoraLoaderModelOnly, loaded separately - this
+      node never touches `model`), the extra reference is inert, same as
       Krea2Img2Img's `identity_edit` toggle needing its LoRA loaded
       separately too. When `video` is connected, `length`/`frame_rate` are
       taken FROM it (overriding the widgets, logged) - the output is meant
@@ -554,8 +555,8 @@ class LTXV23VidToVideo:
     Feed the outputs into LTXV23KSampler UNCHANGED - it already samples any
     joint AV latent + noise mask generically, so no custom sampler is
     needed here. Then LTXV23CropVideoGuide before LTXV23AVDecode to strip
-    the reference frames back out (a no-op if `video`/`video_guide` were
-    never used).
+    the reference frames back out (a no-op if `video`/`ic_lora_attached`
+    were never used).
     """
 
     CATEGORY = LTX23_CATEGORY
@@ -580,8 +581,8 @@ class LTXV23VidToVideo:
                 "vae": ("VAE", {"tooltip": "The loader's video_vae output."}),
                 "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True,
-                                      "tooltip": "With video_guide: describe the OUTPUT you "
-                                                 "want - most IC-LoRAs are trained on an "
+                                      "tooltip": "With ic_lora_attached: describe the OUTPUT "
+                                                 "you want - most IC-LoRAs are trained on an "
                                                  "instruction-style caption describing the "
                                                  "transformed result. Otherwise: describe the "
                                                  "scene and its motion, a caption not an "
@@ -603,32 +604,36 @@ class LTXV23VidToVideo:
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "First frame for image-to-video (ordinary "
-                                    "i2v hold, independent of video/video_guide below). "
+                                    "i2v hold, independent of video/ic_lora_attached below). "
                                     "Resized and CENTER-CROPPED to width x height."}),
                 "image_strength": ("FLOAT", {
                     "default": I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "image only. How much of the init image to keep. 0.7 is "
                                "the official value; 1.0 locks the first frames hard."}),
                 "video": ("VIDEO", {"tooltip": "Source clip for IC-LoRA video-to-video "
-                                    "(see video_guide) and/or held audio (see "
+                                    "(see ic_lora_attached) and/or held audio (see "
                                     "hold_audio). Sets length/frame_rate from itself."}),
-                "video_guide": ("BOOLEAN", {"default": True,
-                                "tooltip": "video only. Inject the source video as an "
-                                           "IC-LoRA reference (the actual vid2vid mechanism "
-                                           "- needs a matching IC-LoRA loaded on model). Off "
-                                           "= video is used only for length/frame_rate/held "
-                                           "audio, ignored for guidance - useful for A/B-ing "
-                                           "whether the IC-LoRA is doing anything."}),
+                "ic_lora_attached": ("BOOLEAN", {"default": True,
+                                "tooltip": "video only. Tell this node an IC-LoRA is loaded "
+                                           "on model, so it should inject the source video "
+                                           "as that LoRA's reference (the actual vid2vid "
+                                           "mechanism) - the LoRA itself is loaded separately "
+                                           "upstream (stock LoraLoaderModelOnly), this only "
+                                           "declares it's there. Off = video is used only for "
+                                           "length/frame_rate/held audio, ignored for guidance "
+                                           "- useful for A/B-ing whether the IC-LoRA is doing "
+                                           "anything."}),
                 "guide_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                                   "tooltip": "video_guide only. How strongly the reference "
-                                              "is held. 1.0 = fully held (official default)."}),
+                                   "tooltip": "ic_lora_attached only. How strongly the "
+                                              "reference is held. 1.0 = fully held (official "
+                                              "default)."}),
                 "hold_audio": ("BOOLEAN", {"default": True,
                                "tooltip": "video only. Freeze the source clip's own audio "
                                           "into the output. Off = silent/synthesized audio."}),
                 "latent_downscale_factor": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0,
                                             "step": 1.0,
-                                            "tooltip": "video_guide only. Only for IC-LoRAs "
-                                                       "trained on a downscaled reference "
+                                            "tooltip": "ic_lora_attached only. Only for "
+                                                       "IC-LoRAs trained on a downscaled reference "
                                                        "grid (rare - check the LoRA's model "
                                                        "card / reference_downscale_factor "
                                                        "metadata; most, including every "
@@ -646,7 +651,7 @@ class LTXV23VidToVideo:
     @torch.inference_mode()
     def prepare(self, clip, vae, audio_vae, prompt, negative_prompt, width, height,
                 length, frame_rate, batch_size, image=None, image_strength=I2V_STRENGTH,
-                video=None, video_guide=True, guide_strength=1.0, hold_audio=True,
+                video=None, ic_lora_attached=True, guide_strength=1.0, hold_audio=True,
                 latent_downscale_factor=1.0, reference_audio=None, length_from_audio=True):
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
@@ -692,7 +697,7 @@ class LTXV23VidToVideo:
         positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
         negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
-        if video is not None and video_guide:
+        if video is not None and ic_lora_attached:
             import comfy_extras.nodes_lt as nodes_lt
 
             scale_factors = vae.downscale_index_formula
@@ -725,7 +730,7 @@ class LTXV23VidToVideo:
             logger.info("LTX-2.3 v2v: guide %s appended @ strength %.2f (frame_idx=%d)",
                         tuple(guide_latent.shape), guide_strength, frame_idx)
         elif video is not None:
-            logger.info("LTX-2.3 v2v: video_guide=False - video used for length/frame_rate/"
+            logger.info("LTX-2.3 v2v: ic_lora_attached=False - video used for length/frame_rate/"
                         "held audio only, ignored for guidance")
 
         n_latents = int(fsm.num_of_latents_from_frames(length, frame_rate))
@@ -933,8 +938,8 @@ class LTXV23CropVideoGuide:
     streams get split before the crop and rejoined after (same reason
     _upsample_video_latent above has to do this for the refine sampler's
     upscale model). A no-op (returns the latent unchanged) when no guide was
-    ever appended (video_guide=False upstream, or nothing to crop) - matches
-    core's own early-return behavior.
+    ever appended (ic_lora_attached=False upstream, or nothing to crop) -
+    matches core's own early-return behavior.
     """
 
     CATEGORY = LTX23_CATEGORY

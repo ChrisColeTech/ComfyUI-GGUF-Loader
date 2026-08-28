@@ -2774,3 +2774,35 @@ built alongside the first version of this node) updated to the new
 signature - explicit `width`/`height`/`length`/`frame_rate`/`batch_size`
 widgets replacing the removed `short_side` one - and re-verified
 structurally consistent.
+
+## LTXV23VidToVideo: `video_guide` renamed to `ic_lora_attached` (2026-08-28)
+
+User asked "where is the switch to turn lora mode on/off" and, when the
+answer was "that's `video_guide`, same shape as Krea2Img2Img's
+`identity_edit`", pushed back: "why isn't this a lora toggle like I
+said." Traced it back to what `identity_edit` actually does (never a
+load/unload switch - it's always been a *mechanism* toggle, LoRA loaded
+externally via `LoraLoaderModelOnly` either way) and confirmed
+`video_guide` already matched that precedent exactly, mechanism for
+mechanism. So the underlying behavior was already correct; the actual
+gap, confirmed with the user, was narrower: `video_guide` doesn't read as
+"tell this node you have an IC-LoRA attached" on the node's face - the
+declaration the user expected to see wasn't there, even though the
+behavior it would have controlled already was.
+
+Renamed the widget/parameter from `video_guide` to `ic_lora_attached`
+throughout `nodes/ltx23.py` (`INPUT_TYPES`, `prepare()`'s parameter and
+both branches that read it, the class docstring, `guide_strength`'s
+tooltip) - same boolean, same default (`True`), same behavior, only the
+name changed, now framed as a declaration ("tell this node an IC-LoRA is
+loaded on `model`") rather than a description of what it does internally.
+`tools/smoke_ltx23_vid2vid.py`'s call sites and two of its four test
+names updated to match (`test_ic_lora_attached_appends_and_crops_cleanly`,
+`test_video_without_ic_lora_attached_is_plain_shape`,
+`test_image_and_ic_lora_attached_combine_independently`). 4/4 pass; 84/84
+full suite unaffected (pure rename, no logic touched).
+`LTX-2.3_V2V_Simple.json`'s saved `LTXV23VidToVideo` node instance had its
+`video_guide` input/widget entry renamed in place (small Python script,
+not by hand) so the saved value still resolves against the renamed
+`INPUT_TYPES` key - re-verified structurally consistent afterward.
+`README.md`'s "LTX-2.3 Video to Video (IC-LoRA)" section updated to match.
