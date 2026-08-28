@@ -651,9 +651,15 @@ def _apply_editanything_patch(model, vae, reference_image, module_path, referenc
 
     def wrapper(executor, x, timesteps, context, attention_mask, frame_rate=25,
                 transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
+        # x is a plain list [video_x, audio_x] for this joint AV model, not
+        # a single tensor - confirmed via a real traceback ("'list' object
+        # has no attribute 'shape'") and comfy's own real code doing the
+        # exact same isinstance(x, list) check for the same reason
+        # (comfy/ldm/lightricks/model.py:993-995, batch_size = x[0].shape[0]).
+        batch_size = x[0].shape[0] if isinstance(x, list) else x.shape[0]
         transformer_options = dict(transformer_options)
-        transformer_options["editanything_ref_context"] = _match_batch(ref_context, x.shape[0])
-        dm._editanything_ref_adaln = _match_batch(ref_adaln, x.shape[0])
+        transformer_options["editanything_ref_context"] = _match_batch(ref_context, batch_size)
+        dm._editanything_ref_adaln = _match_batch(ref_adaln, batch_size)
         return executor(x, timesteps, context, attention_mask, frame_rate,
                         transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
 

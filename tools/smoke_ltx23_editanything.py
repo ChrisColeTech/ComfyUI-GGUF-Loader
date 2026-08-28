@@ -460,6 +460,39 @@ def test_patch_first_frame_only_mode_uses_only_first_image():
           "of 3 images is ever encoded")
 
 
+def test_wrapper_handles_x_as_list_for_joint_av_model():
+    # Real bug caught via a live GPU traceback: "'list' object has no
+    # attribute 'shape'". comfy's real joint AV model passes x as a plain
+    # [video_x, audio_x] list at this exact wrapper hook point, not a
+    # single tensor - confirmed directly in comfy's own source
+    # (comfy/ldm/lightricks/model.py:993-995 does the identical
+    # isinstance(x, list) check for the same reason). The wrapper must
+    # match that convention, not assume x always has a bare .shape.
+    model = _make_installed_fake_model()
+    vae = _FakeVAE()
+    node = ltx23.LTXV23EditAnythingPatch()
+
+    ref_images = torch.stack([torch.full((8, 8, 3), 0.3)])
+    patched, = _patch_with_preinstalled_model(node, model, vae, ref_images, "first_frame_only")
+    wrapper = patched._wrappers["editanything_ref"]
+
+    seen_contexts = []
+
+    def spy_executor(x, timesteps, context, attention_mask, frame_rate=25,
+                     transformer_options=None, keyframe_idxs=None, denoise_mask=None, **kw):
+        seen_contexts.append(transformer_options["editanything_ref_context"])
+        return x
+
+    video_x = torch.randn(2, 5, DIM)
+    audio_x = torch.randn(2, 3, DIM)
+    x_list = [video_x, audio_x]
+    result = wrapper(spy_executor, x_list, None, None, None)
+    assert result is x_list, "wrapper must pass x (the list) straight through to executor unchanged"
+    assert seen_contexts[0].shape[0] == 2, "batch size must come from x[0] (video), not len(x)"
+    print("[ok] LTXV23EditAnythingPatch: wrapper correctly reads batch size from x[0] when "
+          "x is a joint-AV [video_x, audio_x] list instead of a single tensor")
+
+
 if __name__ == "__main__":
     test_patched_forward_matches_original_when_no_reference()
     test_patched_forward_applies_residual_only_in_range_and_when_present()
@@ -467,4 +500,5 @@ if __name__ == "__main__":
     test_install_editanything_module_end_to_end()
     test_patch_per_batch_item_mode_gives_each_image_its_own_reference()
     test_patch_first_frame_only_mode_uses_only_first_image()
+    test_wrapper_handles_x_as_list_for_joint_av_model()
     print("[ok] all smoke_ltx23_editanything tests passed")

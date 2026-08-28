@@ -3245,3 +3245,42 @@ next real run's actual evidence before touching it. 6/6
 `smoke_ltx23_editanything.py` and 84/84 `pytest tests/` unaffected -
 this whole class of bug is invisible to CPU-only tests, same
 limitation as the device-placement fix above.
+
+## EditAnything wrapper x-as-list bug (fourth real GPU run, first real sampling) (2026-08-28)
+
+Fourth real GPU run got past BOTH prior fixes and reached actual
+sampling for the first time (`comfy.sample.sample` -> deep into
+`res_multistep` -> `LTXBaseModel.forward`'s `WrappersMP.DIFFUSION_MODEL`
+wrapper chain) before hitting `AttributeError: 'list' object has no
+attribute 'shape'` inside `_apply_editanything_patch`'s own `wrapper`
+function, at `x.shape[0]`.
+
+Root cause: `x` is a plain Python `list` (`[video_x, audio_x]`) at this
+exact hook point for this joint AV model, not a single tensor - despite
+`av_model.py`'s own docstring saying "x: Combined audio-video input
+tensor" (imprecise/outdated). Confirmed directly, not guessed: comfy's
+own real code handles this exact case identically two call-frames up
+(`comfy/ldm/lightricks/model.py:993-995`, `if isinstance(x, list):
+batch_size = x[0].shape[0]`) - the wrapper needed the same check, since
+it intercepts `x` before comfy's own list-handling code ever sees it.
+
+Fixed: `batch_size = x[0].shape[0] if isinstance(x, list) else
+x.shape[0]`, used in place of the old bare `x.shape[0]` for both
+`_match_batch` calls (`ref_context` and `ref_adaln`). Added
+`test_wrapper_handles_x_as_list_for_joint_av_model` to
+`tools/smoke_ltx23_editanything.py` - calls the wrapper directly with a
+`[video_x, audio_x]` list (2 batch items) and confirms the resulting
+`ref_context`'s batch dim reads from `x[0]`, not `len(x)` (which would
+have silently been 2 either way here by coincidence - the test's real
+value is exercising the `isinstance` branch at all, not this specific
+number). 7/7 `smoke_ltx23_editanything.py`, 8/8 `smoke_ltx23_vid2vid.py`,
+84/84 `pytest tests/` all pass.
+
+Three real GPU-only bugs found and fixed in a row this session (device
+placement, dtype promotion, x-as-list) - each one only surfaced by
+actually running the code, past whatever the prior fix got past. Still
+unverified past this point; the next failure, if any, is inside real
+sampling now rather than node-prep, so likely somewhere in
+`_patched_block_forward`'s per-block ref_attn residual path or the
+`_prepare_timestep` wrapper's `ref_adaln` addition - both finally about
+to run for real for the first time.
