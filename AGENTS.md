@@ -3284,3 +3284,58 @@ sampling now rather than node-prep, so likely somewhere in
 `_patched_block_forward`'s per-block ref_attn residual path or the
 `_prepare_timestep` wrapper's `ref_adaln` addition - both finally about
 to run for real for the first time.
+
+## EditAnything _prepare_timestep bug: joint AV list + CompressedTimestep wrapper (fifth real GPU run) (2026-08-28)
+
+Predicted correctly last entry - fifth real GPU run got past the x-as-list
+wrapper fix and crashed one call deeper, same error shape:
+`AttributeError: 'list' object has no attribute 'device'`, this time
+inside `_prepare_timestep_with_ref_adaln` at `timestep.device`.
+
+Root cause, confirmed via direct read of `av_model.py:738-847` (comfy's
+real joint AV model's own `_prepare_timestep` override, not the base
+`LTXBaseModel` version read earlier): it returns `timestep` as a 5-element
+list - `[v_timestep, a_timestep, cross_av_timestep_ss, v_prompt_timestep,
+a_prompt_timestep]` - not a tensor. Worse, `v_timestep` itself (the only
+element EditAnything's `ref_adaln` should ever touch, since it's a purely
+visual signal) is ALSO not a plain tensor - it's wrapped in
+`CompressedTimestep` (`av_model.py:23-83`, `__slots__`-based, storing the
+real tensor in `.data`, sometimes frame-compressed rather than per-token
+to save memory). Two nested wrapper layers, both undocumented in the
+function signatures/type hints, both only discoverable by reading the
+real source directly.
+
+Fixed `_prepare_timestep_with_ref_adaln`: added `_add_ref_adaln()`
+handling both shapes - `isinstance(timestep, list)` routes to
+`timestep[0]` (video) only, leaving `a_timestep`/`cross_av_timestep_ss`/
+`v_prompt_timestep`/`a_prompt_timestep` completely untouched; within
+that, `torch.is_tensor(v_timestep)` distinguishes a plain tensor (base
+model) from a `CompressedTimestep`-shaped object (duck-typed via
+`hasattr(v, "data")`, not an isinstance check against comfy's real
+class - keeps this port decoupled from that exact class name/location,
+same discipline as elsewhere in this file). Since `ref_adaln` is a
+single global-per-batch-item vector with no per-frame/per-token
+variation, adding it to the COMPRESSED `.data` (before expansion) is
+mathematically identical to adding it after expansion - no need to call
+`.expand()` first.
+
+Added `test_prepare_timestep_handles_av_list_and_compressed_timestep` to
+`tools/smoke_ltx23_editanything.py` - a fake diffusion model whose
+`_prepare_timestep` returns the exact real 5-element list shape with a
+`_FakeCompressedTimestep` stand-in (deliberately NOT importing comfy's
+real class, to exercise the same duck-typed branch the actual fix uses),
+verifying: the wrapped type survives (not silently unwrapped to a plain
+tensor), `ref_adaln` demonstrably changes `v_timestep.data` vs. an
+unpatched baseline, and every other list element (audio, cross-av,
+both prompt timesteps) is bit-identical to that same baseline. 8/8
+`smoke_ltx23_editanything.py`, 8/8 `smoke_ltx23_vid2vid.py`, 84/84
+`pytest tests/` all pass.
+
+Four real GPU-only bugs found and fixed in a row now (device placement,
+dtype promotion, x-as-list, timestep-as-list/CompressedTimestep) - every
+one of them only discoverable by reading comfy's actual joint-AV-model
+source directly per-failure, never guessable from the base
+(non-AV) `LTXBaseModel` code alone, and every one invisible to CPU-only
+tests by construction. Still unverified past this point - the next
+failure, if any, is now inside the actual per-block ref_attn residual
+add or the block's own attention math, genuinely new territory.

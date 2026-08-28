@@ -317,6 +317,101 @@ def test_install_editanything_module_end_to_end():
           "in-range blocks), _prepare_timestep wrapped correctly")
 
 
+class _FakeCompressedTimestep:
+    """Stands in for comfy's real av_model.CompressedTimestep - same shape
+    that matters here (a `.data` tensor, not a tensor itself), without
+    importing comfy's actual internal class (keeps this test decoupled,
+    and exercises the exact duck-typed `hasattr(v, "data") and not
+    torch.is_tensor(v)` branch _add_ref_adaln actually uses)."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+def test_prepare_timestep_handles_av_list_and_compressed_timestep():
+    # Real bug caught via a live GPU traceback: 'list' object has no
+    # attribute 'device', inside _prepare_timestep_with_ref_adaln. comfy's
+    # real joint AV model's own _prepare_timestep returns timestep as
+    # [v_timestep, a_timestep, cross_av_timestep_ss, v_prompt_timestep,
+    # a_prompt_timestep] - a 5-element list, not a tensor - and v_timestep
+    # itself is a CompressedTimestep wrapper, not a tensor either
+    # (confirmed via direct read of av_model.py:738-847). ref_adaln must
+    # land on v_timestep specifically (a purely visual signal - audio and
+    # the other list elements must stay untouched).
+    channels, hidden, rank = 16, DIM, 8
+
+    class _FakeDiffusionModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = torch.nn.ModuleList([_make_block(i) for i in range(36)])
+
+        def _prepare_timestep(self, timestep, batch_size, hidden_dtype, **kwargs):
+            v_timestep = _FakeCompressedTimestep(_fake_timestep(batch_size))
+            a_timestep = _fake_timestep(batch_size)
+            return [v_timestep, a_timestep, [], "v_prompt_ts", "a_prompt_ts"], None, None
+
+    class _FakeModelPatcher:
+        def __init__(self):
+            self.model = types.SimpleNamespace(
+                diffusion_model=_FakeDiffusionModel(), process_latent_in=lambda x: x)
+
+    sd = {}
+    sd["ref_visual_proj.fc1.weight"] = torch.randn(32, 3 * channels)
+    sd["ref_visual_proj.fc1.bias"] = torch.randn(32)
+    sd["ref_visual_proj.proj.weight"] = torch.randn(hidden, 32)
+    sd["ref_visual_proj.proj.bias"] = torch.randn(hidden)
+    sd["ref_visual_proj.norm.weight"] = torch.randn(hidden)
+    sd["ref_visual_proj.norm.bias"] = torch.randn(hidden)
+    sd["ref_visual_proj.pos_embed"] = torch.randn(1, 32, hidden)
+    sd["ref_adaln_proj.fc1.weight"] = torch.randn(32, 6 * channels)
+    sd["ref_adaln_proj.fc1.bias"] = torch.randn(32)
+    sd["ref_adaln_proj.proj.weight"] = torch.randn(6 * hidden, 32)
+    sd["ref_adaln_proj.proj.bias"] = torch.randn(6 * hidden)
+    for name in ("to_q", "to_k", "to_v", "to_out.0"):
+        sd[f"diffusion_model.transformer_blocks.12.ref_attn.{name}.lora_A.weight"] = torch.randn(rank, hidden)
+        sd[f"diffusion_model.transformer_blocks.12.ref_attn.{name}.lora_B.weight"] = torch.randn(hidden, rank)
+
+    tmp_path = Path(__file__).resolve().parent / "_scratch_editanything_av_timestep.safetensors"
+    save_file(sd, str(tmp_path))
+    try:
+        model = _FakeModelPatcher()
+        ltx23._install_editanything_module(model, str(tmp_path))
+        dm = model.model.diffusion_model
+        dm._editanything_ref_adaln = torch.randn(1, 6 * hidden)
+
+        torch.manual_seed(0)
+        baseline = _FakeDiffusionModel._prepare_timestep(dm, torch.zeros(1), 1, torch.float32)
+        baseline_v_data = baseline[0][0].data.clone()
+        baseline_a_timestep = baseline[0][1].clone()
+
+        torch.manual_seed(0)
+        timestep_list, embedded, prompt = dm._prepare_timestep(torch.zeros(1), 1, torch.float32)
+        assert isinstance(timestep_list, list) and len(timestep_list) == 5
+        v_timestep, a_timestep, cross_av, v_prompt, a_prompt = timestep_list
+        assert isinstance(v_timestep, _FakeCompressedTimestep), (
+            "v_timestep must stay wrapped in the same CompressedTimestep-like type, not "
+            "unwrapped to a plain tensor")
+        assert v_prompt == "v_prompt_ts" and a_prompt == "a_prompt_ts" and cross_av == [], (
+            "the other 3 list elements must pass through untouched")
+        assert not torch.equal(v_timestep.data, baseline_v_data), (
+            "ref_adaln must actually change v_timestep.data vs. the unpatched baseline")
+        assert torch.equal(a_timestep, baseline_a_timestep), (
+            "a_timestep must be untouched - ref_adaln is a purely visual signal"
+        )
+    finally:
+        del model, dm
+        import gc
+        gc.collect()
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+    print("[ok] _prepare_timestep_with_ref_adaln: handles the real joint-AV list return "
+          "shape ([v_timestep, a_timestep, cross_av_timestep_ss, v_prompt_timestep, "
+          "a_prompt_timestep]) and a CompressedTimestep-like v_timestep wrapper correctly - "
+          "ref_adaln lands only on v_timestep, everything else passes through unchanged")
+
+
 def _make_installed_fake_model(hidden=DIM, channels=16, rank=8, n_ref_blocks=(12, 20)):
     """A fake ModelPatcher already through _install_editanything_module,
     for exercising LTXV23EditAnythingPatch.patch() itself (not just the
@@ -498,6 +593,7 @@ if __name__ == "__main__":
     test_patched_forward_applies_residual_only_in_range_and_when_present()
     test_ref_visual_proj_and_adaln_proj_shapes()
     test_install_editanything_module_end_to_end()
+    test_prepare_timestep_handles_av_list_and_compressed_timestep()
     test_patch_per_batch_item_mode_gives_each_image_its_own_reference()
     test_patch_first_frame_only_mode_uses_only_first_image()
     test_wrapper_handles_x_as_list_for_joint_av_model()

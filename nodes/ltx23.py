@@ -576,14 +576,41 @@ def _install_editanything_module(model, module_path):
 
     original_prepare_timestep = dm._prepare_timestep
 
+    def _add_ref_adaln(v_timestep, ref_adaln):
+        # v_timestep is a plain tensor for the base (non-AV) LTX model, but
+        # for this pack's real joint AV model (comfy/ldm/lightricks/
+        # av_model.py's AVLTXModel) it's a CompressedTimestep wrapper
+        # (__slots__: data/batch_size/num_frames/patches_per_frame/
+        # feature_dim, not a tensor itself - confirmed via a real
+        # traceback + direct read of av_model.py) storing the real tensor
+        # in `.data`, possibly frame-compressed rather than per-token.
+        # ref_adaln is a single global vector per batch item (no per-
+        # frame/per-token variation), so adding it to the COMPRESSED
+        # `.data` (before expansion back to per-token) is exactly
+        # equivalent to adding it after expansion - broadcast-add onto
+        # whichever tensor is actually there, real or compressed.
+        target = v_timestep.data if hasattr(v_timestep, "data") and not torch.is_tensor(v_timestep) else v_timestep
+        ref_adaln = ref_adaln.to(device=target.device, dtype=target.dtype)
+        if ref_adaln.ndim == 2:
+            ref_adaln = ref_adaln.unsqueeze(1)
+        if torch.is_tensor(v_timestep):
+            return v_timestep + ref_adaln
+        v_timestep.data = v_timestep.data + ref_adaln
+        return v_timestep
+
     def _prepare_timestep_with_ref_adaln(self, *args, **kwargs):
         timestep, embedded_timestep, prompt_timestep = original_prepare_timestep(*args, **kwargs)
         ref_adaln = getattr(self, "_editanything_ref_adaln", None)
         if ref_adaln is not None:
-            ref_adaln = ref_adaln.to(device=timestep.device, dtype=timestep.dtype)
-            if ref_adaln.ndim == 2:
-                ref_adaln = ref_adaln.unsqueeze(1)
-            timestep = timestep + ref_adaln
+            if isinstance(timestep, list):
+                # joint AV model: [v_timestep, a_timestep, cross_av_timestep_ss,
+                # v_prompt_timestep, a_prompt_timestep] - EditAnything is a
+                # purely visual reference signal, only the video component
+                # (index 0) gets it.
+                timestep = list(timestep)
+                timestep[0] = _add_ref_adaln(timestep[0], ref_adaln)
+            else:
+                timestep = _add_ref_adaln(timestep, ref_adaln)
         return timestep, embedded_timestep, prompt_timestep
 
     dm._prepare_timestep = types.MethodType(_prepare_timestep_with_ref_adaln, dm)
