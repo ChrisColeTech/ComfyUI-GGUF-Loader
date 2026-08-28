@@ -306,7 +306,7 @@ class LTXV23ModelsLoader:
 #
 #   1. the reference image gets VAE-encoded and appended as extra guide
 #      tokens the model cross-attends to (comfy-core's own LTXVAddGuide -
-#      the exact mechanism LTXV23VidToVideo's ic_lora_attached already uses,
+#      the exact mechanism LTXV23VidToVideo's ic_lora selector already uses,
 #      nothing new needed for this path);
 #   2. a small extra cross-attention ("ref_attn") on transformer blocks 12-35
 #      only, run against a 32-token pooled summary of the reference latent,
@@ -343,19 +343,20 @@ EDITANYTHING_REF_CONTEXT_SCALE = 0.01
 EDITANYTHING_REF_TOKEN_SCALE = 0.25
 EDITANYTHING_ADALN_SCALE = 2.0
 
-# The .module.safetensors file isn't a LoRA and doesn't belong in models/loras
-# - it needs its own folder_paths category, same convention this pack already
-# uses for other non-standard model kinds (qwen_tts.py's QWEN3_TTS_MODELS_DIR).
-# Registers BOTH a comfy-managed default location AND, if it already exists,
-# wherever this session downloaded the file to - add_model_folder_path()
-# appends additional roots rather than replacing, so both resolve.
+# The .module.safetensors file isn't a LoRA (comfy's own LoRA loader can't
+# apply it - see _apply_editanything_patch's docstring), but it ships from
+# the SAME HuggingFace release as its .standard.safetensors LoRA half and
+# belongs in the same place a user would look for either: the real comfy
+# `loras` folder_paths category (models/loras and whatever extra roots are
+# registered there), not a bespoke category of its own - deploy both files
+# side by side (e.g. models/loras/ltxv/) same as any other LTX-2.3 LoRA.
+# Also register this pack's own D: archive location as an extra `loras`
+# search root, so a fresh download there is discoverable without a manual
+# copy into the portable install's models/loras.
 import os as _os
-_EDITANYTHING_MODELS_DIR = _os.path.join(folder_paths.models_dir, "ltxv23_edit_anything")
-_os.makedirs(_EDITANYTHING_MODELS_DIR, exist_ok=True)
-folder_paths.add_model_folder_path("ltxv23_edit_anything", _EDITANYTHING_MODELS_DIR)
 _EDITANYTHING_EXTRA_DIR = r"D:\models\image-models-dev\ltxv23\edit_anything"
 if _os.path.isdir(_EDITANYTHING_EXTRA_DIR):
-    folder_paths.add_model_folder_path("ltxv23_edit_anything", _EDITANYTHING_EXTRA_DIR)
+    folder_paths.add_model_folder_path("loras", _EDITANYTHING_EXTRA_DIR)
 
 
 class _EditAnythingLoRALinear(nn.Module):
@@ -561,33 +562,96 @@ def _install_editanything_module(model, module_path):
     dm._prepare_timestep = types.MethodType(_prepare_timestep_with_ref_adaln, dm)
 
 
-class LTXV23EditAnythingPatch:
-    """Adds LTX-2.3's EditAnything reference-conditioning path to a model -
-    injects one reference photo's identity via a small extra cross-attention
-    on transformer blocks 12-35 plus a global timestep modulation, on top of
-    the ordinary guide-token append LTXV23VidToVideo's `image` input already
-    does. See the "EditAnything reference conditioning" module docstring
-    above for the full mechanism and where it was ported from.
+def _apply_editanything_patch(model, vae, reference_image, module_path, reference_mode="per_batch_item"):
+    """Clone `model` and add LTX-2.3's EditAnything reference-conditioning
+    path to the clone - a small extra cross-attention on transformer blocks
+    12-35 plus a global timestep modulation, both driven by `reference_image`.
+    See the "EditAnything reference conditioning" module docstring above for
+    the full mechanism and where it was ported from. Shared by
+    LTXV23VidToVideo's built-in `editanything_lora`/`editanything_module_path`
+    selectors (the primary way to use this - see its docstring, mirrors
+    Krea2Img2Img's `identity_edit` toggle) and the standalone
+    LTXV23EditAnythingPatch node (for patching a model ahead of a different
+    conditioning-prep node, e.g. LTXV23ImgToVideo).
 
-    Needs BOTH EditAnything files loaded, from the same HuggingFace release
+    Needs BOTH EditAnything files, from the same HuggingFace release
     (DeepBeepMeep/LTX-2, edit_anything_reference_v0.1_r128_*):
-      - the .standard.safetensors half is an ORDINARY LoRA - load it the
-        normal way, stock LoraLoaderModelOnly, upstream of this node (this
-        node never touches LoRA weights, only the extra .module architecture).
-      - the .module.safetensors half is what THIS node loads (`module_path`)
-        - real extra layers with their own trained weights, not something
-          comfy's own LoRA loader can apply.
-    Without the LoRA loaded upstream, this patch alone is very unlikely to
-    produce a recognizable result - the module's ref_attn/AdaLN paths were
-    trained jointly with the LoRA's own attention deltas, not standalone.
+      - the .standard.safetensors half is an ORDINARY LoRA - load it via
+        comfy-core's real LoraLoaderModelOnly (this function never touches
+        LoRA weights itself, only the extra .module architecture below).
+      - the .module.safetensors half is what `module_path` points at here -
+        real extra layers with their own trained weights, not something
+        comfy's own LoRA loader can apply.
+    Without the LoRA loaded, this patch alone is very unlikely to produce a
+    recognizable result - the module's ref_attn/AdaLN paths were trained
+    jointly with the LoRA's own attention deltas, not standalone.
 
-    `reference_image` is VAE-encoded once here (not per sampling step) and
-    threaded through: (1) the ordinary guide-token append (same mechanism
-    LTXV23VidToVideo's `image` input uses - wire the SAME reference photo
-    into this node's `reference_image` AND LTXV23VidToVideo's `image` input
-    for the intended full recipe), and (2) the two new EditAnything paths
-    this node adds. `model` is cloned before any patching - the source
-    model object passed in is never mutated.
+    `reference_image` is VAE-encoded once here (not per sampling step).
+    `reference_mode`: `per_batch_item` (default) encodes each image in the
+    batch SEPARATELY and keeps them as distinct references, one per sample
+    in the eventual sampling batch (tiled/truncated to fit - vae.encode()
+    always collapses a single call's input batch into temporal frames of
+    ONE video, comfy/sd.py VAE.encode, so a batch is encoded one image at a
+    time and concatenated, never blended); `first_frame_only` uses only
+    `reference_image[0]`, logging how many extra images were dropped - the
+    right choice for vid2vid, where the reference batch isn't meant to line
+    up with the sampling batch. `model` is cloned before any patching - the
+    source model object passed in is never mutated.
+    """
+    m = model.clone()
+    _install_editanything_module(m, folder_paths.get_full_path_or_raise(
+        "loras", module_path))
+    dm = m.model.diffusion_model
+
+    pixels = reference_image[:, :, :, :3]
+    if reference_mode == "first_frame_only":
+        if pixels.shape[0] > 1:
+            logger.info("LTX-2.3 EditAnything: reference_mode=first_frame_only, "
+                        "using only the first of %d images", pixels.shape[0])
+        pixels = pixels[:1]
+
+    ref_latents = [vae.encode(pixels[i:i + 1]) for i in range(pixels.shape[0])]
+    ref_latent = torch.cat(ref_latents, dim=0)
+    ref_latent = m.model.process_latent_in(ref_latent).to(
+        device=comfy.model_management.get_torch_device())
+
+    visual_param = next(dm.editanything_ref_visual_proj.parameters())
+    ref_context = dm.editanything_ref_visual_proj(
+        ref_latent.to(dtype=visual_param.dtype)).detach()
+    adaln_param = next(dm.editanything_ref_adaln_proj.parameters())
+    ref_adaln = dm.editanything_ref_adaln_proj(
+        ref_latent.to(dtype=adaln_param.dtype)).detach()
+
+    def wrapper(executor, x, timesteps, context, attention_mask, frame_rate=25,
+                transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
+        transformer_options = dict(transformer_options)
+        transformer_options["editanything_ref_context"] = _match_batch(ref_context, x.shape[0])
+        dm._editanything_ref_adaln = _match_batch(ref_adaln, x.shape[0])
+        return executor(x, timesteps, context, attention_mask, frame_rate,
+                        transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
+
+    m.add_wrapper_with_key(
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "editanything_ref", wrapper)
+    logger.info("LTX-2.3 EditAnything: patch applied, %d reference(s) (%s), shape %s",
+                pixels.shape[0], reference_mode, tuple(pixels.shape))
+    return m
+
+
+class LTXV23EditAnythingPatch:
+    """Standalone form of LTX-2.3's EditAnything reference-conditioning
+    patch - see LTXV23VidToVideo's `editanything_lora`/`editanything_module_path`
+    selectors instead for the primary, one-node way to use this (mirrors
+    Krea2Img2Img's `identity_edit` toggle: the patch is built into the main
+    conditioning node there too). Use THIS node only when you need the
+    patched model ahead of a DIFFERENT conditioning-prep node - e.g.
+    LTXV23ImgToVideo, or a plain txt2video graph with no video/vid2vid
+    involved at all - since LTXV23VidToVideo's selectors only exist on that
+    one node.
+
+    Wire the SAME reference photo into this node's `reference_image` AND
+    whatever conditioning node's `image` input for the intended full
+    recipe (the guide-token append and the EditAnything path are
+    complementary, not alternatives).
     """
 
     CATEGORY = LTX23_CATEGORY
@@ -596,10 +660,13 @@ class LTXV23EditAnythingPatch:
                       'add person', 'reference image', 'ic-lora']
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-    DESCRIPTION = ("Adds LTX-2.3's EditAnything reference-conditioning (extra "
-                   "cross-attention + timestep modulation from one reference "
-                   "photo) to a model. Load the EditAnything LoRA separately "
-                   "(stock LoraLoaderModelOnly) before this.")
+    DESCRIPTION = ("Standalone EditAnything reference-conditioning patch (extra "
+                   "cross-attention + timestep modulation from one or more "
+                   "reference photos) for use ahead of a conditioning-prep node "
+                   "other than LTXV23VidToVideo, which has this built in via the "
+                   "editanything_lora/editanything_module_path selectors. Load "
+                   "the EditAnything LoRA separately (stock LoraLoaderModelOnly) "
+                   "before this.")
 
     @classmethod
     def INPUT_TYPES(s):
@@ -611,14 +678,12 @@ class LTXV23EditAnythingPatch:
                 "reference_image": ("IMAGE", {"tooltip": "The person/subject to inject. "
                                     "A batch of N images gives N distinct references, one "
                                     "per generation in the sampling batch (tiled/truncated "
-                                    "to fit) - see reference_mode for the vid2vid case. "
-                                    "Wire this SAME image into LTXV23VidToVideo's `image` "
-                                    "input too - this node only adds the two extra "
-                                    "conditioning paths, the guide-token append is "
-                                    "LTXV23VidToVideo's job."}),
-                "module_path": (folder_paths.get_filename_list("ltxv23_edit_anything"), {
-                    "tooltip": "The EditAnything .module.safetensors file (NOT the "
-                               "LoRA - that loads separately via LoraLoaderModelOnly)."}),
+                                    "to fit) - see reference_mode for the vid2vid case."}),
+                "module_path": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "The EditAnything .module.safetensors file, from the "
+                               "loras folder (it's not a LoRA itself, but ships from "
+                               "the same release - keep it next to its .standard.safetensors "
+                               "half, which loads separately via LoraLoaderModelOnly)."}),
                 "reference_mode": (["per_batch_item", "first_frame_only"], {
                     "default": "per_batch_item",
                     "tooltip": "per_batch_item: each image in reference_image's batch is "
@@ -635,49 +700,7 @@ class LTXV23EditAnythingPatch:
 
     @torch.inference_mode()
     def patch(self, model, vae, reference_image, module_path, reference_mode="per_batch_item"):
-        m = model.clone()
-        _install_editanything_module(m, folder_paths.get_full_path_or_raise(
-            "ltxv23_edit_anything", module_path))
-        dm = m.model.diffusion_model
-
-        pixels = reference_image[:, :, :, :3]
-        if reference_mode == "first_frame_only":
-            if pixels.shape[0] > 1:
-                logger.info("LTX-2.3 EditAnything: reference_mode=first_frame_only, "
-                            "using only the first of %d images", pixels.shape[0])
-            pixels = pixels[:1]
-
-        # vae.encode() always collapses its input batch axis into TEMPORAL
-        # FRAMES of one video (comfy/sd.py VAE.encode, output batch dim
-        # forced to 1) - there is no single call that returns N independent
-        # per-image latents. Encode one image at a time instead, so each
-        # reference stays its own real batch item rather than being averaged
-        # into one blurry blend.
-        ref_latents = [vae.encode(pixels[i:i + 1]) for i in range(pixels.shape[0])]
-        ref_latent = torch.cat(ref_latents, dim=0)
-        ref_latent = m.model.process_latent_in(ref_latent).to(
-            device=comfy.model_management.get_torch_device())
-
-        visual_param = next(dm.editanything_ref_visual_proj.parameters())
-        ref_context = dm.editanything_ref_visual_proj(
-            ref_latent.to(dtype=visual_param.dtype)).detach()
-        adaln_param = next(dm.editanything_ref_adaln_proj.parameters())
-        ref_adaln = dm.editanything_ref_adaln_proj(
-            ref_latent.to(dtype=adaln_param.dtype)).detach()
-
-        def wrapper(executor, x, timesteps, context, attention_mask, frame_rate=25,
-                    transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
-            transformer_options = dict(transformer_options)
-            transformer_options["editanything_ref_context"] = _match_batch(ref_context, x.shape[0])
-            dm._editanything_ref_adaln = _match_batch(ref_adaln, x.shape[0])
-            return executor(x, timesteps, context, attention_mask, frame_rate,
-                            transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
-
-        m.add_wrapper_with_key(
-            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "editanything_ref", wrapper)
-        logger.info("LTX-2.3 EditAnything: patch applied, %d reference(s) (%s), shape %s",
-                    pixels.shape[0], reference_mode, tuple(pixels.shape))
-        return (m,)
+        return (_apply_editanything_patch(model, vae, reference_image, module_path, reference_mode),)
 
 
 # ── conditioning / latent prep ──────────────────────────────────────────────
@@ -891,46 +914,69 @@ class LTXV23ImgToVideo:
 
 
 class LTXV23VidToVideo:
-    """Prompts + init latent for LTX-2.3: T2V/I2V plus video-to-video via
-    IC-LoRA guide injection - all independently combinable in one node.
+    """Prompts + init latent for LTX-2.3: T2V/I2V/V2V, with LoRA selection
+    and reference-conditioning all built into this one node - no external
+    LoraLoaderModelOnly wiring, no separate "is X attached" boolean toggles.
+    Every mechanism here is driven purely by whether its selector is set
+    (a real filename) or left at "none" - matching this node's `model`
+    input/output design (patched model out, or the original unpatched
+    model straight through, if nothing was selected).
 
-    Two genuinely different mechanisms live here, matching what the official
-    example workflows wire side by side in the same graph:
+    `mode` (required) declares which of the three base behaviors this call
+    is: `t2v` (image/video must be disconnected - pure text-to-video),
+    `i2v` (`image` required - ordinary first-frame hold, VAE-encoded and
+    held at `image_strength` via the noise mask), or `v2v` (`video`
+    required - IC-LoRA guide injection, see `ic_lora` below). `i2v`/`v2v`
+    can still layer on top of each other exactly as before (image hold +
+    video guide in the same call) - `mode` only says which one is the
+    PRIMARY, required source; the other stays optional and combinable.
 
-      `image` (optional) - the ordinary LTXV23ImgToVideo first-frame hold:
-      VAE-encoded and written into the first latent frame(s), held at
-      `image_strength` via the noise mask. For real image-to-video (start
-      from a still, generate new motion) - works with or without `video`
-      connected, and needs no IC-LoRA.
+    `ic_lora` (optional selector, "none" = off) loads an IC-LoRA (in-context
+    LoRA) task adapter directly onto `model` inside this node (comfy-core's
+    real `LoraLoaderModelOnly.load_lora_model_only`, not reimplemented) at
+    `ic_lora_strength`, then injects `video`'s frames as extra "guide"
+    tokens the model attends to at the SAME timeline position as what it's
+    generating (comfy-core's keyframe_idxs RoPE mechanism,
+    comfy_extras/nodes_lt.py's LTXVAddGuide) - a genuinely different thing
+    from `image`'s first-frame hold, and from Krea2Img2Img's partial-denoise
+    img2img. `ic_lora="none"` (default): `video`, if connected, is only
+    used for length/frame_rate/original audio, ignored for guidance. When
+    `video` is connected, `length`/`frame_rate` are taken FROM it
+    (overriding the widgets, logged); `width`/`height` always come from the
+    widgets regardless of source, same as `image`. `keep_original_audio`
+    (default on, only relevant with `video`) keeps the source clip's own
+    audio unchanged in the output using this file's own already-proven
+    `_encode_reference_audio`/`_fit_audio_latent` helpers - mechanically
+    identical to `reference_audio` below, just fed the source video's own
+    audio track instead of a separate clip. Off = the model generates new
+    audio from scratch instead.
 
-      `video` (optional) - an IC-LoRA (in-context LoRA) task adapter's
-      reference: beard removal, HDR grading, motion tracking, any LTX-2.3
-      IC-LoRA trained on whole-video reference conditioning. Its frames get
-      APPENDED as extra "guide" tokens the model attends to at the SAME
-      timeline position as what it's generating (comfy-core's keyframe_idxs
-      RoPE mechanism, comfy_extras/nodes_lt.py's LTXVAddGuide) - a
-      genuinely different thing from `image`'s first-frame hold, and from
-      Krea2Img2Img's partial-denoise img2img. `ic_lora_attached=True`
-      (default) is what actually applies this - it declares "an IC-LoRA is
-      loaded on model, drive it"; without a matching IC-LoRA actually
-      loaded there (stock LoraLoaderModelOnly, loaded separately - this
-      node never touches `model`), the extra reference is inert, same as
-      Krea2Img2Img's `identity_edit` toggle needing its LoRA loaded
-      separately too. When `video` is connected, `length`/`frame_rate` are
-      taken FROM it (overriding the widgets, logged) - the output is meant
-      to match the source clip's own duration/timing; `width`/`height`
-      always come from the widgets regardless of source, same as `image`.
-      `hold_audio` (default on, only relevant with `video`) freezes the
-      source clip's own audio into the output using this file's own
-      already-proven `_encode_reference_audio`/`_fit_audio_latent` helpers -
-      mechanically identical to `reference_audio` below, just fed the
-      source video's own audio track instead of a separate clip.
+    `reference_audio` (optional, mutually exclusive in effect with
+    `video`+`keep_original_audio` - the LAST one prepared wins if both are
+    wired, though wiring both makes little sense) - LTXV23ImgToVideo's own
+    A2V path, unchanged, for driving generation from a voice/sound clip
+    with no source video at all.
 
-      `reference_audio` (optional, mutually exclusive in effect with
-      `video`+`hold_audio` - the LAST one prepared wins if both are wired,
-      though wiring both makes little sense) - LTXV23ImgToVideo's own A2V
-      path, unchanged, for driving generation from a voice/sound clip with
-      no source video at all.
+    `editanything_lora` + `editanything_module_path` (both optional
+    selectors, "none" = off - EITHER alone does nothing useful, they're
+    trained jointly) add LTX-2.3's EditAnything reference-conditioning
+    patch to `model` in this same node - mirrors Krea2Img2Img's own
+    `identity_edit` toggle (patch built into the main conditioning node,
+    not a separate one), except the LoRA half is now ALSO loaded here
+    (same `LoraLoaderModelOnly` delegation as `ic_lora` above, at
+    `editanything_lora_strength`) instead of requiring external wiring.
+    Needs `reference_image` (the person/subject to inject) too; see
+    `_apply_editanything_patch`'s docstring for the full mechanism and what
+    `reference_mode` controls. Wire the SAME photo into `reference_image`
+    and `image` for the intended full recipe - the returned `model` is the
+    patched clone (or the original, unpatched, if neither selector is set);
+    always take `model` from THIS node's output, not the original upstream
+    model, whenever any selector here is used.
+
+    All three LoRA-adjacent selectors (`ic_lora`, `editanything_lora`,
+    `editanything_module_path`) list comfy's real `loras` folder_paths
+    category - the same place a plain `LoraLoaderModelOnly` looks, so any
+    file placed there for one is visible to all.
 
     This node calls comfy-core's real LTXVAddGuide.get_latent_index()/
     append_keyframe() directly (comfy_extras.nodes_lt, always present
@@ -947,33 +993,40 @@ class LTXV23VidToVideo:
     Feed the outputs into LTXV23KSampler UNCHANGED - it already samples any
     joint AV latent + noise mask generically, so no custom sampler is
     needed here. Then LTXV23CropVideoGuide before LTXV23AVDecode to strip
-    the reference frames back out (a no-op if `video`/`ic_lora_attached`
-    were never used).
+    the reference frames back out (a no-op if `video`/`ic_lora` were never
+    used).
     """
 
     CATEGORY = LTX23_CATEGORY
     TITLE = "LTX-2.3 Video to Video (IC-LoRA) ⚡"
     SEARCH_ALIASES = ['video to video', 'vid2vid', 'v2v', 'ic-lora', 'ic lora',
                        'video guide', 'video conditioning', 'image to video', 'img2vid']
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
-    RETURN_NAMES = ("positive", "negative", "latent", "frame_rate")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "frame_rate")
     FUNCTION = "prepare"
-    DESCRIPTION = ("Prompts and init latent for LTX-2.3 T2V/I2V plus "
-                   "video-to-video via IC-LoRA guide injection - image, "
-                   "video and audio all independently optional. Load the "
-                   "task IC-LoRA separately (stock LoraLoaderModelOnly) "
-                   "before this. Feed into LTXV23KSampler, then "
+    DESCRIPTION = ("Prompts and init latent for LTX-2.3 T2V/I2V/V2V - LoRA "
+                   "selection and EditAnything reference-conditioning both "
+                   "built in, no external LoraLoaderModelOnly wiring "
+                   "needed. Feed the outputs into LTXV23KSampler, then "
                    "LTXV23CropVideoGuide before LTXV23AVDecode.")
 
     @classmethod
     def INPUT_TYPES(s):
+        lora_choices = ["none"] + folder_paths.get_filename_list("loras")
         return {
             "required": {
+                "model": ("MODEL",),
                 "clip": ("CLIP",),
+                "mode": (["t2v", "i2v", "v2v"], {"default": "t2v",
+                          "tooltip": "Which base behavior this call is. t2v: image/video "
+                                     "must be disconnected. i2v: image required (video may "
+                                     "still layer on top as an IC-LoRA guide). v2v: video "
+                                     "required (image may still layer on top as a first-"
+                                     "frame hold)."}),
                 "vae": ("VAE", {"tooltip": "The loader's video_vae output."}),
                 "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True,
-                                      "tooltip": "With ic_lora_attached: describe the OUTPUT "
+                                      "tooltip": "With ic_lora set: describe the OUTPUT "
                                                  "you want - most IC-LoRAs are trained on an "
                                                  "instruction-style caption describing the "
                                                  "transformed result. Otherwise: describe the "
@@ -996,36 +1049,39 @@ class LTXV23VidToVideo:
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "First frame for image-to-video (ordinary "
-                                    "i2v hold, independent of video/ic_lora_attached below). "
+                                    "i2v hold, independent of video/ic_lora below). "
                                     "Resized and CENTER-CROPPED to width x height."}),
                 "image_strength": ("FLOAT", {
                     "default": I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "image only. How much of the init image to keep. 0.7 is "
                                "the official value; 1.0 locks the first frames hard."}),
                 "video": ("VIDEO", {"tooltip": "Source clip for IC-LoRA video-to-video "
-                                    "(see ic_lora_attached) and/or held audio (see "
-                                    "hold_audio). Sets length/frame_rate from itself."}),
-                "ic_lora_attached": ("BOOLEAN", {"default": True,
-                                "tooltip": "video only. Tell this node an IC-LoRA is loaded "
-                                           "on model, so it should inject the source video "
-                                           "as that LoRA's reference (the actual vid2vid "
-                                           "mechanism) - the LoRA itself is loaded separately "
-                                           "upstream (stock LoraLoaderModelOnly), this only "
-                                           "declares it's there. Off = video is used only for "
-                                           "length/frame_rate/held audio, ignored for guidance "
-                                           "- useful for A/B-ing whether the IC-LoRA is doing "
-                                           "anything."}),
+                                    "(see ic_lora) and/or its original audio (see "
+                                    "keep_original_audio). Sets length/frame_rate from itself."}),
+                "ic_lora": (lora_choices, {"default": "none",
+                            "tooltip": "video only. The IC-LoRA task adapter (beard removal, "
+                                       "HDR grading, motion tracking, ...) - loaded onto model "
+                                       "HERE (no external LoraLoaderModelOnly needed) at "
+                                       "ic_lora_strength, then drives the actual vid2vid guide-"
+                                       "injection mechanism. \"none\" = video is used only for "
+                                       "length/frame_rate/original audio, ignored for guidance "
+                                       "- useful for A/B-ing whether the IC-LoRA is doing "
+                                       "anything."}),
+                "ic_lora_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0,
+                                     "step": 0.01,
+                                     "tooltip": "ic_lora only. Same as LoraLoaderModelOnly's "
+                                                "strength_model."}),
                 "guide_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                                   "tooltip": "ic_lora_attached only. How strongly the "
-                                              "reference is held. 1.0 = fully held (official "
-                                              "default)."}),
-                "hold_audio": ("BOOLEAN", {"default": True,
-                               "tooltip": "video only. Freeze the source clip's own audio "
-                                          "into the output. Off = silent/synthesized audio."}),
+                                   "tooltip": "ic_lora only. How strongly the reference is "
+                                              "held. 1.0 = fully held (official default)."}),
+                "keep_original_audio": ("BOOLEAN", {"default": True,
+                               "tooltip": "video only. On = output keeps the source clip's "
+                                          "own audio unchanged. Off = the model generates "
+                                          "new audio from scratch instead."}),
                 "latent_downscale_factor": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0,
                                             "step": 1.0,
-                                            "tooltip": "ic_lora_attached only. Only for "
-                                                       "IC-LoRAs trained on a downscaled reference "
+                                            "tooltip": "ic_lora only. Only for IC-LoRAs "
+                                                       "trained on a downscaled reference "
                                                        "grid (rare - check the LoRA's model "
                                                        "card / reference_downscale_factor "
                                                        "metadata; most, including every "
@@ -1033,22 +1089,85 @@ class LTXV23VidToVideo:
                 "reference_audio": ("AUDIO", {"tooltip": "Drive generation from a voice/sound "
                                               "clip with no source video (LTXV23ImgToVideo's "
                                               "A2V path). Not meant to be combined with "
-                                              "video+hold_audio."}),
+                                              "video+keep_original_audio."}),
                 "length_from_audio": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "With reference_audio and no video: size the video to the clip."}),
+                "editanything_lora": (lora_choices, {"default": "none",
+                                      "tooltip": "The EditAnything .standard.safetensors LoRA "
+                                                 "half - loaded onto model HERE at "
+                                                 "editanything_lora_strength (no external "
+                                                 "LoraLoaderModelOnly needed). \"none\" = off. "
+                                                 "Needs editanything_module_path set too - "
+                                                 "either alone does nothing useful, they're "
+                                                 "trained jointly."}),
+                "editanything_lora_strength": ("FLOAT", {"default": 1.0, "min": -100.0,
+                                               "max": 100.0, "step": 0.01,
+                                               "tooltip": "editanything_lora only. Same as "
+                                                          "LoraLoaderModelOnly's strength_model."}),
+                "editanything_module_path": (lora_choices, {"default": "none",
+                    "tooltip": "The EditAnything .module.safetensors file (NOT a LoRA - real "
+                               "extra layers, loaded by this pack's own patch mechanism), "
+                               "from the loras folder. \"none\" = off. Needs "
+                               "editanything_lora and reference_image set too."}),
+                "reference_image": ("IMAGE", {"tooltip": "Needs editanything_module_path set. "
+                                    "The person/subject to inject. A batch of N images gives "
+                                    "N distinct references, one per generation in the "
+                                    "sampling batch (tiled/truncated to fit) - see "
+                                    "reference_mode. Wire the SAME image into `image` too."}),
+                "reference_mode": (["per_batch_item", "first_frame_only"], {
+                    "default": "first_frame_only",
+                    "tooltip": "Needs editanything_module_path set. per_batch_item: each "
+                               "image in reference_image's batch is encoded and used as its "
+                               "OWN distinct reference (not blended) - image i drives sample "
+                               "i of the sampling batch, tiled/truncated if the counts don't "
+                               "match. first_frame_only (default here): use only "
+                               "reference_image[0], ignore the rest - the vid2vid recipe "
+                               "(one clean reference identity against a single video)."}),
             },
         }
 
     @torch.inference_mode()
-    def prepare(self, clip, vae, audio_vae, prompt, negative_prompt, width, height,
+    def prepare(self, model, clip, vae, audio_vae, mode, prompt, negative_prompt, width, height,
                 length, frame_rate, batch_size, image=None, image_strength=I2V_STRENGTH,
-                video=None, ic_lora_attached=True, guide_strength=1.0, hold_audio=True,
-                latent_downscale_factor=1.0, reference_audio=None, length_from_audio=True):
+                video=None, ic_lora="none", ic_lora_strength=1.0, guide_strength=1.0,
+                keep_original_audio=True, latent_downscale_factor=1.0, reference_audio=None,
+                length_from_audio=True, editanything_lora="none", editanything_lora_strength=1.0,
+                editanything_module_path="none", reference_image=None,
+                reference_mode="first_frame_only"):
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
             raise ValueError("audio_vae is not an LTX audio VAE; use the kit's "
                              "*_audio_vae.safetensors in the audio_vae slot.")
+
+        if mode == "t2v" and (image is not None or video is not None):
+            raise ValueError("LTX-2.3 v2v: mode=t2v but image/video is connected - disconnect "
+                             "them or pick i2v/v2v.")
+        if mode == "i2v" and image is None:
+            raise ValueError("LTX-2.3 v2v: mode=i2v needs image connected.")
+        if mode == "v2v" and video is None:
+            raise ValueError("LTX-2.3 v2v: mode=v2v needs video connected.")
+
+        ic_lora_attached = ic_lora not in (None, "none", "")
+        editanything_lora_attached = editanything_lora not in (None, "none", "")
+        edit_anything = editanything_module_path not in (None, "none", "")
+        if editanything_lora_attached != edit_anything:
+            raise ValueError("LTX-2.3 v2v: editanything_lora and editanything_module_path must "
+                             "be set together (both \"none\" or both a real file) - either "
+                             "alone does nothing, they're trained jointly.")
+
+        if ic_lora_attached:
+            model = nodes.LoraLoaderModelOnly().load_lora_model_only(
+                model, ic_lora, ic_lora_strength)[0]
+        if editanything_lora_attached:
+            model = nodes.LoraLoaderModelOnly().load_lora_model_only(
+                model, editanything_lora, editanything_lora_strength)[0]
+        if edit_anything:
+            if reference_image is None:
+                raise ValueError("LTX-2.3 v2v: editanything_module_path is set but "
+                                 "reference_image isn't connected.")
+            model = _apply_editanything_patch(
+                model, vae, reference_image, editanything_module_path, reference_mode)
 
         video_frames = video_audio = None
         if video is not None:
@@ -1122,13 +1241,13 @@ class LTXV23VidToVideo:
             logger.info("LTX-2.3 v2v: guide %s appended @ strength %.2f (frame_idx=%d)",
                         tuple(guide_latent.shape), guide_strength, frame_idx)
         elif video is not None:
-            logger.info("LTX-2.3 v2v: ic_lora_attached=False - video used for length/frame_rate/"
+            logger.info("LTX-2.3 v2v: ic_lora=none - video used for length/frame_rate/"
                         "held audio only, ignored for guidance")
 
         n_latents = int(fsm.num_of_latents_from_frames(length, frame_rate))
         channels = int(getattr(audio_vae, "latent_channels", fsm.latent_channels))
         target = [batch_size, channels, n_latents, int(fsm.latent_frequency_bins)]
-        if video is not None and hold_audio and video_audio is not None:
+        if video is not None and keep_original_audio and video_audio is not None:
             audio_latent, audio_mask = _encode_reference_audio(
                 audio_vae, video_audio, length / frame_rate)
             audio_latent, audio_mask = _fit_audio_latent(audio_latent, audio_mask, target)
@@ -1153,9 +1272,9 @@ class LTXV23VidToVideo:
                     tuple(video_samples.shape), tuple(video_mask.shape),
                     tuple(audio_latent.shape), tuple(audio_mask.shape),
                     ", image held @ %.2f" % image_strength if image is not None else "",
-                    ", audio held" if (video is not None and hold_audio and video_audio is not None)
+                    ", audio held" if (video is not None and keep_original_audio and video_audio is not None)
                     or (video is None and reference_audio is not None) else "")
-        return (positive, negative, latent, frame_rate)
+        return (model, positive, negative, latent, frame_rate)
 
 
 class LTXV23KSampler:
@@ -1330,7 +1449,7 @@ class LTXV23CropVideoGuide:
     streams get split before the crop and rejoined after (same reason
     _upsample_video_latent above has to do this for the refine sampler's
     upscale model). A no-op (returns the latent unchanged) when no guide was
-    ever appended (ic_lora_attached=False upstream, or nothing to crop) -
+    ever appended (ic_lora=none upstream, or nothing to crop) -
     matches core's own early-return behavior.
     """
 

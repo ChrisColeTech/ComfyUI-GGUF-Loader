@@ -2930,3 +2930,105 @@ transferable) into `D:\Projects\giga-videos`'s comfy-free port of the
 same mechanism, plus wire the feature into that project's live API/UI
 surface and exercise it through its fileserver/sidecar - not yet
 reported back as of this entry.
+
+## LTXV23VidToVideo: mode + in-node LoRA selectors replace boolean toggles (2026-08-28)
+
+User tested the new EditAnything feature and pushed back hard on the
+shape it shipped in: "so it looks like you added a new edit anything
+node, instead of building the features into the existing vid2vid node,
+why is that." I initially defended the separate-node design by citing
+`Krea2IdentityEditSourcePatch` as precedent - wrong precedent. The
+correct one was already sitting in this same file's own docstring:
+`LTXV23VidToVideo`'s `ic_lora_attached` was itself explicitly modeled on
+**`Krea2Img2Img`'s `identity_edit` toggle** - a mechanism built into the
+main conditioning node itself (`model` in, patched `model` out), not a
+separate node. `Krea2IdentityEditSourcePatch` is Krea2's *secondary*,
+standalone option, not the primary pattern. User's diagnosis of why this
+was overlooked, confirmed as accurate: "why isn't it in the plan" - I'd
+verified the model-forward-surgery *mechanism* rigorously (real
+BasicTransformerBlock/LTXBaseModel reads) but treated the *node shape*
+as settled by surface analogy, never actually opening `krea2.py` to
+check `Krea2Img2Img`'s real INPUT_TYPES/RETURN_TYPES against what I was
+about to build - a real gap in plan verification, not a reasonable
+alternate design choice.
+
+Then two more rounds of user-caught gaps, worth recording verbatim since
+each corrects a specific wrong assumption:
+- "so where is the dropdown to change the modes from i2v, t2v, v2v etc?
+  the toggle says if the identity lora is attached, it does not
+  determine the mode." - `LTXV23VidToVideo` never had an explicit mode
+  selector; t2v/i2v/v2v were only ever inferred from which optional
+  sockets happened to be connected.
+- "both files are in the lora folder, thats good, but pointless if i can
+  only select one in the v2v node" - the `.standard.safetensors` LoRA
+  half required an external `LoraLoaderModelOnly` wired in by hand; only
+  the `.module.safetensors` half had an in-node selector.
+- Resolving principle, stated directly: "we dont need a 'is lora
+  connected' switch because we have the selectors here in the node. they
+  are either null or not null." - applies to `ic_lora_attached` too, not
+  just the EditAnything toggle.
+
+Rebuilt `LTXV23VidToVideo` accordingly (`nodes/ltx23.py`): added required
+`mode` (`t2v`/`i2v`/`v2v`, validated against what's actually
+connected - i2v needs `image`, v2v needs `video`, t2v rejects either).
+Removed `ic_lora_attached` (BOOLEAN) and `edit_anything` (BOOLEAN)
+entirely. Added `ic_lora` (dropdown over `folder_paths.get_filename_list
+("loras")`, `"none"` = off) - loads the IC-LoRA task adapter INSIDE this
+node via `nodes.LoraLoaderModelOnly().load_lora_model_only(...)` (real
+comfy-core delegation, not reimplemented) at `ic_lora_strength`, before
+driving the existing guide-append mechanism. Added `editanything_lora`
+(same pattern, for the `.standard.safetensors` half) alongside the
+existing `editanything_module_path`, now required to be set TOGETHER
+(one alone raises a clear `ValueError` - "they're trained jointly", not
+independently toggleable). `model` chains through: `ic_lora` load ->
+`editanything_lora` load -> `_apply_editanything_patch` (each step
+clones internally, matching this pack's clone-then-patch discipline).
+
+Also fixed, same investigation: the two EditAnything files were never
+actually IN comfy's real `loras` folder (`N:\...\ComfyUI\models\loras\
+ltxv\`) - they'd been downloaded earlier this session to `D:\models\
+image-models-dev\...`, a staging location `folder_paths` never
+registered as a search root (no `extra_model_paths.yaml`, no
+`add_model_folder_path` call for it), so neither file was ever
+selectable via any real dropdown despite the node compiling and testing
+clean. Copied both into the real `models/loras/ltxv/` and switched
+`_install_editanything_module`'s/both nodes' folder category from a
+bespoke `ltxv23_edit_anything` category to comfy's real `loras` one
+(`folder_paths.add_model_folder_path("loras", ...)` for the D: archive
+location as an extra search root, so future downloads there resolve
+without a manual copy).
+
+User also corrected the deployment workflow directly: manually copying
+`nodes/ltx23.py` into the portable install's `custom_nodes/` folder
+after each change is NOT the right mechanism - "the correct mechanism is
+bumping the version and pushing." Stopped doing manual portable-install
+copies; version bump + git push is sufficient.
+
+Verification surfaced a real, separate, PRE-EXISTING flakiness in
+`tools/smoke_ltx23_editanything.py`'s bitwise-identity checks while
+re-running them after this change (unrelated to anything touched here) -
+traced by direct measurement, not guessed: (1) calling the SAME real
+`BasicTransformerBlock` instance's `forward` twice in a row, even with
+IDENTICAL unpatched code both times, could itself diverge/NaN - fixed by
+using independent `copy.deepcopy`d instances, each called exactly once;
+(2) `scale_shift_table.normal_()` at std=1 on these toy (untrained) 64-dim
+blocks occasionally produced numerical blowup to ~1e22-1e32 or NaN even
+in comfy's own real code - fixed by scaling init/inputs down
+(`std=0.02`, `*0.1`); (3) a residual, process-level (not per-attempt)
+nondeterminism remained in `torch.ops.comfy_kitchen.rms_adaln` (a
+separate Rust/C extension - confirmed `torch.set_num_threads(1)` has no
+effect on it) - mitigated with a bounded retry (12 independent weight
+draws, first match wins - a real logic bug would fail every attempt
+deterministically, external noise only fails some); (4) the specific
+out-of-range block-gate check remained flaky even at 12 retries (proved
+NOT per-attempt-random via direct measurement - sticky per-process, so
+in-process retrying structurally cannot help) - replaced entirely with a
+call-count spy on `ref_attn.forward` (does the gate ever invoke it at
+all?), a strictly stronger and non-flaky check since it sidesteps the
+unstable kernel path rather than depending on it. 0/12 failures over
+repeated real runs after all four fixes; `smoke_ltx23_vid2vid.py`
+rewritten with 7 tests covering the new `mode`/`ic_lora`/
+`editanything_lora`/`editanything_module_path` surface (LoRA-loader
+delegation order, mode validation, must-be-set-together error, chaining
+through to `_apply_editanything_patch`); 84/84 `pytest tests/`
+unaffected. `README.md`'s vid2vid section rewritten to match.
