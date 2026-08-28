@@ -519,6 +519,13 @@ def _install_editanything_module(model, module_path):
     ref_context/ref_adaln get computed and threaded through."""
     sd = comfy.utils.load_torch_file(module_path)
     dm = model.model.diffusion_model
+    # comfy.utils.load_torch_file() loads onto CPU regardless of where the
+    # rest of the model lives - the module's new submodules must be moved
+    # onto the SAME device as the model's own weights (block.attn2's, here,
+    # since it's already loaded/placed correctly) or their first real
+    # forward call raises a CPU/CUDA mismatch (confirmed via a real
+    # traceback: "mat1 is on cuda:0, different from other tensors on cpu").
+    target_device = next(dm.parameters()).device
 
     def _strip(prefix):
         return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
@@ -528,8 +535,8 @@ def _install_editanything_module(model, module_path):
         raise ValueError(f"{module_path}: no ref_visual_proj.* tensors found - "
                          "not an EditAnything .module.safetensors file?")
     adaln_state = _strip("ref_adaln_proj.")
-    dm.editanything_ref_visual_proj = _EditAnythingRefVisualProj(visual_state)
-    dm.editanything_ref_adaln_proj = _EditAnythingRefAdaLNProj(adaln_state)
+    dm.editanything_ref_visual_proj = _EditAnythingRefVisualProj(visual_state).to(device=target_device)
+    dm.editanything_ref_adaln_proj = _EditAnythingRefAdaLNProj(adaln_state).to(device=target_device)
 
     patched = 0
     for i, block in enumerate(dm.transformer_blocks):
@@ -539,7 +546,7 @@ def _install_editanything_module(model, module_path):
         if f"{prefix}to_q.lora_A.weight" not in sd:
             continue
         block.idx = i
-        block.ref_attn = _EditAnythingRefAttention(block.attn2, sd, prefix)
+        block.ref_attn = _EditAnythingRefAttention(block.attn2, sd, prefix).to(device=target_device)
         block.forward = types.MethodType(_patched_block_forward, block)
         patched += 1
     if patched == 0:

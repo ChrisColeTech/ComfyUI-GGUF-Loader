@@ -280,6 +280,21 @@ def test_install_editanything_module_end_to_end():
         assert hasattr(dm, "editanything_ref_adaln_proj")
         patched_idxs = {b.idx for b in dm.transformer_blocks if hasattr(b, "ref_attn")}
         assert patched_idxs == {12, 20}, f"expected blocks {{12, 20}} patched, got {patched_idxs}"
+        # Real bug caught via a live GPU traceback: comfy.utils.load_torch_file
+        # always loads onto CPU, and the new proj/ref_attn modules were never
+        # moved onto the model's actual device afterward - fine on this
+        # CPU-only test environment even without the fix (nothing here
+        # actually exercises a CPU/CUDA mismatch), but this assertion locks
+        # in the invariant (".to(device=model's device)" was actually
+        # called) so a regression removing that call doesn't silently pass
+        # here even though it can't reproduce the original crash without a
+        # second real device to test against.
+        model_device = next(dm.parameters()).device
+        assert next(dm.editanything_ref_visual_proj.parameters()).device == model_device
+        assert next(dm.editanything_ref_adaln_proj.parameters()).device == model_device
+        for b in dm.transformer_blocks:
+            if hasattr(b, "ref_attn"):
+                assert next(b.ref_attn.parameters()).device == model_device
         # _prepare_timestep patch applied and callable
         dm._editanything_ref_adaln = torch.randn(1, 6 * hidden)
         ts, _, _ = dm._prepare_timestep(torch.zeros(1), 1, torch.float32)

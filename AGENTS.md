@@ -3108,3 +3108,57 @@ link/slot-crosscheck script used for the earlier `model`-input fix.
 `tools/smoke_ltx23_vid2vid.py` call sites updated (`image=` ->
 `images=`); 8/8 pass; 6/6 `smoke_ltx23_editanything.py` and 84/84
 `pytest tests/` unaffected.
+
+## EditAnything device-placement bug fixed (first real GPU run) (2026-08-28)
+
+User's own `ltxv_v2v_test.json` had also gone stale across every rename
+this session (predates even the original `video_guide`->`ic_lora`
+rename) - fixed the same way as `LTX-2.3_V2V_Simple.json`: renamed
+`image`->`images`/`video_guide`->`ic_lora`/`hold_audio`->
+`keep_original_audio`, added the new required `model`/`mode` inputs,
+rewired the model chain through node 2 (previously the loaded TalkVid
+LoRA fed `LTXV23KSampler` directly, bypassing `LTXV23VidToVideo`
+entirely), and replaced a node whose type had decayed into an
+unresolvable raw UUID (`cnr_id: "comfy-core"`, inputs not matching this
+pack's real `LTXV23AVDecode` at all) with a fresh real instance. Also
+set `ic_lora="none"` rather than pointing it at TalkVid (a lip-sync
+ID-LoRA, never a valid IC-LoRA guide-append task adapter - carrying that
+forward would preserve a bug, not fix one), then - per the user's
+explicit "fix this workflow properly," not another round of asking -
+wired `editanything_lora`/`editanything_module_path` to the real files
+and confirmed `images` was already connected to the workflow's
+`LoadImage` node, so it actually attempts the EditAnything insert this
+time instead of doing nothing.
+
+Running it for the first time on real GPU hardware surfaced a real bug,
+immediately: `RuntimeError: Expected all tensors to be on the same
+device, but got mat1 is on cuda:0, different from other tensors on cpu`,
+inside `_EditAnythingRefVisualProj.forward`'s `self.fc1(tokens)` call.
+Root cause, confirmed from the traceback: `comfy.utils.load_torch_file()`
+(used in `_install_editanything_module`) always loads onto CPU
+regardless of where the rest of the model actually lives, and the newly
+attached `editanything_ref_visual_proj`/`editanything_ref_adaln_proj`/
+per-block `ref_attn` modules were never moved onto the model's real
+device afterward - `ref_latent` explicitly gets moved to
+`comfy.model_management.get_torch_device()` a few lines later in
+`_apply_editanything_patch`, so the mismatch was inevitable the moment
+this ran on a real CUDA model instead of the CPU-only smoke tests.
+Fixed in `_install_editanything_module`: `target_device =
+next(dm.parameters()).device` (the model's own real weights, already
+correctly placed), then `.to(device=target_device)` on all three newly
+constructed submodules. Confirmed safe via `_EditAnythingLoRALinear`'s
+`base_linear` (`object.__setattr__`, deliberately NOT a registered
+submodule - `.to()` correctly skips it, since it's a shared reference to
+the model's own already-placed `attn2` linear, not new state).
+
+Added a device-consistency assertion to
+`test_install_editanything_module_end_to_end` in
+`tools/smoke_ltx23_editanything.py`, explicitly noting its real
+limitation in a comment: the sandboxed test environment is CPU-only, so
+this can't reproduce the original crash (nothing here exercises an
+actual CPU/CUDA boundary) - it only locks in that the `.to(device=...)`
+call itself keeps happening, so a future regression removing it doesn't
+silently pass. **The only real verification for this fix is the user's
+own GPU run** - CPU smoke tests structurally cannot catch a
+device-placement bug by themselves, which is exactly how this one
+shipped in the first place despite passing every existing test.
