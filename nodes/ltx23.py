@@ -609,6 +609,9 @@ class LTXV23EditAnythingPatch:
                 "vae": ("VAE", {"tooltip": "Video VAE - encodes reference_image into "
                                 "the same latent space the module's proj layers expect."}),
                 "reference_image": ("IMAGE", {"tooltip": "The person/subject to inject. "
+                                    "A batch of N images gives N distinct references, one "
+                                    "per generation in the sampling batch (tiled/truncated "
+                                    "to fit) - see reference_mode for the vid2vid case. "
                                     "Wire this SAME image into LTXV23VidToVideo's `image` "
                                     "input too - this node only adds the two extra "
                                     "conditioning paths, the guide-token append is "
@@ -616,18 +619,42 @@ class LTXV23EditAnythingPatch:
                 "module_path": (folder_paths.get_filename_list("ltxv23_edit_anything"), {
                     "tooltip": "The EditAnything .module.safetensors file (NOT the "
                                "LoRA - that loads separately via LoraLoaderModelOnly)."}),
+                "reference_mode": (["per_batch_item", "first_frame_only"], {
+                    "default": "per_batch_item",
+                    "tooltip": "per_batch_item: each image in reference_image's batch is "
+                               "encoded and used as its OWN distinct reference (not "
+                               "blended) - image i drives sample i of the sampling batch, "
+                               "tiled/truncated if the counts don't match. "
+                               "first_frame_only: use only reference_image[0], ignore the "
+                               "rest - the vid2vid recipe (one clean reference identity "
+                               "against a single video), avoids a mismatched-count surprise "
+                               "when reference_image's batch isn't meant to map 1:1 onto "
+                               "the sampling batch."}),
             },
         }
 
     @torch.inference_mode()
-    def patch(self, model, vae, reference_image, module_path):
+    def patch(self, model, vae, reference_image, module_path, reference_mode="per_batch_item"):
         m = model.clone()
         _install_editanything_module(m, folder_paths.get_full_path_or_raise(
             "ltxv23_edit_anything", module_path))
         dm = m.model.diffusion_model
 
         pixels = reference_image[:, :, :, :3]
-        ref_latent = vae.encode(pixels)
+        if reference_mode == "first_frame_only":
+            if pixels.shape[0] > 1:
+                logger.info("LTX-2.3 EditAnything: reference_mode=first_frame_only, "
+                            "using only the first of %d images", pixels.shape[0])
+            pixels = pixels[:1]
+
+        # vae.encode() always collapses its input batch axis into TEMPORAL
+        # FRAMES of one video (comfy/sd.py VAE.encode, output batch dim
+        # forced to 1) - there is no single call that returns N independent
+        # per-image latents. Encode one image at a time instead, so each
+        # reference stays its own real batch item rather than being averaged
+        # into one blurry blend.
+        ref_latents = [vae.encode(pixels[i:i + 1]) for i in range(pixels.shape[0])]
+        ref_latent = torch.cat(ref_latents, dim=0)
         ref_latent = m.model.process_latent_in(ref_latent).to(
             device=comfy.model_management.get_torch_device())
 
@@ -635,19 +662,21 @@ class LTXV23EditAnythingPatch:
         ref_context = dm.editanything_ref_visual_proj(
             ref_latent.to(dtype=visual_param.dtype)).detach()
         adaln_param = next(dm.editanything_ref_adaln_proj.parameters())
-        dm._editanything_ref_adaln = dm.editanything_ref_adaln_proj(
+        ref_adaln = dm.editanything_ref_adaln_proj(
             ref_latent.to(dtype=adaln_param.dtype)).detach()
 
         def wrapper(executor, x, timesteps, context, attention_mask, frame_rate=25,
                     transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
             transformer_options = dict(transformer_options)
-            transformer_options["editanything_ref_context"] = ref_context
+            transformer_options["editanything_ref_context"] = _match_batch(ref_context, x.shape[0])
+            dm._editanything_ref_adaln = _match_batch(ref_adaln, x.shape[0])
             return executor(x, timesteps, context, attention_mask, frame_rate,
                             transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
 
         m.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "editanything_ref", wrapper)
-        logger.info("LTX-2.3 EditAnything: patch applied, reference %s", tuple(pixels.shape))
+        logger.info("LTX-2.3 EditAnything: patch applied, %d reference(s) (%s), shape %s",
+                    pixels.shape[0], reference_mode, tuple(pixels.shape))
         return (m,)
 
 

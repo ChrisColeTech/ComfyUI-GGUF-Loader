@@ -227,9 +227,154 @@ def test_install_editanything_module_end_to_end():
           "in-range blocks), _prepare_timestep wrapped correctly")
 
 
+def _make_installed_fake_model(hidden=DIM, channels=16, rank=8, n_ref_blocks=(12, 20)):
+    """A fake ModelPatcher already through _install_editanything_module,
+    for exercising LTXV23EditAnythingPatch.patch() itself (not just the
+    lower-level pieces) without needing a real 450MB module file or a real
+    VAE/checkpoint."""
+
+    class _FakeDiffusionModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = torch.nn.ModuleList(
+                [_make_block(i) for i in range(36)])
+
+        def _prepare_timestep(self, timestep, batch_size, hidden_dtype, **kwargs):
+            return _fake_timestep(batch_size), None, None
+
+    class _FakeModelPatcher:
+        def __init__(self):
+            self.model = types.SimpleNamespace(
+                diffusion_model=_FakeDiffusionModel(), process_latent_in=lambda x: x)
+            self._wrappers = {}
+
+        def clone(self):
+            return self
+
+        def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+            self._wrappers[key] = wrapper
+
+    sd = {}
+    sd["ref_visual_proj.fc1.weight"] = torch.randn(32, 3 * channels)
+    sd["ref_visual_proj.fc1.bias"] = torch.randn(32)
+    sd["ref_visual_proj.proj.weight"] = torch.randn(hidden, 32)
+    sd["ref_visual_proj.proj.bias"] = torch.randn(hidden)
+    sd["ref_visual_proj.norm.weight"] = torch.randn(hidden)
+    sd["ref_visual_proj.norm.bias"] = torch.randn(hidden)
+    sd["ref_visual_proj.pos_embed"] = torch.randn(1, 32, hidden)
+    sd["ref_adaln_proj.fc1.weight"] = torch.randn(32, 6 * channels)
+    sd["ref_adaln_proj.fc1.bias"] = torch.randn(32)
+    sd["ref_adaln_proj.proj.weight"] = torch.randn(6 * hidden, 32)
+    sd["ref_adaln_proj.proj.bias"] = torch.randn(6 * hidden)
+    for idx in n_ref_blocks:
+        p = f"diffusion_model.transformer_blocks.{idx}.ref_attn."
+        for name in ("to_q", "to_k", "to_v", "to_out.0"):
+            sd[f"{p}{name}.lora_A.weight"] = torch.randn(rank, hidden)
+            sd[f"{p}{name}.lora_B.weight"] = torch.randn(hidden, rank)
+
+    tmp_path = Path(__file__).resolve().parent / "_scratch_editanything_patch.safetensors"
+    save_file(sd, str(tmp_path))
+    model = _FakeModelPatcher()
+    ltx23._install_editanything_module(model, str(tmp_path))
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
+    return model
+
+
+class _FakeVAE:
+    """Encodes each call's image batch to a distinguishable, per-image
+    latent (mean == the image's own fill value) so per-item vs. blended
+    behavior can be told apart without a real VAE."""
+
+    def __init__(self, channels=16):
+        self.channels = channels
+        self.encode_call_batch_sizes = []
+
+    def encode(self, pixels):
+        self.encode_call_batch_sizes.append(pixels.shape[0])
+        fill = pixels.mean(dim=(1, 2, 3)).view(-1, 1, 1, 1, 1)
+        return fill.expand(pixels.shape[0], self.channels, 1, 4, 4).clone()
+
+
+def _patch_with_preinstalled_model(node, model, vae, ref_images, reference_mode):
+    # model is already through _install_editanything_module (see
+    # _make_installed_fake_model) - stub out patch()'s own
+    # (re-)installation step, which needs a real file on disk we don't
+    # have here, without touching the LOGIC under test (the encode/mode
+    # handling that follows it).
+    orig_install = ltx23._install_editanything_module
+    orig_get_path = folder_paths.get_full_path_or_raise
+    ltx23._install_editanything_module = lambda m, path: None
+    folder_paths.get_full_path_or_raise = lambda folder, filename: filename
+    try:
+        return node.patch(model, vae, ref_images, "unused.safetensors",
+                          reference_mode=reference_mode)
+    finally:
+        ltx23._install_editanything_module = orig_install
+        folder_paths.get_full_path_or_raise = orig_get_path
+
+
+def test_patch_per_batch_item_mode_gives_each_image_its_own_reference():
+    model = _make_installed_fake_model()
+    vae = _FakeVAE()
+    node = ltx23.LTXV23EditAnythingPatch()
+
+    # three images, each a distinct flat color -> distinct encode() fill value
+    ref_images = torch.stack([
+        torch.full((8, 8, 3), 0.1), torch.full((8, 8, 3), 0.5), torch.full((8, 8, 3), 0.9),
+    ])
+    patched, = _patch_with_preinstalled_model(node, model, vae, ref_images, "per_batch_item")
+
+    # vae.encode() called once PER IMAGE, never once for the whole batch -
+    # proves images aren't collapsed into temporal frames of one encode call
+    assert vae.encode_call_batch_sizes == [1, 1, 1], (
+        f"expected 3 separate single-image encode() calls, got {vae.encode_call_batch_sizes}")
+
+    wrapper = patched._wrappers["editanything_ref"]
+
+    # call the wrapper directly with a 3-item sampling batch matching the
+    # 3 references 1:1, and confirm each one is DISTINCT (not averaged)
+    seen_contexts = []
+
+    def spy_executor(x, timesteps, context, attention_mask, frame_rate=25,
+                     transformer_options=None, keyframe_idxs=None, denoise_mask=None, **kw):
+        seen_contexts.append(transformer_options["editanything_ref_context"])
+        return x
+
+    x = torch.randn(3, 5, DIM)
+    wrapper(spy_executor, x, None, None, None)
+    ref_ctx = seen_contexts[0]
+    assert ref_ctx.shape[0] == 3
+    assert not torch.allclose(ref_ctx[0], ref_ctx[1])
+    assert not torch.allclose(ref_ctx[1], ref_ctx[2])
+    print("[ok] LTXV23EditAnythingPatch reference_mode=per_batch_item: 3 images encoded "
+          "separately (not blended into one video's frames), each sampling-batch item "
+          "gets its own distinct reference context")
+
+
+def test_patch_first_frame_only_mode_uses_only_first_image():
+    model = _make_installed_fake_model()
+    vae = _FakeVAE()
+    node = ltx23.LTXV23EditAnythingPatch()
+
+    ref_images = torch.stack([
+        torch.full((8, 8, 3), 0.1), torch.full((8, 8, 3), 0.5), torch.full((8, 8, 3), 0.9),
+    ])
+    patched, = _patch_with_preinstalled_model(node, model, vae, ref_images, "first_frame_only")
+
+    assert vae.encode_call_batch_sizes == [1], (
+        f"expected exactly 1 encode() call (first image only), got {vae.encode_call_batch_sizes}")
+    print("[ok] LTXV23EditAnythingPatch reference_mode=first_frame_only: only the first "
+          "of 3 images is ever encoded")
+
+
 if __name__ == "__main__":
     test_patched_forward_matches_original_when_no_reference()
     test_patched_forward_applies_residual_only_in_range_and_when_present()
     test_ref_visual_proj_and_adaln_proj_shapes()
     test_install_editanything_module_end_to_end()
+    test_patch_per_batch_item_mode_gives_each_image_its_own_reference()
+    test_patch_first_frame_only_mode_uses_only_first_image()
     print("[ok] all smoke_ltx23_editanything tests passed")

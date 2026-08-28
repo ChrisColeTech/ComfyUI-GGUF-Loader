@@ -2874,3 +2874,59 @@ CPU-only verification status and the same open risk: the real
 Wan2GP's, not confirmed against the actual downloaded file's real key
 names. Stage 1 (masked person-removal, Laplacian-pyramid blend) is
 planned but not yet built in this repo.
+
+## LTXV23EditAnythingPatch: real multi-image reference support (2026-08-28)
+
+User caught a real bug testing the node: `reference_image` accepted a
+batch of images without erroring, but the result silently behaved as if
+only one image mattered. Traced to the actual mechanism: comfy's video
+VAE `.encode()` (`comfy/sd.py:1358-1367`, read directly this session)
+always collapses its input pixel batch into TEMPORAL FRAMES of one
+video - the output batch dim is forced to 1, there's no single call that
+returns N independent per-image latents - and
+`_EditAnythingRefVisualProj`/`_EditAnythingRefAdaLNProj` both started
+with `ref_latent.mean(dim=2)`, blending whatever frames came out of that
+one encode call into one blurry averaged identity. Not a crash, just
+silently wrong for a genuine multi-photo batch.
+
+User's direction: "if there is no technical limitation to using multiple
+images then just do it... if you cant do it or its not possible, there
+should be a dropdown or toggle... if its vid2vid it should use the first
+image and say so." Confirmed via the VAE source there IS no technical
+limitation - `vae.encode()` can just be called once per image (each call
+naturally returns its own real batch-dim-1 latent), then concatenated
+into a genuine multi-item batch.
+
+Implemented: `patch()` now loops `vae.encode(pixels[i:i+1])` per image
+and `torch.cat`s the results, instead of one `vae.encode(pixels)` call
+on the whole batch - real distinct per-image latents, never blended.
+New `reference_mode` input (`ltx23.py` `INPUT_TYPES`): `per_batch_item`
+(default, each image drives its own sample in the generation batch,
+`_match_batch`-tiled to fit) or `first_frame_only` (vid2vid recipe -
+`reference_image[0]` only, extras dropped with a clear `logger.info`).
+`ref_context`/`ref_adaln` batch-matching moved INTO the
+`DIFFUSION_MODEL` wrapper (reads the real `x.shape[0]` at the moment
+sampling actually calls the model, not assumed ahead of time from
+`patch()`'s own inputs) - `dm._editanything_ref_adaln` is now set inside
+the wrapper closure per call instead of once outside it.
+
+Two new tests in `tools/smoke_ltx23_editanything.py`
+(`test_patch_per_batch_item_mode_gives_each_image_its_own_reference`,
+`test_patch_first_frame_only_mode_uses_only_first_image`), using a fake
+VAE whose `encode()` returns a per-image-distinguishable latent (mean ==
+the image's own fill color) specifically so blended-vs-distinct is
+provable, not just shape-checked: confirms 3 images produce 3 separate
+`encode()` calls (never one batched call), the resulting reference
+contexts are numerically distinct per image (not `torch.allclose`),
+and `first_frame_only` calls `encode()` exactly once regardless of batch
+size. 6/6 EditAnything tests, 4/4 `smoke_ltx23_vid2vid.py`, 84/84
+`pytest tests/` all pass. `README.md`'s EditAnything section updated to
+document `reference_mode`.
+
+A parallel agent was dispatched to port the identical fix (two-mode
+per-image batching, same VAE-collapsing root cause verified
+independently against that project's own VAE code rather than assumed
+transferable) into `D:\Projects\giga-videos`'s comfy-free port of the
+same mechanism, plus wire the feature into that project's live API/UI
+surface and exercise it through its fileserver/sidecar - not yet
+reported back as of this entry.
