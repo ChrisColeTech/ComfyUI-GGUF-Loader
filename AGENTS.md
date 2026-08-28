@@ -3339,3 +3339,95 @@ source directly per-failure, never guessable from the base
 tests by construction. Still unverified past this point - the next
 failure, if any, is now inside the actual per-block ref_attn residual
 add or the block's own attention math, genuinely new territory.
+## EditAnything: wrong block class entirely - BasicAVTransformerBlock, not BasicTransformerBlock (sixth real GPU run) (2026-08-28)
+
+Predicted correctly (again) - sixth real GPU run got past the
+`_prepare_timestep` fix and crashed one call deeper, inside the actual
+per-block forward: `TypeError: _patched_block_forward() got an
+unexpected keyword argument 'v_context'`.
+
+This was the big one. Confirmed via direct read of
+`comfy/ldm/lightricks/av_model.py:997` (`_process_transformer_blocks`
+calling `block((vx, ax), v_context=..., a_context=..., ...)`) that this
+pack's real production models ALWAYS use the joint AV model, and its
+per-layer blocks are `BasicAVTransformerBlock` - a genuinely different,
+much larger class than `BasicTransformerBlock`, with its own
+`attn1`/`audio_attn1`, `attn2`/`audio_attn2`,
+`audio_to_video_attn`/`video_to_audio_attn` (cross-modal attention),
+`ff`/`audio_ff`, separate video/audio ADaLN tables, and a completely
+different forward signature (17 params: `v_context`, `a_context`,
+`v_timestep`, `a_timestep`, `v_pe`, `a_pe`, `v_cross_pe`, `a_cross_pe`,
+4 cross-attention timestep params, `v_prompt_timestep`,
+`a_prompt_timestep`, ...). `_patched_block_forward` (the ENTIRE port up
+to this point) was built against the wrong class - every one of the
+five prior GPU-only fixes this session got the wrapper/prep-timestep
+boundary code right, but the actual per-block patching was never going
+to work regardless, since `dm.transformer_blocks[i]` was never really a
+`BasicTransformerBlock` in this pack's real usage. Every CPU test in
+this file was ALSO built against the wrong class (`ltx_model
+.BasicTransformerBlock`), which is exactly why this went undetected
+through five rounds of fixes.
+
+Added `_patched_av_block_forward` - a faithful line-for-line copy of
+the REAL `BasicAVTransformerBlock.forward` (`av_model.py:260-389`,
+read in full), with the ref_attn residual inserted on `vx` (video)
+only, positioned after ALL of video's attention updates (self-attn,
+text cross-attn, audio↔video cross-attn) and before video's own
+feedforward - the natural generalization of Wan2GP's "after attn2,
+before feed-forward" placement to this block's extra audio-cross-
+attention stage in between. `audio`/`ax` is never touched anywhere in
+the addition, matching EditAnything being a purely visual signal.
+`_install_editanything_module` now duck-types each block
+(`hasattr(block, "audio_attn1")`) to bind the correct patched-forward
+variant - AV vs base - rather than assuming one or the other.
+`_patched_block_forward` (base class) is kept as-is for correctness/
+completeness, but this pack's real usage never actually exercises it.
+
+Given this is the single largest and most error-prone hand-copy in the
+whole port, added REAL bitwise-identity tests against the actual
+`av_model.BasicAVTransformerBlock` (not the base class) for the first
+time -
+`test_patched_av_forward_matches_original_when_no_reference` and
+`test_patched_av_forward_applies_residual_to_video_only` - both of
+which immediately caught real issues before this ever reached the
+user's GPU again:
+
+1. The FIRST bitwise-identity attempt failed deterministically (not
+   flaky) - genuinely required, since this is brand new, previously
+   never-exercised code.
+2. After that passed, discovered the SAME external `comfy_kitchen`
+   kernel nondeterminism from earlier sessions is **process-sticky**
+   here too (confirmed via direct measurement: retrying with fresh
+   weight draws within one process either always succeeds or always
+   fails, ~30% of process runs land in "always fails" - not
+   per-attempt-random, so more retries alone cannot fix it). Fixed by
+   adding a REAL-vs-REAL preflight before each attempt's actual
+   comparison (comfy's own unpatched code, called twice independently,
+   same weights) - if the environment can't even reproduce itself this
+   attempt, the attempt is skipped as inconclusive rather than
+   misreported as a port bug; the test only asserts once a
+   internally-consistent baseline is found, or prints `[skip]` (not a
+   failure) if the whole run never gets one.
+3. Found a SEPARATE real issue in `_make_av_block`/`_make_av_inputs`
+   (not a bug in the actual port): freshly constructed `nn.Module`s
+   default to TRAINING mode, and something RNG-consuming in that mode
+   (confirmed via direct measurement: fixed 20/20 mismatches down to
+   0/20) let the with-ref-context call consume different amounts of
+   random state than the no-ref call before reaching audio's own
+   computation, desyncing `ax` under a shared `torch.manual_seed` even
+   though the code never touches audio - not evidence of a real
+   cross-modal bug, purely a test-setup gap. Fixed with `.eval()` on
+   both `_make_block` and `_make_av_block`, matching how this pack's
+   real inference always runs. Also confirmed a second, real,
+   architectural fact along the way (not a bug): `ax` genuinely depends
+   on `vx` through the `video_to_audio_attn` cross-modal path
+   (`vx_scaled`, itself computed via the flaky kernel, is v2a's
+   context) - `.eval()` alone turned out sufficient to fully stabilize
+   it without needing to disable that path.
+
+25/25 real runs clean after all fixes (0 hard failures; a handful of
+honest `[skip]`s on process-sticky-flaky runs, never a false pass or
+false fail). 8/8 `smoke_ltx23_vid2vid.py`, 84/84 `pytest tests/`
+unaffected. `README.md` updated to describe the AV-vs-base block
+distinction and the full six-bug real-GPU-debugging arc.
+

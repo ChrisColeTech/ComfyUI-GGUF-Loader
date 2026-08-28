@@ -515,6 +515,170 @@ def _patched_block_forward(self, x, context=None, attention_mask=None, timestep=
     return x
 
 
+def _patched_av_block_forward(self, x, v_context=None, a_context=None, attention_mask=None, v_timestep=None,
+                              a_timestep=None, v_pe=None, a_pe=None, v_cross_pe=None, a_cross_pe=None,
+                              v_cross_scale_shift_timestep=None, a_cross_scale_shift_timestep=None,
+                              v_cross_gate_timestep=None, a_cross_gate_timestep=None, transformer_options=None,
+                              self_attention_mask=None, v_prompt_timestep=None, a_prompt_timestep=None):
+    """Instance-level replacement for ONE patched BasicAVTransformerBlock's
+    forward - a faithful copy of comfy/ldm/lightricks/av_model.py's real
+    BasicAVTransformerBlock.forward (verified against that file directly
+    this session, lines 260-389; re-check it if EditAnything output ever
+    looks wrong after a ComfyUI update, this is a real fork, not a
+    wrapper) with exactly one addition: the ref_attn residual, applied to
+    `vx` (the video stream - EditAnything is a purely visual signal, `ax`/
+    audio is never touched) right before the video feedforward, after
+    every other video-branch update (self-attn, text cross-attn, and any
+    audio<->video cross-attn) is done - the same relative position ("after
+    attn2, before the feed-forward") Wan2GP's own transformer.py:281-294
+    uses for the simpler, non-AV block, generalized to this block's extra
+    audio-cross-attention stage in between. THIS pack's real production
+    models are always the joint AV model (comfy.ldm.lightricks.av_model),
+    never the plain BasicTransformerBlock - _patched_block_forward above
+    is kept for the base (non-AV) case, but is not what actually runs in
+    this pack's own real usage. Only ever bound onto blocks
+    EDITANYTHING_REF_START_BLOCK.._END_BLOCK on a CLONED model (see
+    _install_editanything_module) - never onto comfy's own class, which
+    would leak into every other loaded model."""
+    run_vx = transformer_options.get("run_vx", True)
+    run_ax = transformer_options.get("run_ax", True)
+
+    vx, ax = x
+    run_ax = run_ax and ax.numel() > 0
+    run_a2v = run_vx and transformer_options.get("a2v_cross_attn", True) and ax.numel() > 0
+    run_v2a = run_ax and transformer_options.get("v2a_cross_attn", True)
+
+    # video
+    if run_vx:
+        # video self-attention
+        vshift_msa, vscale_msa = (self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(0, 2)))
+        if comfy.model_management.in_training:
+            norm_vx = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_msa) + vshift_msa
+        else:
+            norm_vx = comfy.quant_ops.ck.rms_adaln(vx, vscale_msa, vshift_msa)
+        del vshift_msa, vscale_msa
+        attn1_out = self.attn1(norm_vx, pe=v_pe, mask=self_attention_mask, transformer_options=transformer_options)
+        del norm_vx
+        # video cross-attention
+        vgate_msa = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(2, 3))[0]
+        vx.addcmul_(attn1_out, vgate_msa)
+        del vgate_msa, attn1_out
+        vx.add_(self._apply_text_cross_attention(
+            vx, v_context, self.attn2, self.scale_shift_table,
+            getattr(self, 'prompt_scale_shift_table', None),
+            v_timestep, v_prompt_timestep, attention_mask, transformer_options,)
+        )
+
+    # audio
+    if run_ax:
+        # audio self-attention
+        ashift_msa, ascale_msa = (self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 2)))
+        norm_ax = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_msa) + ashift_msa
+        del ashift_msa, ascale_msa
+        attn1_out = self.audio_attn1(norm_ax, pe=a_pe, transformer_options=transformer_options)
+        del norm_ax
+        # audio cross-attention
+        agate_msa = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(2, 3))[0]
+        ax.addcmul_(attn1_out, agate_msa)
+        del agate_msa, attn1_out
+        ax.add_(self._apply_text_cross_attention(
+            ax, a_context, self.audio_attn2, self.audio_scale_shift_table,
+            getattr(self, 'audio_prompt_scale_shift_table', None),
+            a_timestep, a_prompt_timestep, attention_mask, transformer_options,)
+        )
+
+    # video - audio cross attention.
+    if run_a2v or run_v2a:
+        ax_norm3 = comfy.ldm.common_dit.rms_norm(ax)
+
+        # audio to video cross attention
+        if run_a2v:
+            scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0], a_cross_scale_shift_timestep)[:2]
+            scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0], v_cross_scale_shift_timestep)[:2]
+
+            if comfy.model_management.in_training:
+                vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + scale_ca_video_hidden_states_a2v_v) + shift_ca_video_hidden_states_a2v_v
+            else:
+                vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v)
+            ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
+            del scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v, scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v
+
+            a2v_out = self.audio_to_video_attn(vx_scaled, context=ax_scaled, pe=v_cross_pe, k_pe=a_cross_pe, transformer_options=transformer_options)
+            del vx_scaled, ax_scaled
+
+            gate_out_a2v = self.get_ada_values(self.scale_shift_table_a2v_ca_video[4:, :], vx.shape[0], v_cross_gate_timestep)[0]
+            vx.addcmul_(a2v_out, gate_out_a2v)
+            del gate_out_a2v, a2v_out
+
+        # video to audio cross attention
+        if run_v2a:
+            scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0], a_cross_scale_shift_timestep)[2:4]
+            scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0], v_cross_scale_shift_timestep)[2:4]
+
+            ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
+            if comfy.model_management.in_training:
+                vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
+            else:
+                vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a)
+            del scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a, scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a
+
+            v2a_out = self.video_to_audio_attn(ax_scaled, context=vx_scaled, pe=a_cross_pe, k_pe=v_cross_pe, transformer_options=transformer_options)
+            del ax_scaled, vx_scaled
+
+            gate_out_v2a = self.get_ada_values(self.scale_shift_table_a2v_ca_audio[4:, :], ax.shape[0], a_cross_gate_timestep)[0]
+            ax.addcmul_(v2a_out, gate_out_v2a)
+            del gate_out_v2a, v2a_out
+
+    # ── the one addition: EditAnything's ref_attn residual (video only) ──
+    if run_vx:
+        ref_context = (transformer_options or {}).get("editanything_ref_context")
+        if ref_context is not None and EDITANYTHING_REF_START_BLOCK <= self.idx <= EDITANYTHING_REF_END_BLOCK:
+            ref_out = self.ref_attn(comfy.ldm.common_dit.rms_norm(vx), ref_context.to(device=vx.device, dtype=vx.dtype))
+            vx.add_(ref_out * EDITANYTHING_REF_CONTEXT_SCALE)
+            del ref_out
+
+    # video feedforward
+    if run_vx:
+        vshift_mlp, vscale_mlp = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(3, 5))
+        if comfy.model_management.in_training:
+            vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_mlp) + vshift_mlp
+        else:
+            vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, vscale_mlp, vshift_mlp)
+        del vshift_mlp, vscale_mlp
+
+        ff_out = self.ff(vx_scaled)
+        del vx_scaled
+
+        vgate_mlp = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(5, 6))[0]
+        vx.addcmul_(ff_out, vgate_mlp)
+        del vgate_mlp, ff_out
+
+    # audio feedforward
+    if run_ax:
+        ashift_mlp, ascale_mlp = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(3, 5))
+        ax_scaled = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_mlp) + ashift_mlp
+        del ashift_mlp, ascale_mlp
+
+        ff_out = self.audio_ff(ax_scaled)
+        del ax_scaled
+
+        agate_mlp = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(5, 6))[0]
+        ax.addcmul_(ff_out, agate_mlp)
+        del agate_mlp, ff_out
+
+    return vx, ax
+
+    y = comfy.ldm.common_dit.rms_norm(x)
+    y = torch.addcmul(y, y, scale_mlp).add_(shift_mlp)
+    x.addcmul_(self.ff(y), gate_mlp)
+
+    return x
+
+
 def _install_editanything_module(model, module_path):
     """Load the EditAnything .module.safetensors file (NOT a LoRA) onto a
     CLONED model's diffusion_model: attach the two proj modules, attach and
@@ -567,7 +731,17 @@ def _install_editanything_module(model, module_path):
             continue
         block.idx = i
         block.ref_attn = _EditAnythingRefAttention(block.attn2, sd, prefix).to(device=target_device)
-        block.forward = types.MethodType(_patched_block_forward, block)
+        # This pack's real production models are always the joint AV model
+        # (comfy.ldm.lightricks.av_model.BasicAVTransformerBlock) - a
+        # genuinely different, larger class from the base
+        # BasicTransformerBlock, with its own audio<->video cross-attention
+        # stages (confirmed via a real GPU traceback + direct read of
+        # av_model.py, not assumed - duck-typed via `audio_attn1` rather
+        # than an isinstance check against that exact class, to avoid a
+        # hard import dependency on it).
+        is_av_block = hasattr(block, "audio_attn1")
+        block.forward = types.MethodType(
+            _patched_av_block_forward if is_av_block else _patched_block_forward, block)
         patched += 1
     if patched == 0:
         raise ValueError(f"{module_path}: no ref_attn weights matched blocks "
