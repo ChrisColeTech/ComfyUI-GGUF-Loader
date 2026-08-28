@@ -498,6 +498,205 @@ class LTXV23ImgToVideo:
         return (positive, negative, latent)
 
 
+class LTXV23VidToVideo:
+    """Prompts + init latent for LTX-2.3 video-to-video via IC-LoRA guide injection.
+
+    An IC-LoRA (in-context LoRA) task adapter - beard removal, HDR grading,
+    motion tracking, any LTX-2.3 IC-LoRA trained on whole-video reference
+    conditioning - needs the source video's own frames appended as extra
+    "guide" tokens the model attends to at the SAME timeline position as
+    what it's generating (comfy-core's keyframe_idxs RoPE mechanism,
+    comfy_extras/nodes_lt.py's LTXVAddGuide). That is a genuinely different
+    thing from `images` on Krea2Img2Img/LTXV23ImgToVideo's `image` (both of
+    those partially denoise or hold a copy of the source; this APPENDS a
+    whole separate reference block the target cross-attends to, then a crop
+    step removes it again after sampling) - hence its own node rather than a
+    toggle bolted onto LTXV23ImgToVideo.
+
+    This node calls comfy-core's real LTXVAddGuide.get_latent_index()/
+    append_keyframe() directly (comfy_extras.nodes_lt, always present
+    regardless of any custom_nodes pack's state) rather than re-deriving the
+    RoPE coordinate math by hand - the same call the official Lightricks
+    IC-LoRA nodes make internally (ComfyUI-LTXVideo/iclora.py), just wired
+    into this pack's own joint-AV-latent convention
+    (comfy.nested_tensor.NestedTensor((video, audio)), matching
+    LTXV23ImgToVideo) instead of the ~10-node chain
+    (ResizeImageMaskNode -> GetImageSize -> EmptyLTXVLatentVideo ->
+    LTXVConditioning -> LTXAddVideoICLoRAGuide -> VAEEncodeAudio ->
+    LTXVSetAudioRefTokens -> LTXVConcatAVLatent) the official example
+    workflows wire by hand. `frame_idx` is always 0 (guide spans the whole
+    clip from the start) - the only sensible mode for a plain vid2vid node;
+    an offset guide needs the raw core/Lightricks nodes directly.
+
+    `video_guide=True` (default) is the actual vid2vid mechanism - without a
+    matching IC-LoRA loaded on `model` (stock LoraLoaderModelOnly, loaded
+    separately - this node never touches `model`), the extra reference is
+    inert, same as Krea2Img2Img's `identity_edit` toggle needing its LoRA
+    loaded separately too. `video_guide=False` skips it entirely: plain T2V
+    from the prompt, source video ignored for guidance (still used for
+    output size/frame_rate, and for held audio unless `hold_audio` is also
+    off) - useful for A/B-ing whether the IC-LoRA is doing anything.
+
+    Feed the outputs into LTXV23KSampler UNCHANGED - it already samples any
+    joint AV latent + noise mask generically, so no custom sampler is
+    needed here. Then LTXV23CropVideoGuide before LTXV23AVDecode to strip
+    the reference frames back out.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Video to Video (IC-LoRA) ⚡"
+    SEARCH_ALIASES = ['video to video', 'vid2vid', 'v2v', 'ic-lora', 'ic lora',
+                       'video guide', 'video conditioning']
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
+    RETURN_NAMES = ("positive", "negative", "latent", "frame_rate")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Prompts and init latent for LTX-2.3 video-to-video via "
+                   "IC-LoRA guide injection. Load the task IC-LoRA separately "
+                   "(stock LoraLoaderModelOnly) before this. Feed into "
+                   "LTXV23KSampler, then LTXV23CropVideoGuide before "
+                   "LTXV23AVDecode.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "The source clip to transform."}),
+                "clip": ("CLIP",),
+                "vae": ("VAE", {"tooltip": "The loader's video_vae output."}),
+                "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True,
+                                      "tooltip": "Describe the OUTPUT you want - most "
+                                                 "IC-LoRAs are trained on an instruction-"
+                                                 "style caption describing the transformed "
+                                                 "result, matching framing/motion/identity "
+                                                 "to the source."}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "short_side": ("INT", {"default": 544, "min": 64, "max": nodes.MAX_RESOLUTION,
+                                       "step": 32,
+                                       "tooltip": "Resize the source video's shorter dimension "
+                                                  "to this (aspect-preserving, lanczos) before "
+                                                  "encoding - matches the official IC-LoRA "
+                                                  "workflows' own preprocessing."}),
+                "video_guide": ("BOOLEAN", {"default": True,
+                                "tooltip": "Inject the source video as an IC-LoRA reference "
+                                           "(the actual vid2vid mechanism - needs a matching "
+                                           "IC-LoRA loaded on model). Off = plain T2V from the "
+                                           "prompt, source video ignored for guidance (still "
+                                           "used for output size/frame_rate/held audio unless "
+                                           "those are also off)."}),
+                "guide_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                                   "tooltip": "video_guide only. How strongly the reference is "
+                                              "held. 1.0 = fully held (official default)."}),
+            },
+            "optional": {
+                "hold_audio": ("BOOLEAN", {"default": True,
+                               "tooltip": "Freeze the source video's own audio into the "
+                                          "output (the model generates video to match it, "
+                                          "and it is never itself regenerated). Off = "
+                                          "silent/synthesized audio, like plain T2V."}),
+                "latent_downscale_factor": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0,
+                                            "step": 1.0,
+                                            "tooltip": "Only for IC-LoRAs trained on a "
+                                                       "downscaled reference grid (rare - "
+                                                       "check the LoRA's model card / "
+                                                       "reference_downscale_factor metadata; "
+                                                       "most, including every official "
+                                                       "example, use 1.0)."}),
+            },
+        }
+
+    @torch.inference_mode()
+    def prepare(self, video, clip, vae, audio_vae, prompt, negative_prompt,
+                short_side, video_guide, guide_strength, hold_audio=True,
+                latent_downscale_factor=1.0):
+        components = video.get_components()
+        frames = components.images
+        audio = components.audio
+        frame_rate = float(components.frame_rate)
+
+        n, h, w = frames.shape[0], frames.shape[1], frames.shape[2]
+        scale = short_side / min(h, w)
+        width = max(VIDEO_SPATIAL_RATIO,
+                   round(w * scale / VIDEO_SPATIAL_RATIO) * VIDEO_SPATIAL_RATIO)
+        height = max(VIDEO_SPATIAL_RATIO,
+                    round(h * scale / VIDEO_SPATIAL_RATIO) * VIDEO_SPATIAL_RATIO)
+        resized = comfy.utils.common_upscale(
+            frames.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+
+        length = _align_length(n)
+        t_latent = ((length - 1) // VIDEO_TEMPORAL_RATIO) + 1
+        device = comfy.model_management.intermediate_device()
+        video_samples = torch.zeros(
+            [1, VIDEO_LATENT_CHANNELS, t_latent,
+             height // VIDEO_SPATIAL_RATIO, width // VIDEO_SPATIAL_RATIO], device=device)
+        video_mask = torch.ones((1, 1, t_latent, 1, 1), dtype=torch.float32, device=device)
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
+        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
+
+        if video_guide:
+            import comfy_extras.nodes_lt as nodes_lt
+
+            scale_factors = vae.downscale_index_formula
+            time_scale = scale_factors[0]
+            guide_frames = resized[:((n - 1) // time_scale) * time_scale + 1]
+            target_w = int(width / latent_downscale_factor)
+            target_h = int(height / latent_downscale_factor)
+            guide_pixels = comfy.utils.common_upscale(
+                guide_frames.movedim(-1, 1), target_w, target_h, "bilinear", "center"
+            ).movedim(1, -1)[:, :, :, :3]
+            guide_latent = vae.encode(guide_pixels)
+
+            guide_mask = None
+            if latent_downscale_factor > 1:
+                if width % latent_downscale_factor != 0 or height % latent_downscale_factor != 0:
+                    raise ValueError(
+                        f"LTX-2.3 v2v: target size {width}x{height} must be divisible by "
+                        f"latent_downscale_factor {latent_downscale_factor}.")
+                guide_latent, guide_mask = nodes_lt.LTXVAddGuide.dilate_latent(
+                    guide_latent, latent_downscale_factor)
+
+            frame_idx, _ = nodes_lt.LTXVAddGuide.get_latent_index(
+                positive, t_latent, guide_latent.shape[2], 0, scale_factors,
+                latent_shape=video_samples.shape)
+            positive, negative, video_samples, video_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, frame_idx, video_samples, video_mask, guide_latent,
+                guide_strength, scale_factors, guide_mask=guide_mask,
+                latent_downscale_factor=latent_downscale_factor, causal_fix=True)
+            logger.info("LTX-2.3 v2v: guide %s appended @ strength %.2f (frame_idx=%d)",
+                        tuple(guide_latent.shape), guide_strength, frame_idx)
+        else:
+            logger.info("LTX-2.3 v2v: video_guide=False - plain T2V, source video "
+                        "ignored for guidance")
+
+        fsm = audio_vae.first_stage_model
+        n_latents = int(fsm.num_of_latents_from_frames(length, frame_rate))
+        channels = int(getattr(audio_vae, "latent_channels", fsm.latent_channels))
+        target = [1, channels, n_latents, int(fsm.latent_frequency_bins)]
+        if hold_audio and audio is not None:
+            audio_latent, audio_mask = _encode_reference_audio(
+                audio_vae, audio, length / frame_rate)
+            audio_latent, audio_mask = _fit_audio_latent(audio_latent, audio_mask, target)
+        else:
+            audio_latent = torch.zeros(target, device=device)
+            audio_mask = torch.ones_like(audio_latent)
+
+        latent = {
+            "samples": comfy.nested_tensor.NestedTensor(
+                (video_samples, audio_latent.to(video_samples.device))),
+            "noise_mask": comfy.nested_tensor.NestedTensor(
+                (video_mask, audio_mask.to(video_samples.device))),
+            "downscale_ratio_spacial": VIDEO_SPATIAL_RATIO,
+        }
+        logger.info("LTX-2.3 v2v prep: video %s mask %s, audio %s mask %s%s",
+                    tuple(video_samples.shape), tuple(video_mask.shape),
+                    tuple(audio_latent.shape), tuple(audio_mask.shape),
+                    ", audio held" if hold_audio and audio is not None else "")
+        return (positive, negative, latent, frame_rate)
+
+
 class LTXV23KSampler:
     """Euler on the official LTX-2 distilled schedules.
 
@@ -657,6 +856,79 @@ class LTXV23RefineSampler:
             model, positive, negative, upscaled, refine_seed, refine_steps, cfg,
             sampler_name, refine_schedule, denoise=1.0)
         return (refined,)
+
+
+class LTXV23CropVideoGuide:
+    """Strip the video-guide reference frames LTXV23VidToVideo appended,
+    after sampling and before LTXV23AVDecode.
+
+    A thin wrapper around comfy-core's own LTXVCropGuides (comfy_extras/
+    nodes_lt.py's get_keyframe_idxs) applied to just the video half of the
+    joint AV latent - core's version only understands a plain video latent,
+    not this pack's NestedTensor((video, audio)) convention, so the two
+    streams get split before the crop and rejoined after (same reason
+    _upsample_video_latent above has to do this for the refine sampler's
+    upscale model). A no-op (returns the latent unchanged) when no guide was
+    ever appended (video_guide=False upstream, or nothing to crop) - matches
+    core's own early-return behavior.
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Crop Video Guide ⚡"
+    SEARCH_ALIASES = ['crop guide', 'remove guide', 'strip reference', 'ic-lora',
+                      'vid2vid', 'v2v']
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "crop"
+    DESCRIPTION = ("Strip the video-guide reference frames LTXV23VidToVideo "
+                   "appended, after sampling. No-op if none were appended.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent": ("LATENT",),
+            },
+        }
+
+    def crop(self, positive, negative, latent):
+        import comfy_extras.nodes_lt as nodes_lt
+
+        samples = latent["samples"]
+        if not getattr(samples, "is_nested", False):
+            raise ValueError("LTX-2.3 Crop Video Guide: latent isn't a joint AV "
+                             "latent - expected LTXV23KSampler's output.")
+        video, audio = samples.unbind()
+
+        video_mask = audio_mask = None
+        noise_mask = latent.get("noise_mask")
+        if noise_mask is not None:
+            video_mask, audio_mask = noise_mask.unbind()
+
+        _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video.shape)
+        if num_keyframes == 0:
+            return (positive, negative, latent)
+
+        cropped_video = video[:, :, :-num_keyframes]
+        cropped_mask = video_mask[:, :, :-num_keyframes] if video_mask is not None else None
+
+        positive = node_helpers.conditioning_set_values(
+            positive, {"keyframe_idxs": None, "guide_attention_entries": None})
+        negative = node_helpers.conditioning_set_values(
+            negative, {"keyframe_idxs": None, "guide_attention_entries": None})
+
+        out = latent.copy()
+        out["samples"] = comfy.nested_tensor.NestedTensor((cropped_video, audio))
+        if cropped_mask is not None and audio_mask is not None:
+            out["noise_mask"] = comfy.nested_tensor.NestedTensor((cropped_mask, audio_mask))
+        else:
+            out.pop("noise_mask", None)
+
+        logger.info("LTX-2.3 crop guide: removed %d guide frame(s), video %s -> %s",
+                    num_keyframes, tuple(video.shape), tuple(cropped_video.shape))
+        return (positive, negative, out)
 
 
 class LTXV23AVDecode:
@@ -919,8 +1191,10 @@ class LTXV23IDLoraAssembler:
 NODE_CLASS_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader,
     "LTXV23ImgToVideo": LTXV23ImgToVideo,
+    "LTXV23VidToVideo": LTXV23VidToVideo,
     "LTXV23KSampler": LTXV23KSampler,
     "LTXV23RefineSampler": LTXV23RefineSampler,
+    "LTXV23CropVideoGuide": LTXV23CropVideoGuide,
     "LTXV23AVDecode": LTXV23AVDecode,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
     "LTXV23SpeechBatchSelector": LTXV23SpeechBatchSelector,
@@ -930,8 +1204,10 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader.TITLE,
     "LTXV23ImgToVideo": LTXV23ImgToVideo.TITLE,
+    "LTXV23VidToVideo": LTXV23VidToVideo.TITLE,
     "LTXV23KSampler": LTXV23KSampler.TITLE,
     "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
+    "LTXV23CropVideoGuide": LTXV23CropVideoGuide.TITLE,
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,
     "LTXV23SpeechBatchSelector": LTXV23SpeechBatchSelector.TITLE,

@@ -2627,3 +2627,101 @@ math), so this test's job is narrower but real: catching exactly the class
 of bug that shipped here, a call path that raises before it ever reaches
 comfy's real channel-fixing code. 43/43 Krea2 smoke tests, 84/84 full
 suite.
+
+## LTX-2.3 Video to Video (IC-LoRA) - one node instead of ~10 (2026-08-28)
+
+User's reference: the official example workflow
+`LTX-2.3_V2V_ICLoRA_Single_Stage_Distilled.json` (ComfyUI-LTXVideo's own
+gallery), which wires video-to-video via IC-LoRA across ~10 nodes by hand
+(`ResizeImageMaskNode` -> `GetImageSize` -> `EmptyLTXVLatentVideo` ->
+`LTXVConditioning` -> `LTXAddVideoICLoRAGuide` -> `VAEEncodeAudio` ->
+`LTXVSetAudioRefTokens` -> `LTXVConcatAVLatent` -> `SamplerCustomAdvanced`
+chain -> `LTXVCropGuides` -> `LTXVSeparateAVLatent` -> decode/mux). Asked
+for something Krea2Img2Img's `identity_edit`-shaped: one easy node, a
+switch for the mechanism (not for loading the LoRA itself - that stays
+external, same call the Krea2 toggle made), reusing whatever of this
+pack's existing LTX-2.3 infrastructure already applies rather than
+building a parallel stack from scratch.
+
+Traced the real mechanism from source before writing anything (never
+guessed): comfy-core's `comfy_extras/nodes_lt.py` (`LTXVAddGuide`,
+`LTXVCropGuides`, `get_keyframe_idxs`) - not the third-party
+`ComfyUI-LTXVideo` pack, whose `iclora.py` wraps the exact same core
+calls (confirmed by reading both side by side) and which, on this user's
+own install, currently fails to import at all (a `kornia` version
+mismatch, unrelated to any of this - see `comfyui.log`). Depending on
+comfy-core directly instead of the broken third-party pack was not
+optional here, it was the only import path that actually works in this
+environment. The mechanism itself: the source video's frames get
+VAE-encoded and *appended* (not blended, not replacing) onto the end of
+the target latent, with `keyframe_idxs` RoPE metadata stamped onto the
+conditioning so the model cross-attends to them at the SAME timeline
+position as what it is generating - genuinely different from
+`Krea2Img2Img`/`LTXV23ImgToVideo`'s `image` inputs (partial denoise, or a
+held first frame), which is why this became its own node rather than a
+toggle on `LTXV23ImgToVideo`.
+
+Added two classes to `nodes/ltx23.py`:
+
+- **`LTXV23VidToVideo`** - `video` (VIDEO, e.g. from `LoadVideo`) in,
+  `positive`/`negative`/`latent`/`frame_rate` out. Resizes the source to
+  `short_side` (lanczos, aspect-preserving, matching the official
+  workflows' own preprocessing) internally - no separate resize/GetImageSize
+  nodes needed. `video_guide` (default on) is the actual vid2vid mechanism:
+  calls comfy-core's real `LTXVAddGuide.get_latent_index()`/
+  `append_keyframe()` directly (the same calls the official Lightricks
+  IC-LoRA node makes internally) rather than re-deriving the RoPE
+  coordinate math by hand - that math is exactly the kind of thing this
+  pack's docstrings elsewhere warn is easy to get subtly wrong, so it is
+  delegated to comfy's own proven implementation instead of ported.
+  `frame_idx` is hardcoded to 0 (guide spans the whole clip from the
+  start) - the only sensible mode for a plain vid2vid node; an offset
+  guide still needs the raw core/Lightricks nodes directly. `hold_audio`
+  (default on) reuses this file's own already-proven
+  `_encode_reference_audio`/`_fit_audio_latent` helpers verbatim - freezing
+  the source's own audio into the output is mechanically identical to
+  `LTXV23ImgToVideo`'s `reference_audio` path, just fed the source video's
+  own audio instead of a separate reference clip, so no new audio code was
+  needed at all. Output is this pack's own joint-AV-latent convention
+  (`comfy.nested_tensor.NestedTensor((video, audio))`, matching
+  `LTXV23ImgToVideo` exactly) - not core's plain video-only latent - so it
+  slots straight into the *existing*, *unmodified* `LTXV23KSampler`: that
+  sampler already runs generically on any joint AV latent + noise mask, so
+  no custom vid2vid sampler was needed at all, despite the user explicitly
+  offering to build one if it turned out to be necessary. Same story for
+  `LTXV23AVDecode` at the end - untouched, works as-is once the guide
+  frames are cropped back off.
+- **`LTXV23CropVideoGuide`** - the post-sample counterpart. Wraps
+  comfy-core's `LTXVCropGuides`/`get_keyframe_idxs` around the video half
+  of the joint AV latent (core's version only understands a plain video
+  latent, so the two streams split before the crop and rejoin after - same
+  reason `_upsample_video_latent` above has to do this for the refine
+  sampler's upscale model). A no-op passthrough when no guide was appended
+  (`video_guide=False` upstream), inherited for free from core's own
+  early-return.
+
+The distilled LoRA (unrelated to the task-specific IC-LoRA - it is what
+makes the *base model* fast/single-stage) and the task IC-LoRA itself both
+stay fully external (stock `LoraLoaderModelOnly`, loaded before either of
+these new nodes) - explicitly requested, not folded into
+`LTXV23ModelsLoader` or either new node, matching how the Krea 2 Identity
+Edit LoRA was left external to `Krea2Img2Img`'s `identity_edit` toggle too.
+
+Verification: no offline stub harness exists for this file (unlike
+`tools/smoke_krea2.py`), and stubbing out `comfy_extras.nodes_lt` to test
+this would defeat the entire point - the one thing genuinely worth
+verifying is that the REAL delegation into comfy-core's RoPE/keyframe math
+actually works end-to-end. `tools/smoke_ltx23_vid2vid.py` runs against the
+real portable ComfyUI install (`sys.path` insertion, `--cpu`, a synthetic
+package pointed at `nodes/` so only `ltx23.py` imports - not the whole
+`nodes` package's `__init__.py` aggregation) with small fake VAE/CLIP
+objects (CPU tensors, no real weights) so the real
+`comfy_extras.nodes_lt.LTXVAddGuide`/`get_keyframe_idxs` calls run for
+real: guide frames actually get appended (confirmed via shape and via
+`get_keyframe_idxs` returning `num_keyframes > 0`), `LTXV23CropVideoGuide`
+removes exactly that many frames back off (confirmed the cropped shape
+matches the pre-guide target length and `get_keyframe_idxs` returns 0
+afterward), and `video_guide=False` produces the plain shape with `Crop
+Video Guide` as a genuine no-op. 3/3 real-environment tests pass; 84/84
+existing pytest suite unaffected (pure addition, no existing code
+touched).
