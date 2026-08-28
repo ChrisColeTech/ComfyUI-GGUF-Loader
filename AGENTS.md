@@ -3162,3 +3162,43 @@ silently pass. **The only real verification for this fix is the user's
 own GPU run** - CPU smoke tests structurally cannot catch a
 device-placement bug by themselves, which is exactly how this one
 shipped in the first place despite passing every existing test.
+
+## EditAnything device-placement bug, take two: get_torch_device() not next(dm.parameters()).device (2026-08-28)
+
+The user re-ran the workflow after the fix above deployed - SAME exact
+crash, same exact line. Confirmed the fix WAS actually live on the
+running install (grepped the deployed file directly, `.to(device=
+target_device)` present), so the bug was in what `target_device`
+resolved to, not whether the `.to()` call happened at all.
+
+Root cause: `target_device = next(dm.parameters()).device` reports
+wherever the model's real weights CURRENTLY sit at the exact moment
+`_install_editanything_module` runs - which is during
+`LTXV23VidToVideo.prepare()`, i.e. node-graph prep time, BEFORE comfy's
+own model management necessarily streams the model onto GPU for the
+actual sampling step (this pack's users commonly run under offload/
+low-vram modes where large models sit on CPU/disk until the moment
+they're actually needed for compute). So `next(dm.parameters()).device`
+can legitimately report CPU even on a real GPU box mid-generation - it's
+the WRONG signal, always was, and the CPU-only test suite couldn't have
+caught this by construction (matches CPU either way).
+
+The correct signal is `comfy.model_management.get_torch_device()` - the
+system's real, intended compute device regardless of the model's
+current placement - confirmed correct because it's the EXACT call
+`ref_latent` two lines below already uses successfully (the traceback
+itself proved this: "mat1 is on cuda:0" - ref_latent's own
+`.to(device=comfy.model_management.get_torch_device())` landed
+correctly, only the newly attached module weights, placed via the wrong
+signal, didn't). Fixed `_install_editanything_module` to use the same
+call. Updated `test_install_editanything_module_end_to_end`'s
+device-consistency assertion to check against
+`comfy.model_management.get_torch_device()` too, since it was
+previously (accidentally, coincidentally) checking against the exact
+wrong reference point the real bug used - a fix could have "passed" this
+test while reintroducing the actual bug, since both quantities happen to
+be equal in the CPU-only test environment. 6/6 `smoke_ltx23_editanything.py`
+and 84/84 `pytest tests/` still pass. Still unverified beyond a second
+real GPU attempt - if this doesn't clear it, the next failure point is
+likely further downstream (the per-block `ref_attn` residual add, or the
+`_prepare_timestep` wrapper's `ref_adaln` addition), not this same spot.

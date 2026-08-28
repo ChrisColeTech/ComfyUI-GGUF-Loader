@@ -46,6 +46,7 @@ sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
 ltx23 = importlib.import_module("cctech_gguf_pkg.nodes.ltx23")  # noqa: E402
 
 import comfy.ldm.lightricks.model as ltx_model  # noqa: E402
+import comfy.model_management  # noqa: E402
 import comfy.ops  # noqa: E402
 
 # The block's non-training path calls comfy_kitchen's fused rms_adaln custom
@@ -282,19 +283,23 @@ def test_install_editanything_module_end_to_end():
         assert patched_idxs == {12, 20}, f"expected blocks {{12, 20}} patched, got {patched_idxs}"
         # Real bug caught via a live GPU traceback: comfy.utils.load_torch_file
         # always loads onto CPU, and the new proj/ref_attn modules were never
-        # moved onto the model's actual device afterward - fine on this
-        # CPU-only test environment even without the fix (nothing here
-        # actually exercises a CPU/CUDA mismatch), but this assertion locks
-        # in the invariant (".to(device=model's device)" was actually
-        # called) so a regression removing that call doesn't silently pass
-        # here even though it can't reproduce the original crash without a
-        # second real device to test against.
-        model_device = next(dm.parameters()).device
-        assert next(dm.editanything_ref_visual_proj.parameters()).device == model_device
-        assert next(dm.editanything_ref_adaln_proj.parameters()).device == model_device
+        # moved onto the model's actual COMPUTE device afterward. First fix
+        # attempt used next(dm.parameters()).device - WRONG, and the bug
+        # reproduced again on a second real GPU run: that reports wherever
+        # the model's weights CURRENTLY sit at install time, not where
+        # they'll run under comfy's offload/low-vram model management. The
+        # real fix matches comfy.model_management.get_torch_device() - the
+        # same call ref_latent already (correctly) uses two lines later.
+        # This assertion is fine on this CPU-only test environment even
+        # without the real fix (nothing here exercises an actual CPU/CUDA
+        # boundary), but locks in the invariant against reverting to the
+        # wrong reference point.
+        target_device = comfy.model_management.get_torch_device()
+        assert next(dm.editanything_ref_visual_proj.parameters()).device == target_device
+        assert next(dm.editanything_ref_adaln_proj.parameters()).device == target_device
         for b in dm.transformer_blocks:
             if hasattr(b, "ref_attn"):
-                assert next(b.ref_attn.parameters()).device == model_device
+                assert next(b.ref_attn.parameters()).device == target_device
         # _prepare_timestep patch applied and callable
         dm._editanything_ref_adaln = torch.randn(1, 6 * hidden)
         ts, _, _ = dm._prepare_timestep(torch.zeros(1), 1, torch.float32)

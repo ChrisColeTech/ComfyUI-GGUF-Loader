@@ -521,11 +521,22 @@ def _install_editanything_module(model, module_path):
     dm = model.model.diffusion_model
     # comfy.utils.load_torch_file() loads onto CPU regardless of where the
     # rest of the model lives - the module's new submodules must be moved
-    # onto the SAME device as the model's own weights (block.attn2's, here,
-    # since it's already loaded/placed correctly) or their first real
-    # forward call raises a CPU/CUDA mismatch (confirmed via a real
-    # traceback: "mat1 is on cuda:0, different from other tensors on cpu").
-    target_device = next(dm.parameters()).device
+    # onto the model's real compute device or their first real forward call
+    # raises a CPU/CUDA mismatch (confirmed via a real traceback: "mat1 is
+    # on cuda:0, different from other tensors on cpu").
+    #
+    # next(dm.parameters()).device is WRONG here and was tried first - it
+    # reports wherever the model's weights CURRENTLY sit at this exact
+    # moment (_install_editanything_module runs during node prep, before
+    # comfy's own model management has necessarily streamed the model onto
+    # GPU for the actual sampling step under offload/low-vram modes), not
+    # where they'll actually run. comfy.model_management.get_torch_device()
+    # is the real target compute device regardless of current placement -
+    # the SAME call ref_latent below already (correctly) uses to land on
+    # cuda:0, per the traceback itself ("mat1 is on cuda:0" - the input
+    # activations were already using this convention; only the newly
+    # attached weights weren't).
+    target_device = comfy.model_management.get_torch_device()
 
     def _strip(prefix):
         return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
