@@ -2806,3 +2806,71 @@ full suite unaffected (pure rename, no logic touched).
 not by hand) so the saved value still resolves against the renamed
 `INPUT_TYPES` key - re-verified structurally consistent afterward.
 `README.md`'s "LTX-2.3 Video to Video (IC-LoRA)" section updated to match.
+
+## LTXV23EditAnythingPatch: EditAnything reference-conditioning port (2026-08-28)
+
+User's real test case ("replace the woman in the video with the woman in
+the image") needed a capability none of the readily-available LoRAs
+provide - traced through several wrong candidates (Union-Control,
+TalkVid ID-LoRA, a "detailer" IC-LoRA, BFS-Best-Face-Swap-Video, the
+last explicitly rejected: "no i didnt ask for face swap, thats not true
+vid2vid... i dont like the technique bfs uses in their node"). A
+deep-dive agent found LTX-2.3's own closest tool, EditAnything, is an
+ADD-a-person mechanism, not REPLACE; the genuine "replace while keeping
+background" tools (VACE, Mocha) are Wan-only and out of scope (user
+confirmed staying on LTX-2.3: "what model did i tell you to tell the
+agent to focus on"). Resolution: a two-stage LTX-2.3-only composite -
+remove the original person (masked inpainting, not yet built), then
+insert the reference person (EditAnything, this node) - both mechanisms
+traced to real source in `D:\Projects\Wan2GP-main\models\ltx2\` (a
+separate, unrelated multi-model video UI with its own from-scratch
+LTX-2.3 pipeline), not guessed.
+
+Ported `editanything.py` (186 lines, read in full) into `nodes/ltx23.py`:
+`_EditAnythingRefVisualProj`/`_EditAnythingRefAdaLNProj` (pool a
+VAE-encoded reference latent into 32 tokens / a single AdaLN vector),
+`_EditAnythingRefAttention` (LoRA-shaped extra cross-attention grafted
+onto `attn2`), `_patched_block_forward` (a hand-copy of comfy's real
+`comfy/ldm/lightricks/model.py` `BasicTransformerBlock.forward`, lines
+546-628 read in full, with one addition: the ref_attn residual, gated to
+blocks `EDITANYTHING_REF_START_BLOCK`..`_END_BLOCK` = 12-35), and
+`_install_editanything_module` (loads the `.module.safetensors` file -
+NOT a LoRA - and attaches/patches the CLONED model's instance only,
+never the class, matching this pack's established Krea2 clone-then-patch
+discipline). New node `LTXV23EditAnythingPatch` clones `model`, installs
+the module, VAE-encodes `reference_image`, and threads `ref_context`/
+`ref_adaln` through a `DIFFUSION_MODEL` wrapper (`add_wrapper_with_key`) -
+same mechanism as every other model-forward patch in this pack, nothing
+comfy-core-invasive.
+
+Verified via a new `tools/smoke_ltx23_editanything.py` against the real
+portable ComfyUI's actual `BasicTransformerBlock` class (not a fake) -
+the single most important check: with no `ref_context` present, the
+patched forward is **bitwise identical** (`torch.equal`) to calling
+comfy's real, unpatched `forward` on the same inputs, proving the
+hand-copied body has no subtle bug. Also verified: the residual only
+fires for in-range blocks when `ref_context` is supplied (out-of-range
+blocks or no reference -> untouched); `_install_editanything_module`
+patches by list *position* (`enumerate()`), not any `.idx` attribute -
+caught as a real bug in the test itself, not the port, while writing it
+(a real 36-position `nn.ModuleList` was needed, not a sparse list of
+fake indices, since the patch logic indexes positionally). 4/4 new tests
+pass; 4/4 existing `smoke_ltx23_vid2vid.py` and 84/84 `pytest tests/`
+unaffected. Downloaded both EditAnything halves from `DeepBeepMeep/LTX-2`
+- `.standard.safetensors` (ordinary LoRA, loads via stock
+`LoraLoaderModelOnly`) into the loras folder, `.module.safetensors` (the
+new architecture this node loads) into a new
+`ltxv23_edit_anything` `folder_paths` category (also registers
+`D:\models\image-models-dev\ltxv23\edit_anything` as an extra search
+path). `README.md` updated with a new node section.
+
+**Not yet done, explicitly**: no real GPU generation has been run - CPU
+shape/wiring/numerical-fidelity smoke tests only. A parallel Track B
+agent ported the same two mechanisms into a second, unrelated project
+(`D:\Projects\giga-videos`, comfy-free by design) with the same
+CPU-only verification status and the same open risk: the real
+`.module.safetensors` key-naming convention (`ref_visual_proj.*`,
+`diffusion_model.transformer_blocks.{i}.ref_attn.*`) is assumed to match
+Wan2GP's, not confirmed against the actual downloaded file's real key
+names. Stage 1 (masked person-removal, Laplacian-pyramid blend) is
+planned but not yet built in this repo.
