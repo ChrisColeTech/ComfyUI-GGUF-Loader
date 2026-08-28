@@ -429,6 +429,12 @@ class _EditAnythingRefVisualProj(nn.Module):
         global_std = ref_frame.std(dim=(-2, -1), unbiased=False)
         stats = torch.cat([global_mean, global_std], dim=-1).unsqueeze(1).expand(-1, local.shape[1], -1)
         tokens = torch.cat([local, stats], dim=-1)
+        # .mean()/.std() above can silently promote a bf16 input back to
+        # float32 (confirmed via a real GPU traceback: "mat1 and mat2 must
+        # have the same dtype, but got BFloat16 and Float" right here) -
+        # re-cast to the Linear's own weight dtype explicitly rather than
+        # trust it survived the pooling/reduction chain unchanged.
+        tokens = tokens.to(dtype=self.fc1.weight.dtype)
         tokens = self.proj(F.silu(self.fc1(tokens)))
         tokens = self.norm(tokens)
         tokens = tokens + self.pos_embed[:, :tokens.shape[1]].to(device=tokens.device, dtype=tokens.dtype)
@@ -454,6 +460,9 @@ class _EditAnythingRefAdaLNProj(nn.Module):
         avg_2x2 = F.adaptive_avg_pool2d(ref_frame, (2, 2)).flatten(1)
         max_1x1 = F.adaptive_max_pool2d(ref_frame, (1, 1)).flatten(1)
         pooled = torch.cat([avg_1x1, avg_2x2, max_1x1], dim=-1)
+        # see _EditAnythingRefVisualProj.forward's comment - pooling/
+        # reduction ops can silently promote a bf16 input back to float32.
+        pooled = pooled.to(dtype=self.fc1.weight.dtype)
         return self.proj(F.silu(self.fc1(pooled))) * float(adaln_scale)
 
 

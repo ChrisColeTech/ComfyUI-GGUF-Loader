@@ -3202,3 +3202,46 @@ and 84/84 `pytest tests/` still pass. Still unverified beyond a second
 real GPU attempt - if this doesn't clear it, the next failure point is
 likely further downstream (the per-block `ref_attn` residual add, or the
 `_prepare_timestep` wrapper's `ref_adaln` addition), not this same spot.
+
+## EditAnything dtype-promotion bug (third real GPU run) (2026-08-28)
+
+Device fix confirmed working - the second real GPU run got past the
+device-mismatch crash entirely and hit a NEW error at the same call
+site: `RuntimeError: mat1 and mat2 must have the same dtype, but got
+BFloat16 and Float`, inside `_EditAnythingRefVisualProj.forward`'s
+`self.fc1(tokens)`.
+
+Root cause: `_apply_editanything_patch` explicitly casts the input to
+`next(dm.editanything_ref_visual_proj.parameters()).dtype` before
+calling forward - correct in principle - but `forward()` then runs the
+cast tensor through several reduction/pooling ops
+(`ref_latent.mean(dim=2)`, `.mean()`, `.std()`,
+`F.adaptive_avg_pool2d`/`_max_pool2d`) before ever reaching
+`self.fc1`. At least one of those silently promotes a bf16 input back
+to float32 (a real, if under-documented, PyTorch behavior for some
+reduction kernels) - so by the time `self.fc1(tokens)` runs, `tokens`
+no longer matches `self.fc1.weight`'s dtype, even though the ORIGINAL
+input was correctly cast.
+
+Rather than chase down which specific op is responsible (fragile - the
+exact promotion behavior can vary by PyTorch version/backend), fixed
+both `_EditAnythingRefVisualProj.forward` and
+`_EditAnythingRefAdaLNProj.forward` (same pattern, same risk) to
+explicitly re-cast to `self.fc1.weight.dtype` immediately before the
+first `Linear` call, rather than trust the dtype survived the
+pooling/reduction chain unchanged. Cheap (one `.to()` call), and
+eliminates the whole failure class instead of only patching the one
+symptom that happened to surface first.
+
+Deliberately did NOT preemptively patch `_EditAnythingRefAttention`/
+`_EditAnythingLoRALinear` (the next stage in the pipeline) despite
+similar theoretical risk (the real model's attn2 linears are FP8, not
+bf16, per the loaded checkpoint's filename
+`ltxv23_uncensored_v1.4-fp8_scaled.safetensors` - a plausible THIRD
+mismatch) - no real traceback has touched that code path yet, and
+guessing a defensive fix there risks masking a genuine precision
+incompatibility rather than actually fixing anything. Waiting for the
+next real run's actual evidence before touching it. 6/6
+`smoke_ltx23_editanything.py` and 84/84 `pytest tests/` unaffected -
+this whole class of bug is invisible to CPU-only tests, same
+limitation as the device-placement fix above.
