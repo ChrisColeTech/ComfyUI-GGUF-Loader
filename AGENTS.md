@@ -2725,3 +2725,52 @@ afterward), and `video_guide=False` produces the plain shape with `Crop
 Video Guide` as a genuine no-op. 3/3 real-environment tests pass; 84/84
 existing pytest suite unaffected (pure addition, no existing code
 touched).
+
+## LTXV23VidToVideo: image/video/audio all independently optional (2026-08-28)
+
+User caught a real gap immediately after the above shipped: the reference
+workflow (`LTX-2.3_V2V_ICLoRA_Single_Stage_Distilled.json`) doesn't only do
+vid2vid - it ALSO wires a separate `image` input (ordinary i2v first-frame
+hold, via core `LTXVImgToVideoConditionOnly`, gated by its own
+`bypass_i2v` toggle) alongside the video-guide path, in the same graph.
+`LTXV23VidToVideo` as first shipped required `video` and had no `image`
+input at all - it could not reproduce that workflow's actual flexibility,
+only its video-guide half.
+
+Made `video` fully optional and added `image`/`image_strength` (identical
+mechanism to `LTXV23ImgToVideo`'s own i2v hold, copied verbatim - not
+reimplemented) plus `reference_audio`/`length_from_audio` (identical to
+`LTXV23ImgToVideo`'s a2v path). `LTXV23VidToVideo` is now a strict
+superset of `LTXV23ImgToVideo`: same required
+`width`/`height`/`length`/`frame_rate`/`batch_size` widgets (dropped the
+short-lived `short_side` auto-derive-from-video approach in favor of this
+- consistent, predictable, and lets `video` be truly optional instead of
+required for dimension derivation), same `image`/`reference_audio`
+optional inputs, PLUS `video`/`video_guide`/`guide_strength`/`hold_audio`/
+`latent_downscale_factor` for the IC-LoRA path. `image` and `video` are
+independently combinable in one call (a still for identity/framing plus a
+clip for the task transform) - verified, not just claimed, by a real
+smoke test exercising both together.
+
+The one non-obvious wrinkle: when `video` is connected, `length` and
+`frame_rate` are taken FROM it (the output should match the source
+clip's own duration/timing - nobody wants to manually retype a video's
+frame count), overriding the `length`/`frame_rate` widgets with a logged
+note; `width`/`height` always come from the widgets regardless of source,
+matching `LTXV23ImgToVideo`'s existing `image` convention exactly (that
+node already resizes/center-crops `image` to explicit width/height
+without deriving them from the image itself).
+
+`tools/smoke_ltx23_vid2vid.py` gained two new real-environment tests
+(`test_image_only_is_ordinary_i2v_hold_no_video_needed`,
+`test_image_and_video_guide_combine_independently`) alongside the two
+existing ones (renamed slightly for clarity), still running against the
+real portable install with the same fake CPU-only VAE/CLIP objects - the
+new i2v-hold path reuses proven code from `LTXV23ImgToVideo` verbatim, so
+these tests exist to catch wiring mistakes in this file, not to
+re-validate logic already covered elsewhere. 4/4 pass; 84/84 existing
+pytest suite unaffected. `LTX-2.3_V2V_Simple.json` (the example workflow
+built alongside the first version of this node) updated to the new
+signature - explicit `width`/`height`/`length`/`frame_rate`/`batch_size`
+widgets replacing the removed `short_side` one - and re-verified
+structurally consistent.

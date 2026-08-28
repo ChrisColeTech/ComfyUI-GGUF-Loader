@@ -3,9 +3,10 @@
 Runs against the actual portable ComfyUI install so the new code's delegation
 into comfy-core's real comfy_extras.nodes_lt.LTXVAddGuide is exercised for
 real (not stubbed) - that's the one piece genuinely new here, everything
-else (audio-hold helpers, joint-latent convention) is already-proven code
-reused from LTXV23ImgToVideo. Fake VAE/CLIP objects keep this GPU/weight-free
-(CPU only, tiny tensors) while still running the real RoPE/keyframe math.
+else (audio-hold helpers, joint-latent convention, the image-hold path) is
+already-proven code reused from LTXV23ImgToVideo. Fake VAE/CLIP objects
+keep this GPU/weight-free (CPU only, tiny tensors) while still running the
+real RoPE/keyframe math.
 
 Usage: python tools/smoke_ltx23_vid2vid.py
 """
@@ -40,6 +41,8 @@ nodes_pkg = types.ModuleType("cctech_gguf_pkg.nodes")
 nodes_pkg.__path__ = [str(REPO_ROOT / "nodes")]
 sys.modules["cctech_gguf_pkg.nodes"] = nodes_pkg
 ltx23 = importlib.import_module("cctech_gguf_pkg.nodes.ltx23")  # noqa: E402
+
+import comfy_extras.nodes_lt as nodes_lt  # noqa: E402 - real core module, used directly below
 
 
 class _FakeFSM:
@@ -89,7 +92,11 @@ def _fake_clip():
         tokenize=lambda s, **kw: s)
 
 
-def test_vid_to_video_with_guide_appends_and_crops_cleanly():
+def _target_t(n_frames):
+    return ((ltx23._align_length(n_frames) - 1) // 8) + 1
+
+
+def test_video_guide_appends_and_crops_cleanly():
     node = ltx23.LTXV23VidToVideo()
     video = _FakeVideo()
     vae = _FakeVideoVAE()
@@ -97,19 +104,19 @@ def test_vid_to_video_with_guide_appends_and_crops_cleanly():
     clip = _fake_clip()
 
     positive, negative, latent, frame_rate = node.prepare(
-        video, clip, vae, audio_vae, "prompt", "", 544, True, 1.0, hold_audio=False)
+        clip, vae, audio_vae, "prompt", "", 448, 256, 121, 24.0, 1,
+        video=video, video_guide=True, hold_audio=False)
 
-    assert frame_rate == 24.0
+    assert frame_rate == 24.0  # taken from the (fake) video, overriding the 24.0 widget too
     samples = latent["samples"]
     assert samples.is_nested
     video_latent, audio_latent = samples.unbind()
 
-    target_t = ((ltx23._align_length(25) - 1) // 8) + 1
+    target_t = _target_t(25)
     assert video_latent.shape[0] == 1 and video_latent.shape[1] == 128
     assert video_latent.shape[2] > target_t  # guide frames appended on top
 
-    _, num_keyframes = __import__("comfy_extras.nodes_lt", fromlist=["get_keyframe_idxs"]) \
-        .get_keyframe_idxs(positive, video_latent.shape)
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
     assert num_keyframes > 0
     assert video_latent.shape[2] - num_keyframes == target_t
 
@@ -119,15 +126,14 @@ def test_vid_to_video_with_guide_appends_and_crops_cleanly():
     assert cropped_video.shape[2] == target_t
     assert torch.equal(cropped_audio, audio_latent)
 
-    _, num_keyframes_after = __import__("comfy_extras.nodes_lt", fromlist=["get_keyframe_idxs"]) \
-        .get_keyframe_idxs(cpos, cropped_video.shape)
+    _, num_keyframes_after = nodes_lt.get_keyframe_idxs(cpos, cropped_video.shape)
     assert num_keyframes_after == 0
     print("[ok] LTXV23VidToVideo: video_guide=True appends real IC-LoRA guide frames "
-          "(real comfy_extras.nodes_lt.LTXVAddGuide), LTXV23CropVideoGuide removes "
-          "exactly them back off")
+          "(real comfy_extras.nodes_lt.LTXVAddGuide) and takes length/frame_rate from "
+          "the clip; LTXV23CropVideoGuide removes exactly them back off")
 
 
-def test_vid_to_video_without_guide_is_plain_t2v_shape():
+def test_video_without_guide_is_plain_shape():
     node = ltx23.LTXV23VidToVideo()
     video = _FakeVideo()
     vae = _FakeVideoVAE()
@@ -135,41 +141,76 @@ def test_vid_to_video_without_guide_is_plain_t2v_shape():
     clip = _fake_clip()
 
     positive, negative, latent, _ = node.prepare(
-        video, clip, vae, audio_vae, "prompt", "", 544, False, 1.0, hold_audio=False)
+        clip, vae, audio_vae, "prompt", "", 448, 256, 121, 24.0, 1,
+        video=video, video_guide=False, hold_audio=False)
 
     samples = latent["samples"]
     video_latent, _ = samples.unbind()
-    target_t = ((ltx23._align_length(25) - 1) // 8) + 1
-    assert video_latent.shape[2] == target_t  # no guide appended
+    assert video_latent.shape[2] == _target_t(25)  # no guide appended
 
     crop_node = ltx23.LTXV23CropVideoGuide()
     _, _, cropped = crop_node.crop(positive, negative, latent)
     assert cropped is latent  # no-op passthrough, nothing to crop
-    print("[ok] LTXV23VidToVideo: video_guide=False -> plain shape, no guide frames "
-          "appended; LTXV23CropVideoGuide is a no-op passthrough")
+    print("[ok] LTXV23VidToVideo: video_guide=False -> plain shape (video only used for "
+          "length/frame_rate), LTXV23CropVideoGuide is a no-op passthrough")
 
 
-def test_vid_to_video_rejects_bad_latent_downscale_factor():
+def test_image_only_is_ordinary_i2v_hold_no_video_needed():
     node = ltx23.LTXV23VidToVideo()
-    video = _FakeVideo(h=250, w=450)  # deliberately not divisible by 2 after 32-rounding tricks
     vae = _FakeVideoVAE()
     audio_vae = _FakeAudioVAE()
     clip = _fake_clip()
-    try:
-        node.prepare(video, clip, vae, audio_vae, "prompt", "", 100, True, 1.0,
-                     hold_audio=False, latent_downscale_factor=3.0)
-        raised = False
-    except ValueError:
-        raised = True
-    # width/height are rounded to 32-multiples inside prepare(), so whether this
-    # raises depends on the resulting size vs factor 3 - just confirm it does not
-    # crash with anything OTHER than the documented ValueError.
-    print(f"[ok] LTXV23VidToVideo: latent_downscale_factor=3.0 path runs without an "
-          f"unexpected exception (raised ValueError: {raised})")
+    image = torch.rand(1, 256, 448, 3)
+
+    positive, negative, latent, frame_rate = node.prepare(
+        clip, vae, audio_vae, "prompt", "", 448, 256, 121, 30.0, 1,
+        image=image, image_strength=0.7)
+
+    assert frame_rate == 30.0  # widget value used - no video connected to override it
+    samples = latent["samples"]
+    video_latent, _ = samples.unbind()
+    assert video_latent.shape[2] == _target_t(121)  # widget length, not any clip's
+
+    noise_mask = latent["noise_mask"].unbind()[0]
+    assert torch.allclose(noise_mask[:, :, 0], torch.tensor(1.0 - 0.7))
+    assert torch.allclose(noise_mask[:, :, 1], torch.tensor(1.0))  # rest of the clip untouched
+
+    crop_node = ltx23.LTXV23CropVideoGuide()
+    _, _, cropped = crop_node.crop(positive, negative, latent)
+    assert cropped is latent  # no video_guide ever ran -> nothing to crop
+    print("[ok] LTXV23VidToVideo: image only (no video connected) -> ordinary i2v "
+          "first-frame hold, width/height/length/frame_rate all from the widgets")
+
+
+def test_image_and_video_guide_combine_independently():
+    node = ltx23.LTXV23VidToVideo()
+    video = _FakeVideo()
+    vae = _FakeVideoVAE()
+    audio_vae = _FakeAudioVAE()
+    clip = _fake_clip()
+    image = torch.rand(1, 256, 448, 3)
+
+    positive, negative, latent, _ = node.prepare(
+        clip, vae, audio_vae, "prompt", "", 448, 256, 121, 24.0, 1,
+        image=image, image_strength=0.7, video=video, video_guide=True, hold_audio=False)
+
+    samples = latent["samples"]
+    video_latent, _ = samples.unbind()
+    target_t = _target_t(25)  # video's own length wins over the length widget
+    assert video_latent.shape[2] > target_t  # guide frames still appended on top
+
+    noise_mask = latent["noise_mask"].unbind()[0]
+    assert torch.allclose(noise_mask[:, :, 0], torch.tensor(1.0 - 0.7))  # image hold still applied
+
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+    assert num_keyframes > 0
+    print("[ok] LTXV23VidToVideo: image (i2v hold) and video (IC-LoRA guide) combine "
+          "in the same call without interfering with each other")
 
 
 if __name__ == "__main__":
-    test_vid_to_video_with_guide_appends_and_crops_cleanly()
-    test_vid_to_video_without_guide_is_plain_t2v_shape()
-    test_vid_to_video_rejects_bad_latent_downscale_factor()
+    test_video_guide_appends_and_crops_cleanly()
+    test_video_without_guide_is_plain_shape()
+    test_image_only_is_ordinary_i2v_hold_no_video_needed()
+    test_image_and_video_guide_combine_independently()
     print("[ok] all smoke_ltx23_vid2vid tests passed")
