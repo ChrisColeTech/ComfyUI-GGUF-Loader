@@ -3553,3 +3553,38 @@ with a NATIVE-30fps test clip (the case the old graph failed): output
 Regenerated + strict-diffed (0 mismatches) + comfy-validated the user's
 ltxv_v2v_test.json / ltxv_person_replace_API.json and reinstalled both.
 
+
+## 2026-08-29 - True motion-preserving person swap: pose control, not EA/inpaint
+
+User report on v2.8.1: "why isnt the woman following the exact same dance
+and motions... its like it just removes the old girl, and adds a new girl
+doing rando things" - correct: the composed two-stage graph removed the
+dancer BEFORE the EditAnything stage, so the guide video carried no motion.
+
+Tested with real frames (all on the 5090 via the HTTP API):
+(1) EA guided on the RAW source: motion tracks perfectly but identity never
+swaps (guide 1.0 and 0.6, with and without a frame-0 reference pin - the
+in-place person dominates Channel A). Dead end.
+(2) Green-silhouette inpaint + new optional start_image on LTXV23RemovePerson
+(control video's frame 0 = the new person composited into the scene in the
+source's opening pose, no green fill on frame 0): identity swaps cleanly,
+but a flat silhouette encodes position, not limb pose - choreography damped
+(dilation 8 and 2 both). Partial.
+(3) THE RECIPE: OpenPose skeleton render of the source as the control video,
+ic_lora = ltx-2.3-22b-ic-lora-union-control-ref0.5 @ 1.0, i2v start_image
+anchor, and latent_downscale_factor=2.0. KEY FACT decoded from Wan2GP
+(_infer_ic_lora_downscale_factor, ltx2.py:737): "-refN" in an IC-LoRA
+filename = control conditioned at N x resolution; ref0.5 -> half-res via
+comfy-core's LTXVAddGuide.dilate_latent(2) (the node's existing
+latent_downscale_factor path). At FULL res the model reconstructs the
+skeleton verbatim (observed). Half-res: exact choreography + swapped
+identity. Sizes must be divisible by 64 (half-res guide on whole 32px
+latents) - node validation hardened to say so instead of crashing.
+
+Final composed graph (installed as ltxv_v2v_test.json, 25 nodes, strict-diff
+0 mismatches + comfy-validated + proof-run): Stage A remove -> Laplacian
+blend clean plate; Stage B pose swap as above; Stage C SAM3 mask of the
+GENERATED woman -> MaskBlend onto the clean plate; original waveform muxed.
+Verified frame-by-frame: identity, choreography, background, audio all
+correct; residual background invention confined to the masked region
+directly behind the subject.

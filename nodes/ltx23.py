@@ -1545,10 +1545,13 @@ class LTXV23VidToVideo:
 
             guide_mask = None
             if latent_downscale_factor > 1:
-                if width % latent_downscale_factor != 0 or height % latent_downscale_factor != 0:
+                block = int(VIDEO_SPATIAL_RATIO * latent_downscale_factor)
+                if width % block != 0 or height % block != 0:
                     raise ValueError(
-                        f"LTX-2.3 v2v: target size {width}x{height} must be divisible by "
-                        f"latent_downscale_factor {latent_downscale_factor}.")
+                        f"LTX-2.3 v2v: with latent_downscale_factor {latent_downscale_factor} "
+                        f"the target size must be divisible by {block} (the downscaled guide "
+                        f"still has to land on whole {VIDEO_SPATIAL_RATIO}px latents) - got "
+                        f"{width}x{height}. Round width/height up to a multiple of {block}.")
                 guide_latent, guide_mask = nodes_lt.LTXVAddGuide.dilate_latent(
                     guide_latent, latent_downscale_factor)
 
@@ -1815,13 +1818,20 @@ class LTXV23RemovePerson:
                                   "max": 128,
                                   "tooltip": "Pre-fill mask dilation radius in pixels "
                                              "(trained default 5)."}),
+                "start_image": ("IMAGE", {"tooltip": "Optional identity anchor: becomes the "
+                                "control video's FIRST frame verbatim (no green fill on frame "
+                                "0). For person replacement: an image of the NEW person in the "
+                                "same scene and starting pose - the green silhouette in later "
+                                "frames carries the motion, this frame carries who fills it. "
+                                "The prompt should then describe the scene WITH the new "
+                                "subject."}),
             },
         }
 
     @torch.inference_mode()
     def prepare(self, model, clip, vae, audio_vae, video, mask, prompt, negative_prompt,
                 width, height, batch_size, inpaint_lora, keep_original_audio=True,
-                mask_dilation=LTX2_INPAINT_MASK_DILATION):
+                mask_dilation=LTX2_INPAINT_MASK_DILATION, start_image=None):
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
             raise ValueError("audio_vae is not an LTX audio VAE; use the kit's "
@@ -1847,6 +1857,17 @@ class LTXV23RemovePerson:
         mask_t1hw = _comfy_mask_to_t1hw(mask, source_frames.shape[0], height, width)
         mask_t1hw = _ltx2_dilate_mask(mask_t1hw, int(mask_dilation))
         control_frames = _ltx2_greenfill(source_frames, mask_t1hw)
+        if start_image is not None:
+            # Identity anchor: the control video opens on the provided frame
+            # verbatim (no green fill), so the regenerated green region in
+            # later frames inherits this subject's appearance via temporal
+            # propagation from t=0. Frame 0 is excluded from the blend mask.
+            anchor = comfy.utils.common_upscale(
+                start_image[:1].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)[:, :, :, :3].to(control_frames)
+            control_frames = torch.cat([anchor, control_frames[1:]], dim=0)
+            mask_t1hw = mask_t1hw.clone()
+            mask_t1hw[0].zero_()
         control_frames, mask_t1hw = _ltx2_green_tail_pad(control_frames, mask_t1hw, length)
 
         t_latent = ((length - 1) // VIDEO_TEMPORAL_RATIO) + 1
