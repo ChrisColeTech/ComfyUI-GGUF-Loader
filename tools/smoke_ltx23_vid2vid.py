@@ -396,6 +396,156 @@ def test_editanything_selectors_chain_lora_then_patch_helper():
           "through to the patch")
 
 
+def test_editanything_appends_reference_and_video_guides_without_ic_lora():
+    # The corrected Wan2GP recipe: EditAnything active + video connected must
+    # append BOTH the reference image (1 latent frame, Channel A) and the
+    # source video (guide frames) as clean guide tokens - WITHOUT any
+    # ic_lora set. This was the root cause of the zero-effect bug: the video
+    # guide was gated on ic_lora, and the reference was never appended at all.
+    node = ltx23.LTXV23VidToVideo()
+    video = _FakeVideo()
+    vae = _FakeVideoVAE()
+    audio_vae = _FakeAudioVAE()
+    clip = _fake_clip()
+    image = torch.rand(1, 256, 448, 3)
+
+    orig_apply = ltx23._apply_editanything_patch
+    orig_loader = ltx23.nodes.LoraLoaderModelOnly
+    ltx23._apply_editanything_patch = lambda *a, **kw: "patched"
+    ltx23.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
+    try:
+        out_model, positive, negative, latent, _ = node.prepare(
+            "base-model", clip, vae, audio_vae, "v2v", "prompt", "", 448, 256, 121, 24.0, 1,
+            images=image, video=video, ic_lora="none",
+            editanything_lora="standard.safetensors",
+            editanything_module_path="module.safetensors", keep_original_audio=False)
+    finally:
+        ltx23._apply_editanything_patch = orig_apply
+        ltx23.nodes.LoraLoaderModelOnly = orig_loader
+
+    video_latent, _ = latent["samples"].unbind()
+    target_t = _target_t(25)
+    guide_t = ((25 - 1) // 8) + 1  # video guide latent frames (fake VAE convention)
+    assert video_latent.shape[2] == target_t + 1 + guide_t, (
+        f"expected {target_t} target + 1 reference + {guide_t} guide latent frames, "
+        f"got {video_latent.shape[2]}")
+
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+    assert num_keyframes == 1 + guide_t, (
+        f"expected {1 + guide_t} keyframes (1 ref + {guide_t} video), got {num_keyframes}")
+
+    # the appended reference/guide tokens are HELD (noise mask 0), the
+    # generated region fully noised (mask 1) - Wan2GP's denoise_mask=1-strength
+    noise_video, _ = latent["noise_mask"].unbind()
+    assert torch.all(noise_video[:, :, target_t:] == 0.0), "appended guides must be mask 0 (held)"
+    assert torch.all(noise_video[:, :, :target_t] == 1.0), "generated region must be mask 1"
+
+    crop_node = ltx23.LTXV23CropVideoGuide()
+    _, _, cropped = crop_node.crop(positive, negative, latent)
+    cropped_video, _ = cropped["samples"].unbind()
+    assert cropped_video.shape[2] == target_t, "crop must strip BOTH appended guide blocks"
+    print("[ok] LTXV23VidToVideo: EditAnything (no ic_lora) appends the reference image "
+          "(1 clean latent frame) AND the source video as held guide tokens, and "
+          "LTXV23CropVideoGuide strips both blocks back off")
+
+
+def test_editanything_and_ic_lora_are_mutually_exclusive():
+    node = ltx23.LTXV23VidToVideo()
+    vae = _FakeVideoVAE()
+    audio_vae = _FakeAudioVAE()
+    clip = _fake_clip()
+    try:
+        node.prepare(None, clip, vae, audio_vae, "t2v", "prompt", "", 448, 256, 121, 24.0, 1,
+                     ic_lora="task.safetensors", editanything_lora="standard.safetensors",
+                     editanything_module_path="module.safetensors")
+        assert False, "expected ValueError: ic_lora + EditAnything set together"
+    except ValueError as e:
+        assert "mutually exclusive" in str(e)
+    print("[ok] LTXV23VidToVideo: ic_lora and EditAnything together raise a clear "
+          "mutually-exclusive error")
+
+
+def test_remove_person_greenfill_and_guide():
+    # Stage 1 prep: mask dilation grows the region, masked pixels become
+    # exactly #66FF00, unmasked pixels stay untouched, and the green-filled
+    # control video is appended as held guide tokens at strength 1.0.
+    node = ltx23.LTXV23RemovePerson()
+    video = _FakeVideo()
+    vae = _FakeVideoVAE()
+    audio_vae = _FakeAudioVAE()
+    clip = _fake_clip()
+    mask = torch.zeros(25, 256, 448)
+    mask[:, 100:150, 200:300] = 1.0
+
+    orig_loader = ltx23.nodes.LoraLoaderModelOnly
+    ltx23.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
+    _FakeLoraLoaderModelOnly.calls = []
+    try:
+        out = node.prepare("base-model", clip, vae, audio_vae, video, mask,
+                           "empty room", "", 448, 256, 1, "inpaint.safetensors",
+                           keep_original_audio=False)
+    finally:
+        ltx23.nodes.LoraLoaderModelOnly = orig_loader
+
+    out_model, positive, negative, latent, frame_rate, source_frames, blend_mask = out
+    assert _FakeLoraLoaderModelOnly.calls == [("base-model", "inpaint.safetensors", 1.0)], \
+        "inpaint LoRA must load at the trained strength 1.0"
+
+    # green-fill check: rebuild the control frames the node built internally
+    green = torch.tensor(ltx23.LTX2_MASKED_CONTROL_VIDEO_PAD_RGB).float() / 255.0
+    m = ltx23._comfy_mask_to_t1hw(mask, 25, 256, 448)
+    m_dil = ltx23._ltx2_dilate_mask(m, 5)
+    assert m_dil.sum() > m.sum(), "dilation must grow the mask"
+    filled = ltx23._ltx2_greenfill(source_frames, m_dil)
+    inside = filled[0, 120, 250]  # deep inside the mask
+    assert torch.allclose(inside, green), f"masked pixel must be exact #66FF00, got {inside}"
+    outside = filled[0, 10, 10]
+    assert torch.allclose(outside, source_frames[0, 10, 10]), "unmasked pixels must be untouched"
+
+    video_latent, _ = latent["samples"].unbind()
+    noise_video, _ = latent["noise_mask"].unbind()
+    target_t = _target_t(25)
+    assert video_latent.shape[2] > target_t, "green control video must be appended as guide"
+    assert torch.all(noise_video[:, :, target_t:] == 0.0), "guide must be held @ strength 1.0"
+    # the user mask must NOT touch the denoise mask of the generated region
+    assert torch.all(noise_video[:, :, :target_t] == 1.0), \
+        "generated region must be fully noised - the mask is not a denoise mask in this recipe"
+    assert blend_mask.shape == (25, 256, 448)
+    assert source_frames.shape == (25, 256, 448, 3)
+    print("[ok] LTXV23RemovePerson: mask dilated, masked region painted exact #66FF00, "
+          "green control video appended as held guide @ 1.0, user mask kept OUT of the "
+          "denoise mask (LoRA does the regeneration), source/blend passthroughs correct")
+
+
+def test_mask_blend_identity_outside_mask_and_generated_inside():
+    node = ltx23.LTXV23MaskBlend()
+    torch.manual_seed(0)
+    source = torch.rand(3, 128, 128, 3)
+    generated = torch.rand(3, 128, 128, 3)
+
+    # zero mask -> output == source everywhere (pyramid collapse is exact)
+    zero_mask = torch.zeros(3, 128, 128)
+    out, = node.blend(generated, source, zero_mask, mask_low_res_dilation=0)
+    assert torch.allclose(out, source, atol=1e-5), "zero mask must reproduce source exactly"
+
+    # full mask -> output == generated everywhere
+    ones_mask = torch.ones(3, 128, 128)
+    out, = node.blend(generated, source, ones_mask, mask_low_res_dilation=0)
+    assert torch.allclose(out, generated, atol=1e-5), "full mask must reproduce generated exactly"
+
+    # partial mask (with the trained soft skirt): deep inside -> generated,
+    # far outside -> source
+    part_mask = torch.zeros(3, 128, 128)
+    part_mask[:, 40:88, 40:88] = 1.0
+    out, = node.blend(generated, source, part_mask)
+    assert torch.allclose(out[:, 64, 64], generated[:, 64, 64], atol=0.05), \
+        "deep inside the mask must be (close to) the generated pixels"
+    assert torch.allclose(out[:, 4, 4], source[:, 4, 4], atol=0.05), \
+        "far outside the mask must be (close to) the source pixels"
+    print("[ok] LTXV23MaskBlend: Laplacian pyramid blend - exact source outside, exact "
+          "generated inside, soft trained skirt in between")
+
+
 if __name__ == "__main__":
     test_ic_lora_appends_and_crops_cleanly()
     test_video_with_ic_lora_none_is_plain_shape()
@@ -405,4 +555,8 @@ if __name__ == "__main__":
     test_mode_t2v_allows_image_when_editanything_active()
     test_editanything_lora_and_module_path_must_be_set_together()
     test_editanything_selectors_chain_lora_then_patch_helper()
+    test_editanything_appends_reference_and_video_guides_without_ic_lora()
+    test_editanything_and_ic_lora_are_mutually_exclusive()
+    test_remove_person_greenfill_and_guide()
+    test_mask_blend_identity_outside_mask_and_generated_inside()
     print("[ok] all smoke_ltx23_vid2vid tests passed")

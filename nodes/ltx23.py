@@ -1193,25 +1193,33 @@ class LTXV23VidToVideo:
 
     `editanything_lora` + `editanything_module_path` (both optional
     selectors, "none" = off - EITHER alone does nothing useful, they're
-    trained jointly) add LTX-2.3's EditAnything reference-conditioning
-    patch to `model` in this same node - mirrors Krea2Img2Img's own
-    `identity_edit` toggle (patch built into the main conditioning node,
-    reusing the SAME `images` input for both purposes rather than a
-    second reference-photo slot - `identity_edit=True` switches what
-    `images` means there instead of adding a new input; this node does
-    the same), except the LoRA half is now ALSO loaded here (same
-    `LoraLoaderModelOnly` delegation as `ic_lora` above, at
-    `editanything_lora_strength`) instead of requiring external wiring.
-    Needs `images` connected too (the person/subject to inject - one or
-    more photos, see `reference_mode` below for what a batch means here;
-    the SAME photo(s) drive both the ordinary i2v hold, if
-    `image_strength` > 0, AND the EditAnything reference; set
-    `image_strength=0` to use `images` for EditAnything only, with no
-    first-frame hold effect) - see `_apply_editanything_patch`'s docstring
-    for the full mechanism and what `reference_mode` controls. The
-    returned `model` is the patched clone (or the original, unpatched, if
-    neither selector is set); always take `model` from THIS node's output,
-    not the original upstream model, whenever any selector here is used.
+    trained jointly; mutually exclusive with `ic_lora`, whose task-adapter
+    role EditAnything's own LoRA fills) activate LTX-2.3's EditAnything
+    subject-injection recipe, ported faithfully from Wan2GP's real
+    pipeline (traced, not guessed). Four things happen at once, matching
+    the trained recipe exactly:
+      1. `images[0]` (the reference photo - `identity_edit`-style reuse of
+         the `images` input, one subject, plain/white background
+         recommended) is VAE-encoded and APPENDED as clean reference
+         tokens at frame_idx 0 / strength 1.0 (Wan2GP's
+         VideoConditionByReferenceLatent - the mechanism's main identity
+         carrier). It is NOT held as an output frame; `image_strength` is
+         ignored under EditAnything.
+      2. The source `video` (when connected, mode=v2v) is appended as
+         clean guide tokens at frame_idx 0 / `guide_strength` (default
+         1.0) - same append `ic_lora` uses, active here WITHOUT `ic_lora`
+         (Wan2GP EditAnything conditions on the source video this way;
+         it is not a partial-denoise v2v).
+      3+4. The `.module.safetensors` extra layers add the ref_attn
+         residual (blocks 12-35, x0.01) and the ref_adaln timestep shift
+         (x2.0) - see `_apply_editanything_patch`. The `.standard` LoRA
+         loads via the same `LoraLoaderModelOnly` delegation as
+         `ic_lora`, at `editanything_lora_strength`.
+    Prompt format: imperative "Add <appearance> <placement> <scene
+    relation>" (official trained format). The returned `model` is the
+    patched clone (or the original, unpatched, if neither selector is
+    set); always take `model` from THIS node's output, not the original
+    upstream model, whenever any selector here is used.
 
     All three LoRA-adjacent selectors (`ic_lora`, `editanything_lora`,
     `editanything_module_path`) list comfy's real `loras` folder_paths
@@ -1269,8 +1277,14 @@ class LTXV23VidToVideo:
                                       "tooltip": "With ic_lora set: describe the OUTPUT "
                                                  "you want - most IC-LoRAs are trained on an "
                                                  "instruction-style caption describing the "
-                                                 "transformed result. Otherwise: describe the "
-                                                 "scene and its motion, a caption not an "
+                                                 "transformed result. With EditAnything: an "
+                                                 "imperative ADD instruction, e.g. 'Add a "
+                                                 "<detailed appearance> <placement in frame> "
+                                                 "<relation to the scene>' (the official "
+                                                 "trained format - the reference photo "
+                                                 "supplies identity, the prompt supplies "
+                                                 "placement/attributes). Otherwise: describe "
+                                                 "the scene and its motion, a caption not an "
                                                  "instruction."}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 768, "min": 64,
@@ -1290,11 +1304,13 @@ class LTXV23VidToVideo:
             "optional": {
                 "images": ("IMAGE", {"tooltip": "First frame(s) for image-to-video (ordinary "
                                     "i2v hold, independent of video/ic_lora below) - "
-                                    "resized and CENTER-CROPPED to width x height. Also the "
-                                    "EditAnything reference photo(s) when "
-                                    "editanything_module_path is set (see reference_mode for "
-                                    "how a batch is used there) - set image_strength=0 for a "
-                                    "pure EditAnything reference with no i2v-hold effect."}),
+                                    "resized and CENTER-CROPPED to width x height. With "
+                                    "EditAnything active, images is instead the REFERENCE "
+                                    "photo (the subject to inject - one photo, plain/white "
+                                    "background strongly recommended, that's what the "
+                                    "mechanism was trained on): appended as clean reference "
+                                    "tokens the model attends to, NOT held as a first frame "
+                                    "(image_strength is ignored under EditAnything)."}),
                 "image_strength": ("FLOAT", {
                     "default": I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "images only. How much of the init image(s) to keep. 0.7 is "
@@ -1387,6 +1403,11 @@ class LTXV23VidToVideo:
             raise ValueError("LTX-2.3 v2v: editanything_lora and editanything_module_path must "
                              "be set together (both \"none\" or both a real file) - either "
                              "alone does nothing, they're trained jointly.")
+        if ic_lora_attached and edit_anything:
+            raise ValueError("LTX-2.3 v2v: ic_lora and EditAnything are mutually exclusive "
+                             "(Wan2GP treats them as separate model modes and they were never "
+                             "trained together) - EditAnything's own .standard.safetensors LoRA "
+                             "IS the task adapter for its recipe; set ic_lora to \"none\".")
 
         # images is dual-purpose: ordinary i2v hold AND (when edit_anything
         # is on) the EditAnything reference photo(s) - mode=t2v only
@@ -1448,19 +1469,67 @@ class LTXV23VidToVideo:
              height // VIDEO_SPATIAL_RATIO, width // VIDEO_SPATIAL_RATIO], device=device)
         video_mask = torch.ones((batch_size, 1, t_latent, 1, 1),
                                 dtype=torch.float32, device=device)
-        if images is not None:
+        if images is not None and not edit_anything:
             pixels = comfy.utils.common_upscale(
                 images.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             t = _match_batch(vae.encode(pixels[:, :, :, :3]), batch_size)
             video_samples[:, :, :t.shape[2]] = t.to(video_samples.device, video_samples.dtype)
             video_mask[:, :, :t.shape[2]] = 1.0 - image_strength
+        elif images is not None and edit_anything:
+            # Under EditAnything, images is the REFERENCE, never an i2v hold:
+            # Wan2GP's reference is a parallel clean token block the model
+            # attends to (VideoConditionByReferenceLatent), NOT a frame of
+            # the output timeline. Holding the reference photo as frame 1
+            # was exactly the "hard photo cut then unrelated video" glitch
+            # observed in real output - so the hold is skipped entirely
+            # here, regardless of image_strength.
+            logger.info("LTX-2.3 v2v: edit_anything active - images used as EditAnything "
+                        "reference only, i2v hold skipped (image_strength ignored)")
 
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
         positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
         negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
-        if video is not None and ic_lora_attached:
+        # ── EditAnything Channel A: reference latent appended as clean guide
+        # tokens (Wan2GP's VideoConditionByReferenceLatent - editanything.py:175,
+        # reference_video_cond.py:16-58: frame_idx=0, strength=1.0, causal_fix,
+        # denoise_mask=0). This is the mechanism's MAIN identity carrier - the
+        # ref_attn (0.01 residual) and ref_adaln paths in
+        # _apply_editanything_patch are the two smaller channels. Appended
+        # BEFORE the source-video guide block, matching Wan2GP's conditioning
+        # order (ref conditionings += before control-video conditionings).
+        # Same delegation as the video guide below: comfy-core's real
+        # LTXVAddGuide, the identical mechanism the official Ingredients
+        # workflow uses to append reference IMAGES (LTXAddVideoICLoRAGuide
+        # @ frame_idx 0, strength 1).
+        if edit_anything:
+            import comfy_extras.nodes_lt as nodes_lt
+
+            scale_factors = vae.downscale_index_formula
+            # Wan2GP takes exactly ONE reference image (ref_images[0],
+            # one_image_ref_only) - Channel A always uses images[0], even
+            # under reference_mode=per_batch_item (which only varies the
+            # per-batch ref_attn/ref_adaln signals).
+            ref_pixels = comfy.utils.common_upscale(
+                images[:1].movedim(-1, 1), width, height, "bilinear", "center"
+            ).movedim(1, -1)[:, :, :, :3]
+            ref_guide_latent = _match_batch(vae.encode(ref_pixels), batch_size)
+            frame_idx, _ = nodes_lt.LTXVAddGuide.get_latent_index(
+                positive, t_latent, ref_guide_latent.shape[2], 0, scale_factors,
+                latent_shape=video_samples.shape)
+            positive, negative, video_samples, video_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, frame_idx, video_samples, video_mask, ref_guide_latent,
+                1.0, scale_factors, causal_fix=True)
+            logger.info("LTX-2.3 EditAnything: reference guide %s appended @ strength 1.0 "
+                        "(frame_idx=%d)", tuple(ref_guide_latent.shape), frame_idx)
+
+        # Source-video guide append: active for a task IC-LoRA *or* for
+        # EditAnything (Wan2GP appends the source video as clean guide tokens
+        # at frame_idx 0 strength 1.0 in EditAnything mode too - it is NOT a
+        # v2v partial-denoise; without this append the model has no
+        # connection to the source clip at all).
+        if video is not None and (ic_lora_attached or edit_anything):
             import comfy_extras.nodes_lt as nodes_lt
 
             scale_factors = vae.downscale_index_formula
@@ -1527,6 +1596,381 @@ class LTXV23VidToVideo:
                     ", audio held" if (video is not None and keep_original_audio and video_audio is not None)
                     or (video is None and reference_audio is not None) else "")
         return (model, positive, negative, latent, frame_rate)
+
+
+# ── Stage 1: masked removal (LTX-2.3 in/outpainting IC-LoRA) ──
+#
+# Ported from D:\Projects\Wan2GP-main\models\ltx2\inpainting.py +
+# ltx2.py/ltx2_handler.py orchestration (read directly, full trace this
+# session - not guessed). The trained recipe, exactly:
+#   1. dilate the per-frame mask by 5px (max-pool),
+#   2. paint the masked region chroma green #66FF00 (102,255,0) - the
+#      in/outpainting IC-LoRA learned "green = regenerate this",
+#   3. green-pad the tail to the full frame count,
+#   4. append the green-filled video as CLEAN guide tokens at frame_idx 0,
+#      strength exactly 1.0 (Wan2GP validates this in its UI). The user
+#      mask is NOT a denoise mask during sampling (masking_strength is
+#      force-zeroed in Wan2GP) - the LoRA does the regeneration,
+#   5. after decode, composite the generated result back over the original
+#      pixels with a multi-level Laplacian pyramid blend (7 levels, mask
+#      softened by a low-res dilation of 6 at a 64px long side, source
+#      sanitized inside the mask) so the seam doesn't show.
+# Steps 1-4 are LTXV23RemovePerson (a conditioning-prep node shaped like
+# LTXV23VidToVideo); step 5 is LTXV23MaskBlend (post-decode, IMAGE-space).
+
+LTX2_MASKED_CONTROL_VIDEO_PAD_RGB = (102, 255, 0)   # ltx2_runtime.py, "#66FF00"
+LTX2_INPAINT_MASK_DILATION = 5                       # LTX2_INPAINTING_PREPROCESS_MASK_DILATION
+LTX2_INPAINT_LAPLACIAN_MASK_LOW_RES_DILATION = 6     # LTX2_INPAINTING_LAPLACIAN_MASK_LOW_RES_DILATION
+LTX2_LAPLACIAN_MASK_LOW_RES_LONG_SIDE = 64           # LTX2_LAPLACIAN_BLEND_MASK_LOW_RES_LONG_SIDE
+
+
+def _ltx2_dilate_mask(mask_t1hw, radius):
+    """Wan2GP's _apply_ltx2_inpaint_preprocess_dilation, mask half: max-pool
+    dilation with kernel 2r+1. mask is [T,1,H,W] float 0..1."""
+    if radius <= 0:
+        return mask_t1hw
+    return F.max_pool2d(mask_t1hw.float().clamp(0.0, 1.0), kernel_size=radius * 2 + 1,
+                        stride=1, padding=radius).clamp(0.0, 1.0)
+
+
+def _ltx2_greenfill(frames_thwc, mask_t1hw):
+    """Paint masked pixels chroma green. frames are comfy IMAGE [T,H,W,C]
+    float 0..1 (Wan2GP paints the same color in its own -1..1/uint8
+    conventions - (102,255,0)/255 here is the identical color)."""
+    color = torch.tensor(LTX2_MASKED_CONTROL_VIDEO_PAD_RGB, device=frames_thwc.device,
+                         dtype=frames_thwc.dtype) / 255.0
+    mask_thw1 = mask_t1hw.permute(0, 2, 3, 1).to(device=frames_thwc.device)
+    return torch.where(mask_thw1 > 0, color.view(1, 1, 1, 3), frames_thwc[..., :3])
+
+
+def _ltx2_green_tail_pad(frames_thwc, mask_t1hw, target_frames):
+    """Wan2GP's _pad_ltx2_masked_control_video_tail: pad the control video
+    with solid green frames (and the mask with ones) up to target_frames."""
+    t = frames_thwc.shape[0]
+    if t < target_frames:
+        color = torch.tensor(LTX2_MASKED_CONTROL_VIDEO_PAD_RGB, device=frames_thwc.device,
+                             dtype=frames_thwc.dtype) / 255.0
+        pad = color.view(1, 1, 1, 3).expand(target_frames - t, frames_thwc.shape[1],
+                                            frames_thwc.shape[2], 3)
+        frames_thwc = torch.cat([frames_thwc, pad], dim=0)
+    if mask_t1hw.shape[0] < frames_thwc.shape[0]:
+        pad = torch.ones((frames_thwc.shape[0] - mask_t1hw.shape[0], *mask_t1hw.shape[1:]),
+                         device=mask_t1hw.device, dtype=mask_t1hw.dtype)
+        mask_t1hw = torch.cat([mask_t1hw, pad], dim=0)
+    return frames_thwc, mask_t1hw
+
+
+def _ltx2_resize_long_side(tensor, long_side, mode):
+    height, width = tensor.shape[-2:]
+    current = max(height, width)
+    if current == long_side:
+        return tensor
+    scale = long_side / current
+    size = (max(1, int(round(height * scale))), max(1, int(round(width * scale))))
+    if mode == "nearest":
+        return F.interpolate(tensor, size=size, mode=mode)
+    return F.interpolate(tensor, size=size, mode=mode, align_corners=False)
+
+
+def _ltx2_low_res_mask_dilation(mask_c_thw, radius, long_side=LTX2_LAPLACIAN_MASK_LOW_RES_LONG_SIDE):
+    """Wan2GP's _apply_low_res_mask_dilation: soften/expand the blend mask by
+    dilating a low-res copy and upsampling back - gives the pyramid blend a
+    wide soft skirt around the mask instead of a hard edge."""
+    if radius <= 0:
+        return mask_c_thw
+    original_size = mask_c_thw.shape[-2:]
+    low = _ltx2_resize_long_side(mask_c_thw.float(), long_side, "bilinear")
+    low = F.max_pool2d(low, kernel_size=radius * 2 + 1, stride=1, padding=radius)
+    return F.interpolate(low, size=original_size, mode="bilinear", align_corners=False)
+
+
+def _ltx2_laplacian_pyramid_blend(generated_tchw, source_tchw, mask_t1hw, levels=7,
+                                  mask_low_res_dilation=0):
+    """Faithful port of Wan2GP's _laplacian_pyramid_blend (inpainting.py:121-150),
+    operating on [T,C,H,W] float 0..1 (comfy's unit range - Wan2GP's own
+    _to_unit_video conversion from its -1..1 convention is already done by
+    virtue of comfy IMAGE being unit-range; the math from that point on is
+    identical). Blends generated over source inside the mask, per pyramid
+    level, so low frequencies transition over a wide area and high
+    frequencies stay crisp - no visible seam at the mask boundary."""
+    generated = generated_tchw.float().clamp(0.0, 1.0).cpu()
+    source = source_tchw.float().clamp(0.0, 1.0).cpu()
+    mask = mask_t1hw.float().clamp(0.0, 1.0).cpu()
+    mask = _ltx2_low_res_mask_dilation(mask, mask_low_res_dilation).clamp(0.0, 1.0)
+    levels = max(1, min(int(levels), int(math.log2(max(2, min(generated.shape[-2:])))) - 2))
+
+    def gaussian_pyramid(x):
+        pyramid = [x]
+        for _ in range(1, levels):
+            if min(pyramid[-1].shape[-2:]) <= 8:
+                break
+            pyramid.append(F.interpolate(pyramid[-1], scale_factor=0.5, mode="bilinear",
+                                         align_corners=False, recompute_scale_factor=False))
+        return pyramid
+
+    def laplacian_pyramid(x):
+        gaussian = gaussian_pyramid(x)
+        laps = [cur - F.interpolate(nxt, size=cur.shape[-2:], mode="bilinear", align_corners=False)
+                for cur, nxt in zip(gaussian[:-1], gaussian[1:])]
+        laps.append(gaussian[-1])
+        return laps
+
+    generated_pyr = laplacian_pyramid(generated)
+    source_pyr = laplacian_pyramid(source)
+    mask_pyr = gaussian_pyramid(mask)
+    blended = [gen * m + src * (1.0 - m) for gen, src, m in zip(generated_pyr, source_pyr, mask_pyr)]
+    result = blended[-1]
+    for level in reversed(blended[:-1]):
+        result = F.interpolate(result, size=level.shape[-2:], mode="bilinear",
+                               align_corners=False) + level
+    return result.clamp(0.0, 1.0)
+
+
+def _comfy_mask_to_t1hw(mask, frames, height, width):
+    """Normalize a comfy MASK ([T,H,W] or [H,W]) to [T,1,H,W] at the target
+    frame count/size: resized bilinear, tiled/truncated along T (a 1-frame
+    mask becomes a static mask for the whole clip)."""
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    m = mask.unsqueeze(1).float()  # [T,1,H,W]
+    if m.shape[-2:] != (height, width):
+        m = F.interpolate(m, size=(height, width), mode="bilinear", align_corners=False)
+    t = m.shape[0]
+    if t < frames:
+        reps = -(-frames // t)
+        m = m.repeat(reps, 1, 1, 1)
+    return m[:frames].clamp(0.0, 1.0)
+
+
+class LTXV23RemovePerson:
+    """Stage 1 of the two-stage person-replacement recipe: regenerate a
+    masked region of a video (typically the person to remove) using the
+    official LTX-2.3 in/outpainting IC-LoRA - the trained Wan2GP recipe
+    (see the section comment above), shaped like LTXV23VidToVideo: `model`
+    in/out, LoRA loaded in-node via the selector, feed the outputs into
+    LTXV23KSampler → LTXV23CropVideoGuide → LTXV23AVDecode. Then composite
+    with LTXV23MaskBlend (using this node's `source_frames`/`blend_mask`
+    outputs) so everything outside the mask stays pixel-original.
+
+    `mask`: per-frame comfy MASK batch (white = remove/regenerate). Get one
+    from comfy-core's SAM3 nodes (SAM3_Detect on the frames, or
+    SAM3_VideoTrack → SAM3_TrackToMask) with a text prompt like "woman".
+    A single-frame mask is tiled across the whole clip (static mask).
+
+    `prompt`: describe the scene WITHOUT the removed subject (what the
+    filled-in region should show), e.g. "An empty room with a wooden floor
+    and beige walls, doorway in the background, static camera."
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Remove Person (inpaint) ⚡"
+    SEARCH_ALIASES = ['remove person', 'inpaint', 'inpainting', 'erase', 'masked removal',
+                      'object removal', 'clean plate']
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT", "IMAGE", "MASK")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "frame_rate",
+                    "source_frames", "blend_mask")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Masked video inpainting via the official LTX-2.3 in/outpainting "
+                   "IC-LoRA (green-fill recipe). Feed into LTXV23KSampler, then "
+                   "LTXV23CropVideoGuide, LTXV23AVDecode, and finally LTXV23MaskBlend "
+                   "with this node's source_frames/blend_mask outputs.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        lora_choices = ["none"] + folder_paths.get_filename_list("loras")
+        default_lora = next((c for c in lora_choices if "in-outpainting" in c), "none")
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE", {"tooltip": "The loader's video_vae output."}),
+                "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
+                "video": ("VIDEO", {"tooltip": "Source clip. Sets length/frame_rate from "
+                                    "itself, same as LTXV23VidToVideo."}),
+                "mask": ("MASK", {"tooltip": "Per-frame mask, white = regenerate (the person/"
+                                  "object to remove). SAM3_Detect / SAM3_VideoTrack + "
+                                  "SAM3_TrackToMask produce this. A 1-frame mask is tiled "
+                                  "across the clip."}),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True,
+                           "tooltip": "Describe the scene WITHOUT the removed subject - what "
+                                      "the regenerated region should contain."}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 768, "min": 64,
+                                  "max": nodes.MAX_RESOLUTION, "step": 32}),
+                "height": ("INT", {"default": 512, "min": 64,
+                                   "max": nodes.MAX_RESOLUTION, "step": 32}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "inpaint_lora": (lora_choices, {"default": default_lora,
+                                 "tooltip": "The official ltx-2.3-22b-ic-lora-in-outpainting "
+                                            "LoRA - loaded onto model HERE at strength 1.0 "
+                                            "(the trained value). \"none\" disables the whole "
+                                            "mechanism (for A/B only - the green fill would "
+                                            "just be reproduced verbatim)."}),
+            },
+            "optional": {
+                "keep_original_audio": ("BOOLEAN", {"default": True,
+                               "tooltip": "On = output keeps the source clip's own audio "
+                                          "unchanged. Off = the model generates new audio."}),
+                "mask_dilation": ("INT", {"default": LTX2_INPAINT_MASK_DILATION, "min": 0,
+                                  "max": 128,
+                                  "tooltip": "Pre-fill mask dilation radius in pixels "
+                                             "(trained default 5)."}),
+            },
+        }
+
+    @torch.inference_mode()
+    def prepare(self, model, clip, vae, audio_vae, video, mask, prompt, negative_prompt,
+                width, height, batch_size, inpaint_lora, keep_original_audio=True,
+                mask_dilation=LTX2_INPAINT_MASK_DILATION):
+        fsm = getattr(audio_vae, "first_stage_model", None)
+        if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
+            raise ValueError("audio_vae is not an LTX audio VAE; use the kit's "
+                             "*_audio_vae.safetensors in the audio_vae slot.")
+
+        if inpaint_lora not in (None, "none", ""):
+            model = nodes.LoraLoaderModelOnly().load_lora_model_only(model, inpaint_lora, 1.0)[0]
+        else:
+            logger.warning("LTX-2.3 remove: inpaint_lora=none - the green-filled region will "
+                           "NOT be regenerated (A/B mode only)")
+
+        components = video.get_components()
+        video_frames = components.images
+        video_audio = components.audio
+        length = _align_length(video_frames.shape[0])
+        frame_rate = float(components.frame_rate)
+
+        # Source frames at target size - kept pristine for the post-decode blend.
+        source_frames = comfy.utils.common_upscale(
+            video_frames.movedim(-1, 1), width, height, "bilinear", "center"
+        ).movedim(1, -1)[:, :, :, :3]
+
+        mask_t1hw = _comfy_mask_to_t1hw(mask, source_frames.shape[0], height, width)
+        mask_t1hw = _ltx2_dilate_mask(mask_t1hw, int(mask_dilation))
+        control_frames = _ltx2_greenfill(source_frames, mask_t1hw)
+        control_frames, mask_t1hw = _ltx2_green_tail_pad(control_frames, mask_t1hw, length)
+
+        t_latent = ((length - 1) // VIDEO_TEMPORAL_RATIO) + 1
+        device = comfy.model_management.intermediate_device()
+        video_samples = torch.zeros(
+            [batch_size, VIDEO_LATENT_CHANNELS, t_latent,
+             height // VIDEO_SPATIAL_RATIO, width // VIDEO_SPATIAL_RATIO], device=device)
+        video_mask = torch.ones((batch_size, 1, t_latent, 1, 1),
+                                dtype=torch.float32, device=device)
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
+        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
+
+        # Green-filled control video appended as clean guide tokens at
+        # frame_idx 0, strength exactly 1.0 - identical delegation to
+        # LTXV23VidToVideo's guide path. The user mask deliberately does
+        # NOT touch the denoise mask (Wan2GP force-zeroes masking_strength
+        # for this mode - the LoRA does the regeneration).
+        import comfy_extras.nodes_lt as nodes_lt
+
+        scale_factors = vae.downscale_index_formula
+        time_scale = scale_factors[0]
+        n = control_frames.shape[0]
+        guide_frames = control_frames[:((n - 1) // time_scale) * time_scale + 1]
+        guide_latent = _match_batch(vae.encode(guide_frames), batch_size)
+        frame_idx, _ = nodes_lt.LTXVAddGuide.get_latent_index(
+            positive, t_latent, guide_latent.shape[2], 0, scale_factors,
+            latent_shape=video_samples.shape)
+        positive, negative, video_samples, video_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+            positive, negative, frame_idx, video_samples, video_mask, guide_latent,
+            1.0, scale_factors, causal_fix=True)
+        logger.info("LTX-2.3 remove: green-filled guide %s appended @ strength 1.0 "
+                    "(mask dilation %d)", tuple(guide_latent.shape), int(mask_dilation))
+
+        n_latents = int(fsm.num_of_latents_from_frames(length, frame_rate))
+        channels = int(getattr(audio_vae, "latent_channels", fsm.latent_channels))
+        target = [batch_size, channels, n_latents, int(fsm.latent_frequency_bins)]
+        if keep_original_audio and video_audio is not None:
+            audio_latent, audio_mask = _encode_reference_audio(
+                audio_vae, video_audio, length / frame_rate)
+            audio_latent, audio_mask = _fit_audio_latent(audio_latent, audio_mask, target)
+            audio_latent = _match_batch(audio_latent, batch_size).to(video_samples.device)
+            audio_mask = _match_batch(audio_mask, batch_size).to(video_samples.device)
+        else:
+            audio_latent = torch.zeros(target, device=video_samples.device)
+            audio_mask = torch.ones_like(audio_latent)
+
+        latent = {
+            "samples": comfy.nested_tensor.NestedTensor((video_samples, audio_latent)),
+            "noise_mask": comfy.nested_tensor.NestedTensor((video_mask, audio_mask)),
+            "downscale_ratio_spacial": VIDEO_SPATIAL_RATIO,
+        }
+        blend_mask = mask_t1hw[:source_frames.shape[0], 0]  # comfy MASK [T,H,W]
+        return (model, positive, negative, latent, frame_rate, source_frames, blend_mask)
+
+
+class LTXV23MaskBlend:
+    """Stage 1's post-decode composite: Laplacian-pyramid blend of the
+    generated (inpainted) frames back over the ORIGINAL source frames,
+    inside the (softened) mask only - Wan2GP's _apply_ltx2_mask_blend,
+    ported faithfully (7-level pyramid, low-res mask dilation 6 at a 64px
+    long side, sanitize-source inside the mask). Everything outside the
+    mask ends up pixel-identical to the source; inside, only the
+    regenerated content shows, with no visible seam.
+
+    Wire: LTXV23AVDecode's video → core GetVideoComponents → `images` here;
+    LTXV23RemovePerson's `source_frames`/`blend_mask` → the matching
+    inputs. Output frames go to core CreateVideo (with the held audio).
+    """
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Mask Blend ⚡"
+    SEARCH_ALIASES = ['mask blend', 'laplacian blend', 'composite', 'inpaint blend',
+                      'seamless blend']
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "blend"
+    DESCRIPTION = ("Laplacian-pyramid composite of inpainted frames over the original "
+                   "source inside the mask - the post-decode half of the LTX-2.3 "
+                   "removal recipe.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Generated (inpainted) frames, decoded."}),
+                "source_frames": ("IMAGE", {"tooltip": "LTXV23RemovePerson's source_frames "
+                                            "output (the pristine originals)."}),
+                "mask": ("MASK", {"tooltip": "LTXV23RemovePerson's blend_mask output."}),
+            },
+            "optional": {
+                "mask_low_res_dilation": ("INT", {
+                    "default": LTX2_INPAINT_LAPLACIAN_MASK_LOW_RES_DILATION, "min": 0, "max": 64,
+                    "tooltip": "Soft-skirt width around the mask (trained default 6)."}),
+            },
+        }
+
+    @torch.inference_mode()
+    def blend(self, images, source_frames, mask,
+              mask_low_res_dilation=LTX2_INPAINT_LAPLACIAN_MASK_LOW_RES_DILATION):
+        height, width = source_frames.shape[1], source_frames.shape[2]
+        frames = min(images.shape[0], source_frames.shape[0])
+        generated = images[:frames, :height, :width, :3]
+        source = source_frames[:frames, :, :, :3]
+        if generated.shape[1:3] != source.shape[1:3]:
+            generated = comfy.utils.common_upscale(
+                generated.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+        mask_t1hw = _comfy_mask_to_t1hw(mask, frames, height, width)
+
+        # sanitize_masked_source (Wan2GP inpainting.py:162-170): inside the
+        # mask the "source" is replaced by the generated pixels BEFORE the
+        # blend, so leftover original content (the removed person) can't
+        # bleed back through the soft pyramid skirt.
+        mask_thw1 = mask_t1hw.permute(0, 2, 3, 1)
+        source = torch.where(mask_thw1 > 0, generated.to(source.dtype), source)
+
+        blended = _ltx2_laplacian_pyramid_blend(
+            generated.movedim(-1, 1), source.movedim(-1, 1), mask_t1hw,
+            mask_low_res_dilation=int(mask_low_res_dilation))
+        out = blended.movedim(1, -1).to(images.dtype)
+        if frames < images.shape[0]:
+            out = torch.cat([out, images[frames:]], dim=0)
+        return (out,)
 
 
 class LTXV23KSampler:
@@ -1688,6 +2132,45 @@ class LTXV23RefineSampler:
             model, positive, negative, upscaled, refine_seed, refine_steps, cfg,
             sampler_name, refine_schedule, denoise=1.0)
         return (refined,)
+
+
+class LTXV23LatentUpscale:
+    """Standalone x2 spatial latent upscale (the same _upsample_video_latent
+    the refine sampler uses internally, exposed as its own step) - for
+    composing a custom two-stage flow, e.g. the EditAnything recipe: sample
+    the ADD at half resolution (where guide tokens don't drown the edit -
+    Wan2GP's own stage 1 runs at half res for exactly this reason), crop the
+    guides, upscale x2 here, then run LTXV23KSampler with the "refine
+    (3 steps)" schedule on the result. Feed the CROPPED conditioning to the
+    refine pass - the keyframe coords would misalign after upscaling."""
+
+    CATEGORY = LTX23_CATEGORY
+    TITLE = "LTX-2.3 Latent Upscale x2 ⚡"
+    SEARCH_ALIASES = ['latent upscale', 'upscale', 'spatial upscaler', 'x2', 'two stage']
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "upscale"
+    DESCRIPTION = ("x2 spatial latent upscale via the official LTX-2.3 spatial "
+                   "upscaler, on the video half of the joint AV latent. Crop "
+                   "guides first; refine after with the 'refine (3 steps)' "
+                   "schedule.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "upscale_model": ("LATENT_UPSCALE_MODEL",),
+                "vae": ("VAE", {"tooltip": "Video VAE (for the latent statistics)."}),
+            },
+        }
+
+    @torch.inference_mode()
+    def upscale(self, latent, upscale_model, vae):
+        upscaled = _upsample_video_latent(latent, upscale_model, vae)
+        logger.info("LTX-2.3 latent upscale: %s -> %s",
+                    tuple(latent["samples"].unbind()[0].shape),
+                    tuple(upscaled["samples"].unbind()[0].shape))
+        return (upscaled,)
 
 
 class LTXV23CropVideoGuide:
@@ -2025,8 +2508,11 @@ NODE_CLASS_MAPPINGS = {
     "LTXV23EditAnythingPatch": LTXV23EditAnythingPatch,
     "LTXV23ImgToVideo": LTXV23ImgToVideo,
     "LTXV23VidToVideo": LTXV23VidToVideo,
+    "LTXV23RemovePerson": LTXV23RemovePerson,
+    "LTXV23MaskBlend": LTXV23MaskBlend,
     "LTXV23KSampler": LTXV23KSampler,
     "LTXV23RefineSampler": LTXV23RefineSampler,
+    "LTXV23LatentUpscale": LTXV23LatentUpscale,
     "LTXV23CropVideoGuide": LTXV23CropVideoGuide,
     "LTXV23AVDecode": LTXV23AVDecode,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor,
@@ -2039,8 +2525,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23EditAnythingPatch": LTXV23EditAnythingPatch.TITLE,
     "LTXV23ImgToVideo": LTXV23ImgToVideo.TITLE,
     "LTXV23VidToVideo": LTXV23VidToVideo.TITLE,
+    "LTXV23RemovePerson": LTXV23RemovePerson.TITLE,
+    "LTXV23MaskBlend": LTXV23MaskBlend.TITLE,
     "LTXV23KSampler": LTXV23KSampler.TITLE,
     "LTXV23RefineSampler": LTXV23RefineSampler.TITLE,
+    "LTXV23LatentUpscale": LTXV23LatentUpscale.TITLE,
     "LTXV23CropVideoGuide": LTXV23CropVideoGuide.TITLE,
     "LTXV23AVDecode": LTXV23AVDecode.TITLE,
     "LTXV23IDLoraPromptEditor": LTXV23IDLoraPromptEditor.TITLE,

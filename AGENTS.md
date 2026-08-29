@@ -3431,3 +3431,100 @@ false fail). 8/8 `smoke_ltx23_vid2vid.py`, 84/84 `pytest tests/`
 unaffected. `README.md` updated to describe the AV-vs-base block
 distinction and the full six-bug real-GPU-debugging arc.
 
+## EditAnything root-cause fix + Stage 1 build + first VERIFIED end-to-end person replacement (2026-08-29)
+
+The user reported the crash-free EditAnything produced ZERO visible
+effect and directed: plan it, execute it, and TEST IT MYSELF on real GPU
+before handing anything back. Done - this entry records the largest
+single working session of this feature's life, ending in a verified,
+frame-inspected, full two-stage person replacement.
+
+**Root cause of the zero effect (traced, then fixed, then proven):** a
+very-thorough agent traced Wan2GP's REAL pipeline orchestration (not just
+editanything.py, which had already been read - the code AROUND it:
+wgp.py -> ltx2.py::generate() -> ti2vid_two_stages/distilled.py ->
+ltx_core conditioning types). EditAnything conditions through THREE
+channels; the port had only the two smallest (ref_attn @0.01, ref_adaln
+@2.0). Missing: **Channel A - the reference image VAE-encoded and
+APPENDED as clean tokens at frame_idx 0 / strength 1.0**
+(VideoConditionByReferenceLatent) - the main identity carrier - and the
+**source video appended as clean guide tokens** (VideoConditionByKeyframe
+Index @ 1.0; NOT a partial-denoise v2v), which our node had gated on
+`ic_lora` so the "isolated EditAnything" test silently dropped the video
+entirely. Also: official prompts are imperative "Add <appearance>
+<placement> <scene relation>"; the reference is background-removed to
+white by default in Wan2GP; inpainting's mask is NOT a denoise mask
+(masking_strength force-zeroed - the in/outpainting LoRA regenerates
+green); and Wan2GP's stage 1 always runs at HALF RESOLUTION.
+
+**Fixes in `nodes/ltx23.py`:** (1) `ic_lora` and EditAnything now
+mutually exclusive (separate model modes in Wan2GP, never trained
+together); (2) source-video guide append fires under EditAnything
+without `ic_lora`; (3) Channel A: `images[0]` appended as a 1-frame
+clean guide BEFORE the video guide (Wan2GP's conditioning order), via
+the same comfy-core `LTXVAddGuide` delegation (the official Ingredients
+workflow appends reference IMAGES through the identical mechanism);
+(4) under EditAnything, `images` is a pure reference - the i2v hold is
+skipped entirely (the old image_strength hold was the "hard photo cut
+then unrelated video" glitch); (5) prompt/images tooltips document the
+imperative-Add format and white-background recommendation.
+
+**Stage 1 built (was never built):** `LTXV23RemovePerson` (mask dilate 5
+-> #66FF00 green-fill -> green tail pad -> clean guide append @ 1.0 with
+the in/outpainting LoRA loaded in-node; mask kept OUT of the denoise
+mask, per the trained recipe) + `LTXV23MaskBlend` (faithful 7-level
+Laplacian pyramid blend, low-res mask dilation 6 @ 64px long side,
+sanitize-source) + `LTXV23LatentUpscale` (the refine sampler's
+`_upsample_video_latent` exposed standalone, needed for the two-stage
+EditAnything flow). Downloads: `ltx-2.3-22b-ic-lora-in-outpainting-0.9`
+(DeepBeepMeep/LTX-2 -> models/loras/ltxv) and `sam3.1_multiplex_fp16`
+(Comfy-Org/sam3 -> models/checkpoints; comfy-core's own SAM3_Detect
+nodes produce the per-frame person masks - no custom pack needed).
+
+**Self-testing on real GPU (the part skipped before):** drove the live
+ComfyUI at 127.0.0.1:8188 via POST /prompt with API-format graphs,
+inspected every output by extracting frames with ffmpeg and READING
+them. A trimmed 3.3s/480x832 test clip kept iterations at ~1-4 min.
+Sequence of findings, each gating the next:
+- Corrected Stage 2 at full res: output now faithfully TRACKS the source
+  video (guide fix works) but no added person.
+- White-background reference alone: still no add.
+- Pure t2v + EditAnything isolation: **the reference woman herself
+  appears** (same face/hair/outfit) - all three channels proven live,
+  identity transfer real.
+- guide_strength 0.9/0.8: still copy-locked (and noising the guide is
+  the wrong dial anyway).
+- Dev-style config (non-fused 10Eros v1.5 bf16 + DMD LoRA @ 0.5, the
+  Wan2GP dev-variant recipe): still copy-locked -> checkpoint theory
+  disproven.
+- **HALF RESOLUTION: the add appears** - guide tokens at quarter count
+  no longer drown the edit, exactly why Wan2GP's stage 1 is half-res.
+  Recipe locked: EA sampling pass at half res -> CropVideoGuide ->
+  LatentUpscale x2 -> KSampler `refine (3 steps)`.
+- Stage 1 removal: worked on the FIRST real run - dancer completely
+  gone, background cleanly reconstructed, temporally stable.
+- **Full composed replace: VERIFIED.** Original hallway/camera
+  preserved, original dancer absent, the reference-identity woman
+  dancing in her place, coherent at the refined resolution.
+
+**Workflow shipping - new discipline after the widget-order incident:**
+the user's `ltxv_v2v_test.json` was rebuilt by a GENERATOR
+(scratchpad api_to_ui.py) that derives input/widget order from the live
+/object_info, never hand-assumed - then validated three ways: a strict
+positional re-reader diffing the UI file against the source API graph
+(0 mismatches), `comfy validate` (0 errors, converted_from_ui), and an
+actual END-TO-END RUN of the UI file through the comfy CLI's converter
+with the output frames inspected. That proof-run caught two real
+generator bugs before shipping (the frontend's implicit
+control_after_generate slot after any widget literally named seed; V3
+nodes serializing combos as the string "COMBO" rather than a choices
+list - both fixed). `ltxv_person_replace_API.json` ships alongside as
+the proven API-format twin. Old workflow backed up to scratchpad.
+
+Also: `10Eros_v1.5_bf16.safetensors` (43GB) + `LTX2.3_DMD_reshaped_r256`
+were copied into the portable install's model dirs for the dev-style
+diagnostic - left in place (usable models, user's own files).
+`test_dancer_small.mp4` (trimmed test clip) left in ComfyUI/input.
+12/12 + 8/8 smoke suites, 84/84 pytest. The user's ComfyUI server was
+restarted several times during testing (flagged in the approved plan).
+
