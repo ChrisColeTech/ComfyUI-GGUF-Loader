@@ -3528,3 +3528,28 @@ diagnostic - left in place (usable models, user's own files).
 12/12 + 8/8 smoke suites, 84/84 pytest. The user's ComfyUI server was
 restarted several times during testing (flagged in the approved plan).
 
+## Audio sync + fidelity fix in the composed replace workflow (2026-08-29)
+
+User: "why isnt it keeping the original audio, and syncing the original
+audio to the new video?" Two real causes, both mine: (1) the composed
+graph HARDCODED fps=24 into both AVDecode nodes and the CreateVideo mux
+while the user's source video is 30fps - the nodes' own frame_rate
+outputs exist precisely to be wired there (and the earlier simple
+workflow DID wire them); my small test clip happened to be 24fps so the
+verification runs never exercised the mismatch - a real test-coverage
+gap. (2) keep_original_audio holds audio by round-tripping it through
+the audio VAE (encode + decode), TWICE across the two stages - a lossy
+48kHz reconstruction, not the original track.
+
+Fix (workflow-level, no node code changes): fps inputs wired from the
+frame_rate outputs (RemovePerson.frame_rate -> stage-1 decode + clean-
+plate mux; VidToVideo.frame_rate -> final decode), and the final output
+re-muxed with the ORIGINAL waveform (GetVideoComponents on the source
+LoadVideo -> final CreateVideo.audio) - the held audio still conditions
+generation, but the delivered file carries the pristine track. Proven
+with a NATIVE-30fps test clip (the case the old graph failed): output
+30fps, audio 44.1kHz with loudness profile identical to the source
+(-14.7dB mean both; the VAE path would be 48kHz), replacement intact.
+Regenerated + strict-diffed (0 mismatches) + comfy-validated the user's
+ltxv_v2v_test.json / ltxv_person_replace_API.json and reinstalled both.
+
