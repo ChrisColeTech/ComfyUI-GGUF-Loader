@@ -126,37 +126,44 @@ def test_img2img_batch_size_repeats_empty_latent():
     print("[ok] FluxKleinImg2Img: batch_size repeats the empty latent correctly")
 
 
-def test_sizing_exact_honors_typed_canvas_over_reference_aspect():
-    # The reported bug: a ~1MP typed size + a square reference collapses to
-    # exactly 1024x1024 under the budget re-derive. sizing="exact" must
-    # honor the typed shape instead (snapped to /16), reference connected
-    # or not - in BOTH klein img2img nodes.
+def test_typed_canvas_is_always_honored_and_refs_encode_at_own_aspect():
+    # The reported bug (root-fixed, not worked around): the old
+    # "pixel budget" behavior re-derived the canvas from the reference
+    # photo's aspect, so a ~1MP typed size + a square-ish reference always
+    # collapsed to ~1024x1024. The canvas is now the typed width/height
+    # (/16-snapped) in BOTH klein img2img nodes, references connected or
+    # not - and references encode at their OWN aspect (~1MP), decoupled
+    # from the canvas, so nothing gets distorted.
     square_ref = torch.rand(1, 512, 512, 3)
+    encoded_shapes = []
+
+    def _spy_vae():
+        return types.SimpleNamespace(encode=lambda img: (
+            encoded_shapes.append(tuple(img.shape)) or torch.zeros(1, 128, 8, 8)))
 
     node = fk.FluxKleinImg2Img()
-    bw, bh = fk._scale_to_megapixels(square_ref, (768 * 1344) / (1024.0 * 1024.0))
-    assert bw == bh, "square ref must produce a square budget canvas"
     _, _, _, latent = node.prepare(
-        object(), _clip(), _vae(), "prompt", "", 1, 768, 1344, images=square_ref)
-    assert latent["samples"].shape == (1, 128, bh // 16, bw // 16), \
-        "default reference_aspect: square ref -> square canvas regardless of typed shape (old behavior)"
-    _, _, _, latent = node.prepare(
-        object(), _clip(), _vae(), "prompt", "", 1, 768, 1344, images=square_ref,
-        sizing="exact")
+        object(), _clip(), _spy_vae(), "prompt", "", 1, 768, 1344, images=square_ref)
     assert latent["samples"].shape == (1, 128, 1344 // 16, 768 // 16), \
-        "sizing=exact must honor the typed 768x1344 with a reference connected"
+        "typed 768x1344 must be the canvas even with a square reference connected"
+    # the square reference must be encoded square at ~1MP (1024x1024), not
+    # squeezed through the 768x1344 canvas
+    assert encoded_shapes[-1][1] == encoded_shapes[-1][2] == 1024, \
+        f"reference must encode at its own aspect (~1MP square), got {encoded_shapes[-1]}"
 
     cn = fk.FluxKleinControlNetImg2Img()
     _, _, _, latent = cn.prepare(
-        object(), _clip(), _vae(), "prompt", "", 1, 768, 1344,
-        control_source_image=square_ref, control_mode="manual", sizing="exact")
+        object(), _clip(), _spy_vae(), "prompt", "", 1, 768, 1344,
+        control_source_image=square_ref, control_mode="manual")
     assert latent["samples"].shape == (1, 128, 1344 // 16, 768 // 16), \
-        "controlnet node: sizing=exact must honor the typed canvas too"
+        "controlnet node: typed canvas honored with a control image connected"
+    assert encoded_shapes[-1][1] == encoded_shapes[-1][2] == 1024, \
+        "control map must also encode at its own aspect"
 
     # snapping: off-grid values land on the /16 grid, never explode
     assert fk._snap_exact_canvas(770, 1350) == (768, 1344)
-    print("[ok] sizing=exact honors the typed canvas in both klein nodes "
-          "(/16-snapped); default budget behavior unchanged")
+    print("[ok] typed width/height ARE the canvas in both klein nodes (/16-snapped); "
+          "references/control maps encode at their own ~1MP aspect, decoupled from it")
 
 
 def test_scale_to_megapixels_preserves_aspect_ratio():
@@ -177,24 +184,31 @@ def test_scale_to_megapixels_square_input_stays_square():
     print("[ok] _scale_to_megapixels: square input stays square")
 
 
-def test_img2img_canvas_derives_from_images_aspect_ratio_not_widget_defaults():
-    # Widget width/height default to a square 1024x1024 budget, but a
-    # non-square `images` input must reshape the canvas to match its own
-    # aspect ratio - this was the actual bug: previously the reference image
-    # got center-cropped to whatever aspect ratio the widgets said, silently
-    # distorting it.
+def test_img2img_canvas_honored_and_reference_never_distorted():
+    # History: an early bug center-cropped references through the widget
+    # aspect (distorting them); the fix for THAT re-derived the canvas from
+    # the reference's aspect - which created the next bug (typed resolution
+    # silently overridden). The root fix decouples them: the canvas is the
+    # typed width/height, and references encode at their OWN aspect (~1MP),
+    # so neither can distort or override the other.
     node = fk.FluxKleinImg2Img()
     model = object()
+    encoded_shapes = []
+    spy_vae = types.SimpleNamespace(encode=lambda img: (
+        encoded_shapes.append(tuple(img.shape)) or torch.zeros(1, 128, 8, 8)))
     wide_ref = torch.rand(1, 512, 1024, 3)  # 2:1 landscape
     _, _, _, latent = node.prepare(
-        model, _clip(), _vae(), "prompt", "", 1, 1024, 1024,
+        model, _clip(), spy_vae, "prompt", "", 1, 1024, 1024,
         images=wide_ref)
     lat_h, lat_w = latent["samples"].shape[-2], latent["samples"].shape[-1]
-    # Landscape reference -> landscape (or at least non-square) latent, not
-    # forced into the widgets' square 1024x1024 default.
-    assert lat_w > lat_h
-    print("[ok] FluxKleinImg2Img: canvas aspect ratio derives from `images`, "
-          "not the square widget defaults")
+    # canvas: exactly the typed square, reference notwithstanding
+    assert lat_w == lat_h == 1024 // 16
+    # reference: encoded landscape at ~2:1 (own aspect), never squeezed square
+    eh, ew = encoded_shapes[-1][1], encoded_shapes[-1][2]
+    assert abs((ew / eh) - 2.0) < 0.05, \
+        f"reference must keep its own 2:1 aspect at encode, got {ew}x{eh}"
+    print("[ok] FluxKleinImg2Img: typed canvas honored AND reference encoded at its "
+          "own aspect - neither distorts nor overrides the other")
 
 
 def test_img2img_canvas_prioritizes_images_over_control_source_image_for_sizing():
@@ -530,7 +544,7 @@ def test_sectioned_encoder_warns_without_tokenizer_but_still_encodes():
 if __name__ == "__main__":
     test_scale_to_megapixels_preserves_aspect_ratio()
     test_scale_to_megapixels_square_input_stays_square()
-    test_img2img_canvas_derives_from_images_aspect_ratio_not_widget_defaults()
+    test_img2img_canvas_honored_and_reference_never_distorted()
     test_img2img_canvas_prioritizes_images_over_control_source_image_for_sizing()
     test_img2img_images_batch_attaches_one_reference_latent_per_image()
     test_img2img_images_single_attaches_to_both_conditionings()
@@ -538,7 +552,7 @@ if __name__ == "__main__":
     test_img2img_images_and_control_source_image_combine()
     test_img2img_always_uses_flux2_real_empty_latent_shape()
     test_img2img_batch_size_repeats_empty_latent()
-    test_sizing_exact_honors_typed_canvas_over_reference_aspect()
+    test_typed_canvas_is_always_honored_and_refs_encode_at_own_aspect()
     test_img2img_control_source_image_auto_depth_uses_depth_helper()
     test_img2img_control_source_image_auto_canny_derives_edge_map()
     test_img2img_control_mode_none_skips_control_source_image_even_if_connected()
