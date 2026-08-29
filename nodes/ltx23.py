@@ -1963,12 +1963,22 @@ class LTXV23MaskBlend:
                 "mask_low_res_dilation": ("INT", {
                     "default": LTX2_INPAINT_LAPLACIAN_MASK_LOW_RES_DILATION, "min": 0, "max": 64,
                     "tooltip": "Soft-skirt width around the mask (trained default 6)."}),
+                "mask_b": ("MASK", {"tooltip": "Optional second mask, unioned with mask "
+                           "after both are fitted to the common frame count. For "
+                           "replacement composites: mask = the ORIGINAL subject's "
+                           "silhouette, mask_b = the GENERATED subject's - the union is "
+                           "the region taken from the generated frames, so the original "
+                           "subject can never peek out and no inpainting is needed. "
+                           "Differing frame counts between the two masks (the 8k+1 "
+                           "grid round-up) are reconciled here, which core "
+                           "MaskComposite cannot do."}),
             },
         }
 
     @torch.inference_mode()
     def blend(self, images, source_frames, mask,
-              mask_low_res_dilation=LTX2_INPAINT_LAPLACIAN_MASK_LOW_RES_DILATION):
+              mask_low_res_dilation=LTX2_INPAINT_LAPLACIAN_MASK_LOW_RES_DILATION,
+              mask_b=None):
         height, width = source_frames.shape[1], source_frames.shape[2]
         frames = min(images.shape[0], source_frames.shape[0])
         generated = images[:frames, :height, :width, :3]
@@ -1977,6 +1987,9 @@ class LTXV23MaskBlend:
             generated = comfy.utils.common_upscale(
                 generated.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
         mask_t1hw = _comfy_mask_to_t1hw(mask, frames, height, width)
+        if mask_b is not None:
+            mask_b_t1hw = _comfy_mask_to_t1hw(mask_b, frames, height, width)
+            mask_t1hw = torch.maximum(mask_t1hw, mask_b_t1hw)
 
         # sanitize_masked_source (Wan2GP inpainting.py:162-170): inside the
         # mask the "source" is replaced by the generated pixels BEFORE the

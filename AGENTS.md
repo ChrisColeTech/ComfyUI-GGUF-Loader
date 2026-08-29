@@ -3588,3 +3588,38 @@ GENERATED woman -> MaskBlend onto the clean plate; original waveform muxed.
 Verified frame-by-frame: identity, choreography, background, audio all
 correct; residual background invention confined to the masked region
 directly behind the subject.
+
+## 2026-08-29 (later) - Inpaint retired; Ostris edit port; mask_b union
+
+User verdict on the 3-stage replace: the in/outpaint stage "destroys the
+background and composition" - correct, it regenerates the WHOLE frame (the
+green-fill recipe is not surgical) and its invented fill survives in the
+ring the new silhouette doesn't cover. Pipeline v2 (installed as
+ltxv_v2v_final_subgraphs.json, flatten-diff 0 + validated + GPU-verified
+with frames): ONE pose-swap pass (the ltxv_v2v_best core) + SAM3 masks of
+BOTH women -> union -> LTXV23MaskBlend composite onto the ORIGINAL footage.
+No inpainting anywhere. MaskBlend gained optional `mask_b` (second mask,
+unioned after both are fitted to the common frame count - core MaskComposite
+hard-crashes on the 8k+1 round-up count mismatch, verified live 99 vs 105).
+Contract note: frames past the source length are appended un-composited
+(no source to blend onto) - the output keeps the full generated length.
+
+Krea2: ported ostris/ComfyUI-Krea2-Ostris-Edit (MIT) in-pack as
+CCTechKrea2OstrisEditTextEncode/-ModelPatch (reference latents at RoPE
+axis-0 index i+1 conditioned t=0; optional cached ref K/V) - proven
+bit-identical (PSNR inf, same seed) against the original pack, which is
+now removed. Drives thedeoxen's krea2_turbo_openpose_controlnet (skeleton
+map as image1). Krea2 control projection now passes non-target token
+branches through untouched (identity-edit's reference forward used to hit
+the strict count check and error) - identity + control now compose.
+
+Per-frame img2img swaps (krea2/klein/qwen, all variants incl. pose LoRA +
+identity refs): proven inferior for video - each signal works alone but
+pose+identity fusion fails (identity ref overrides the skeleton) and
+temporal coherence is unfixable per-frame. The LTX pipeline remains the
+recipe; giga-videos is being reshaped to ltxv_v2v_best 1:1 (engine-side
+OpenPose, union composite, inpaint code DELETED per user).
+
+Audio wiring note: LTXV23VidToVideo reads audio for keep_original_audio /
+length_from_audio from its `video` input - a silent pose clip makes both
+no-ops. The pose CreateVideo must carry the source audio track.

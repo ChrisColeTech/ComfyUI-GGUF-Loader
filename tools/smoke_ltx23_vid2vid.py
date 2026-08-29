@@ -546,6 +546,40 @@ def test_mask_blend_identity_outside_mask_and_generated_inside():
           "generated inside, soft trained skirt in between")
 
 
+def test_mask_blend_union_mask_b_and_frame_count_reconciliation():
+    node = ltx23.LTXV23MaskBlend()
+    torch.manual_seed(1)
+    # generated longer than source (the 8k+1 round-up case: 105 gen vs 99 src)
+    source = torch.rand(4, 64, 64, 3)
+    generated = torch.rand(6, 64, 64, 3)
+
+    # two disjoint masks with MISMATCHED frame counts - mask covers the left
+    # block, mask_b (gen count) the right block; union must take generated in
+    # BOTH blocks and source elsewhere, over the common 4 frames.
+    mask = torch.zeros(4, 64, 64)
+    mask[:, 16:32, 8:24] = 1.0
+    mask_b = torch.zeros(6, 64, 64)
+    mask_b[:, 16:32, 40:56] = 1.0
+    out, = node.blend(generated, source, mask, mask_low_res_dilation=0, mask_b=mask_b)
+    assert out.shape[0] == 6, ("output keeps the FULL generated length - frames past the "
+                               "source are appended un-composited (no source to blend onto)")
+    assert torch.allclose(out[4:], generated[4:], atol=1e-5), \
+        "tail frames beyond the source must be the generated frames verbatim"
+    assert torch.allclose(out[:4, 24, 16], generated[:4, 24, 16], atol=1e-5), \
+        "inside mask (left block) must be generated"
+    assert torch.allclose(out[:4, 24, 48], generated[:4, 24, 48], atol=1e-5), \
+        "inside mask_b (right block) must be generated - the union must include it"
+    assert torch.allclose(out[:4, 4, 32], source[:, 4, 32], atol=1e-5), \
+        "outside both masks must be source"
+
+    # mask_b=None keeps the original single-mask behaviour
+    out2, = node.blend(generated, source, mask, mask_low_res_dilation=0)
+    assert torch.allclose(out2[:4, 24, 48], source[:, 24, 48], atol=1e-5), \
+        "without mask_b the right block must stay source"
+    print("[ok] LTXV23MaskBlend: mask_b union with mismatched frame counts - trimmed to "
+          "common length, union region from generated, elsewhere source, None = old behaviour")
+
+
 if __name__ == "__main__":
     test_ic_lora_appends_and_crops_cleanly()
     test_video_with_ic_lora_none_is_plain_shape()
@@ -559,4 +593,5 @@ if __name__ == "__main__":
     test_editanything_and_ic_lora_are_mutually_exclusive()
     test_remove_person_greenfill_and_guide()
     test_mask_blend_identity_outside_mask_and_generated_inside()
+    test_mask_blend_union_mask_b_and_frame_count_reconciliation()
     print("[ok] all smoke_ltx23_vid2vid tests passed")
