@@ -126,6 +126,39 @@ def test_img2img_batch_size_repeats_empty_latent():
     print("[ok] FluxKleinImg2Img: batch_size repeats the empty latent correctly")
 
 
+def test_sizing_exact_honors_typed_canvas_over_reference_aspect():
+    # The reported bug: a ~1MP typed size + a square reference collapses to
+    # exactly 1024x1024 under the budget re-derive. sizing="exact" must
+    # honor the typed shape instead (snapped to /16), reference connected
+    # or not - in BOTH klein img2img nodes.
+    square_ref = torch.rand(1, 512, 512, 3)
+
+    node = fk.FluxKleinImg2Img()
+    bw, bh = fk._scale_to_megapixels(square_ref, (768 * 1344) / (1024.0 * 1024.0))
+    assert bw == bh, "square ref must produce a square budget canvas"
+    _, _, _, latent = node.prepare(
+        object(), _clip(), _vae(), "prompt", "", 1, 768, 1344, images=square_ref)
+    assert latent["samples"].shape == (1, 128, bh // 16, bw // 16), \
+        "default reference_aspect: square ref -> square canvas regardless of typed shape (old behavior)"
+    _, _, _, latent = node.prepare(
+        object(), _clip(), _vae(), "prompt", "", 1, 768, 1344, images=square_ref,
+        sizing="exact")
+    assert latent["samples"].shape == (1, 128, 1344 // 16, 768 // 16), \
+        "sizing=exact must honor the typed 768x1344 with a reference connected"
+
+    cn = fk.FluxKleinControlNetImg2Img()
+    _, _, _, latent = cn.prepare(
+        object(), _clip(), _vae(), "prompt", "", 1, 768, 1344,
+        control_source_image=square_ref, control_mode="manual", sizing="exact")
+    assert latent["samples"].shape == (1, 128, 1344 // 16, 768 // 16), \
+        "controlnet node: sizing=exact must honor the typed canvas too"
+
+    # snapping: off-grid values land on the /16 grid, never explode
+    assert fk._snap_exact_canvas(770, 1350) == (768, 1344)
+    print("[ok] sizing=exact honors the typed canvas in both klein nodes "
+          "(/16-snapped); default budget behavior unchanged")
+
+
 def test_scale_to_megapixels_preserves_aspect_ratio():
     # 1920x1080 (16:9) at a ~1MP budget should stay 16:9, not become square.
     image = torch.rand(1, 1080, 1920, 3)
@@ -505,6 +538,7 @@ if __name__ == "__main__":
     test_img2img_images_and_control_source_image_combine()
     test_img2img_always_uses_flux2_real_empty_latent_shape()
     test_img2img_batch_size_repeats_empty_latent()
+    test_sizing_exact_honors_typed_canvas_over_reference_aspect()
     test_img2img_control_source_image_auto_depth_uses_depth_helper()
     test_img2img_control_source_image_auto_canny_derives_edge_map()
     test_img2img_control_mode_none_skips_control_source_image_even_if_connected()

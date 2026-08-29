@@ -115,6 +115,26 @@ def _scale_to_megapixels(image, megapixels, resolution_steps=16):
     return int(new_w), int(new_h)
 
 
+_SIZING_MODES = ["reference_aspect", "exact"]
+_SIZING_TOOLTIP = (
+    "reference_aspect (default): width*height is a pixel BUDGET and the canvas "
+    "is re-derived from the connected photo's own aspect ratio at that total "
+    "pixel count - the shipped Klein workflow's behavior. exact: the typed "
+    "width/height are used literally (snapped to /16); reference photos are "
+    "still attached, they just no longer decide the canvas shape.")
+
+
+def _snap_exact_canvas(width, height, resolution_steps=16):
+    """Honor a user-typed canvas literally, snapped to Flux.2's /16 latent
+    grid (min one step per side)."""
+    new_w = max(resolution_steps, round(width / resolution_steps) * resolution_steps)
+    new_h = max(resolution_steps, round(height / resolution_steps) * resolution_steps)
+    if (new_w, new_h) != (width, height):
+        logger.info("Flux Klein: sizing=exact snapped %dx%d -> %dx%d (/16 grid)",
+                    width, height, new_w, new_h)
+    return int(new_w), int(new_h)
+
+
 # ── Nodes ─────────────────────────────────────────────────────────────────
 
 class FluxKleinModelLoader:
@@ -273,17 +293,22 @@ class FluxKleinImg2Img:
                                                "upstream). Each is independently encoded and "
                                                "attached to positive+negative conditioning as "
                                                "reference_latents - Klein's real edit mechanism."}),
+                "sizing": (_SIZING_MODES, {"default": "reference_aspect",
+                           "tooltip": _SIZING_TOOLTIP}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, batch_size, width, height,
-                images=None):
-        # width/height are a pixel BUDGET, not necessarily the exact output
-        # size - re-derive the real canvas from `images`, matching the real
-        # example workflow's own ImageScaleToTotalPixels -> GetImageSize ->
-        # EmptyFlux2LatentImage chain exactly, instead of trusting a
-        # user-typed value that may not match the photo's aspect ratio.
-        if images is not None:
+                images=None, sizing="reference_aspect"):
+        # sizing="reference_aspect" (default): width/height are a pixel
+        # BUDGET, not necessarily the exact output size - re-derive the real
+        # canvas from `images`, matching the real example workflow's own
+        # ImageScaleToTotalPixels -> GetImageSize -> EmptyFlux2LatentImage
+        # chain exactly. sizing="exact": honor the typed width/height
+        # literally (snapped to /16).
+        if sizing == "exact":
+            width, height = _snap_exact_canvas(width, height)
+        elif images is not None:
             megapixels = (width * height) / (1024.0 * 1024.0)
             width, height = _scale_to_megapixels(images[0:1], megapixels)
 
@@ -413,26 +438,33 @@ class FluxKleinControlNetImg2Img:
                     "tooltip": "auto_depth mode only. Model size for the automatic depth "
                                "estimation. Downloads on first use if not already in "
                                "models/depth_anything_v2."}),
+                "sizing": (_SIZING_MODES, {"default": "reference_aspect",
+                           "tooltip": _SIZING_TOOLTIP}),
             },
         }
 
     def prepare(self, model, clip, vae, prompt, negative_prompt, batch_size, width, height,
                 images=None, control_source_image=None, control_mode="manual",
-                depth_ckpt_name="depth_anything_v2_vitb.pth"):
-        # width/height are a pixel BUDGET, not necessarily the exact output
-        # size - re-derive the real canvas from whichever photo defines it
-        # (the first `images` frame takes priority; else
-        # control_source_image), matching the real example workflow's own
-        # ImageScaleToTotalPixels -> GetImageSize -> EmptyFlux2LatentImage
-        # chain exactly, instead of trusting a user-typed value that may
-        # not match the photo's aspect ratio.
+                depth_ckpt_name="depth_anything_v2_vitb.pth", sizing="reference_aspect"):
+        # sizing="reference_aspect" (default): width/height are a pixel
+        # BUDGET, not necessarily the exact output size - re-derive the real
+        # canvas from whichever photo defines it (the first `images` frame
+        # takes priority; else control_source_image), matching the real
+        # example workflow's own ImageScaleToTotalPixels -> GetImageSize ->
+        # EmptyFlux2LatentImage chain exactly. sizing="exact": honor the
+        # typed width/height literally (snapped to /16) - the fix for
+        # "it keeps overriding my custom resolution": with a ~1MP budget and
+        # a square-ish reference, the aspect re-derive lands on exactly
+        # 1024x1024 no matter what shape the user typed.
         if images is not None:
             size_source = images[0:1]
         elif control_source_image is not None:
             size_source = control_source_image
         else:
             size_source = None
-        if size_source is not None:
+        if sizing == "exact":
+            width, height = _snap_exact_canvas(width, height)
+        elif size_source is not None:
             megapixels = (width * height) / (1024.0 * 1024.0)
             width, height = _scale_to_megapixels(size_source, megapixels)
 
