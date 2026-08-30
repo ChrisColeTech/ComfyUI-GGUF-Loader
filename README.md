@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; LTX-2.5 A/V under `🤖 CCTech/LTX-2.5`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`.
 
 | Node | Purpose |
 |---|---|
@@ -162,6 +162,18 @@ A 5th output, `speech_text_batch`, splits `[SPEECH]` into one clip per non-blank
 **LTX-2.3 ID-LoRA Assembler** is the Editor's formatting step exposed standalone: three plain `visual`/`speech`/`sounds` `STRING` inputs in, one formatted `[VISUAL]: .../[SPEECH]: .../[SOUNDS]: ...` string out — no `source`, no parsing, no edit-state. For when you already have the three pieces from elsewhere (e.g. a clip picked via `LTXV23SpeechBatchSelector`, or hand-typed values) and just need them combined, rather than parsed apart from a captioner's raw output.
 
 `tools/smoke_ltx23.py` validates every kit file's load path (both DiT formats, all three quants, TE + projections, both VAEs) without sampling. `tools/smoke_id_lora_prompt_editor.py` covers the parser, every state-machine transition (first run empty/filled, edit preserved, source changed, per-node isolation), the batch split, and the selector's indexing/clamping — no GPU required; the JS write-back itself needs a browser to confirm.
+
+### LTX-2.5 A/V
+
+The same one-loader-plus-recipe-nodes treatment for LTX-2.5-family A/V checkpoints, under `🤖 CCTech/LTX-2.5` — a faithful mirror of ComfyUI's official `video_ltx2_5_i2v` workflow (verified end-to-end on real GPU, including the GGUF DiT path). LTX-2.5 is a different animal from 2.3 (128-channel /32-spatial /8-temporal video latents, a Gemma-4-12B text encoder with projection, its own VAE pair and trained schedules), which is why loading a 2.5 checkpoint in the 2.3 nodes errors — this family is the supported path.
+
+- **LTX-2.5 Models Loader** (`LTXV25ModelsLoader`): DiT (`comfy-int8` safetensors or Q6_K/Q8_0 GGUF — GGUF stays quantized), the `gemma4-12b-with-proj` text encoder, video VAE, audio VAE → `MODEL / CLIP / VAE / VAE`, with the same single-entry encoder cache as the 2.3 loader. Validates the checkpoint really is an `ltxav` A/V model and that the two VAEs aren't swapped.
+- **LTX-2.5 Img to Video** (`LTXV25ImgToVideo`): prompts + the stage-1 init latent for `t2v`/`i2v` (mode validated against what's connected). `width`/`height` are the FINAL resolution — stage 1 samples at half (the official recipe's `a/2` math) and the latent upscaler doubles it back. i2v runs core `LTXVPreprocess` (`img_compression` 18) then core `LTXVImgToVideoInplace`'s exact in-place first-frame hold at `image_strength` **0.7** (the workflow's link-traced stage-1 value). **One or more LoRAs load right in the node**: `lora_1/2/3` + strengths chain through comfy-core's real `LoraLoaderModelOnly` in order (`none` = skip) — cross-version LoRAs like `LTX-2.3-ID-LoRA-TalkVid-3K` @ 0.6 + `LTX-2-Image2Vid-Adapter` @ 0.6 (the official workflow's own chain) apply cleanly. Always take `model` from this node's output.
+- **LTX-2.5 KSampler (distilled)** (`LTXV25KSampler`): the two official `ManualSigmas` schedules verbatim — `distilled (8 steps)` and `refine (3 steps)` — through core's real `Guider_LTXAVDualCFG` (separate video/audio CFG, both 1.0 official) with `euler_ancestral`. No step-count or scheduler widget to get wrong.
+- **LTX-2.5 Latent Upscale x2** (`LTXV25LatentUpscale`): the official spatial ×2 latent upscaler on the video half (audio passes through), plus the refine-pass re-hold — wire the SAME first-frame image in and it's re-held at **1.0** on the upscaled latent (the workflow's second `LTXVImgToVideoInplace`), rebuilding the joint noise mask.
+- **LTX-2.5 AV Decode** (`LTXV25AVDecode`): tiled video VAE decode (the workflow's `512/64/64/16` defaults) + audio VAE decode + mux to `VIDEO`, one `fps` threaded through — wire the prep node's `frame_rate` output in.
+
+The chain: **Models Loader** → **Img to Video** (`i2v`, image + LoRAs) → **KSampler** `distilled (8 steps)` → **Latent Upscale x2** (same image) → **KSampler** `refine (3 steps)` → **AV Decode** → core `SaveVideo`. `LTXV25EmptyLatentAVBatch` remains for hand-rolled graphs. No CropVideoGuide counterpart exists on purpose: 2.5's hold overwrites latent frames in place rather than appending guide frames, so there is nothing to crop. `tools/smoke_ltx25.py` covers the geometry, both holds, both sigma lists, the LoRA chain order, the dual-CFG sampler composition, and the decode wiring on CPU.
 
 ### Preprocessors
 

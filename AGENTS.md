@@ -3623,3 +3623,29 @@ OpenPose, union composite, inpaint code DELETED per user).
 Audio wiring note: LTXV23VidToVideo reads audio for keep_original_audio /
 length_from_audio from its `video` input - a silent pose clip makes both
 no-ops. The pose CreateVideo must carry the source audio track.
+
+## 2026-08-30 - LTX-2.5 node family (mirrors video_ltx2_5_i2v.json, GPU-verified)
+
+New family in `nodes/ltx25.py` under `🤖 CCTech/LTX-2.5`: `LTXV25ModelsLoader`
+(int8 safetensors or GGUF DiT + gemma4-12b-with-proj CLIP + both VAEs),
+`LTXV25ImgToVideo` (t2v/i2v prep at HALF the target res with core
+LTXVPreprocess crf-18 + LTXVImgToVideoInplace hold, and lora_1/2/3 chained
+in-node via core LoraLoaderModelOnly), `LTXV25KSampler` (the workflow's two
+ManualSigmas lists verbatim through core Guider_LTXAVDualCFG +
+euler_ancestral), `LTXV25LatentUpscale` (official x2 spatial upscaler on the
+video half + refine re-hold), `LTXV25AVDecode` (tiled video decode + audio
+decode + mux, one fps).
+
+Hold strengths, link-traced from the workflow JSON (initial agent build had
+them INVERTED; caught before ship by tracing nodes 357/349): stage 1 = 0.7 on
+the EMPTY half-res latent, refine = 1.0 on the UPSCALED latent. The brief's
+"stage 1 @ 1.0" reading was wrong - trust the link trace, not widget order.
+
+GPU-verified on 127.0.0.1:8188: full chain i2v 1280x704x73f with
+LTX-2.3-ID-LoRA-TalkVid-3K @0.6 + LTX-2-Image2Vid-Adapter @0.6 chained
+(zero "lora key not loaded" - cross-version LoRAs apply cleanly), first
+frame = input image center-cropped, motion + audio present; and the
+Q8_0 GGUF DiT variant end-to-end. `tools/smoke_ltx25.py` (10 tests) covers
+the CPU-checkable math. giga-videos got the same recipe corrections in
+parallel (its ltx25 refine sigmas, sampler, upscaler file, holds, crf were
+all off before the same audit).

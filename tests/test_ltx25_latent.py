@@ -39,12 +39,29 @@ def _load_module():
     core = sys.modules.setdefault("nodes", types.ModuleType("nodes"))
     core.MAX_RESOLUTION = 16384
 
+    # nodes/ltx25.py grew the full LTX-2.5 family (loader/prep/sampler/
+    # upscale/decode), which imports these at module scope the same way
+    # nodes/ltx23.py does. None of them run in these geometry tests - empty
+    # module stubs are enough for the import to land.
+    for name in ("comfy.sample", "comfy.samplers", "comfy.sd", "comfy.utils"):
+        sub = sys.modules.setdefault(name, types.ModuleType(name))
+        setattr(comfy, name.split(".", 1)[1], sub)
+    sys.modules.setdefault("folder_paths", types.ModuleType("folder_paths"))
+    sys.modules.setdefault("node_helpers", types.ModuleType("node_helpers"))
+
     package = sys.modules.setdefault(_PKG, types.ModuleType(_PKG))
     package.__path__ = [str(ROOT)]
     spec = importlib.util.spec_from_file_location(full, ROOT / "nodes" / "ltx25.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[full] = module
     spec.loader.exec_module(module)
+    # The pack's root __init__.py probes `import comfy.utils` to decide
+    # whether it is running inside a real ComfyUI (see tests/conftest.py's
+    # warning) - leaving the stub registered sends that probe down the
+    # node-registration path and breaks every loader test. The ltx25 module
+    # keeps its own reference via the `comfy` package attribute, so the
+    # sys.modules entry can be dropped again after the import has landed.
+    sys.modules.pop("comfy.utils", None)
     return module
 
 
