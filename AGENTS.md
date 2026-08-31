@@ -3750,3 +3750,22 @@ picks the candidate grid size with the CLOSEST ASPECT to the typed target
 (then closest pixel count, then smaller - deterministic ties). 728x1296 @
 ds2 -> 640x1152 (1.1% aspect err); exact-grid sizes pass through untouched.
 GPU-verified: framing matches the source again.
+
+## 2026-08-31 (v2.15.0) - LTX Reference / Face Identity family (10s-pack port)
+
+Ported the user's 10s-comfy-nodes reference trio into nodes/ltx_reference.py
+(six CCTech-prefixed nodes; source ids would collide with the still-installed
+pack). Mechanism: token-prefix injection inside the model forward (patchified
+reference concatenated ahead of the video tokens at frame-0 RoPE coords,
+adaLN extended, unpatchify strips) - different intervention point from both
+the IC-LoRA guide append and the removed EditAnything; composes with the v2v
+guide path in principle (untested). Port deviation: per-INSTANCE patching
+(source patched the LTXAVModel class globally). GPU-found port bug: the
+source predates joint AV NestedTensor latents - every target_latent consumer
+now unbinds the video half (_video_latent_samples); before the fix the
+Conditioning node silently skipped grid-matching and the Reinforcer crashed.
+Verified ladder at seed 42 t2v: off = stranger; conditioning = visible pull
+toward the reference; reinforcer + Best_FaceID_v1.0_LoRA @1.0 (downloaded,
+also staged into giga's ltxv_23 tree) = closest match. Author-recipe values
+confirmed from his own workflow JSON: lora 1.0, source_id 2, phase_scale 1,
+overlap layout.

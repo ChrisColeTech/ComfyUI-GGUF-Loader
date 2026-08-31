@@ -169,6 +169,15 @@ The same one-loader-plus-recipe-nodes treatment for LTX-2.5-family A/V checkpoin
 
 The i2v chain: **Models Loader** → (any `LoraLoaderModelOnly` chain) → **Img to Video** (`i2v`, image) → **KSampler** `distilled (8 steps)` → **Latent Upscale x2** (same image) → **KSampler** `refine (3 steps)` → **AV Decode** → core `SaveVideo`. The v2v chain inserts **Crop Video Guide** between the distilled pass and the upscale. `LTXV25EmptyLatentAVBatch` remains for hand-rolled graphs. `tools/smoke_ltx25.py` covers the geometry, both holds, both sigma lists, the VidToVideo surface (guide append/crop round-trip, the mode validation matrix, audio holds), the dual-CFG sampler composition, and the decode wiring on CPU.
 
+### LTX Reference / Face Identity (ported from the 10s dev pack)
+
+Token-prefix reference conditioning for any ltxav model (2.3 and 2.5), under `🤖 CCTech/LTX Reference` — a genuinely different mechanism from the IC-LoRA guide append: the reference image's latent is patchified and concatenated IN FRONT of the video token sequence inside the model's forward (frame-0 RoPE coordinates, adaLN rows extended to match, prefix stripped in unpatchify — the sampler never sees a shape change, no crop node exists or is needed). Zero new weights; per-instance clone-then-patch.
+
+- **LTX Reference Enable** patches the MODEL; **LTX Reference Conditioning** supplies the reference (VAE-encode, `process_latent_in` normalization, `strength`, `position_mode` reference/prefix_continuous; `strength 0` is a clean bypass). **Sequence Conditioning**, **Probe**, and **Bypass** complete the family.
+- **LTX Face Identity Reinforcer** composes the full Best-Face-ID recipe in one node: face detection (YuNet→MediaPipe→Haar), auto face crop with bbox tracking, soft/hard spatial gating, and the trained `source_id 2 / phase_scale 1` rotary phase tag. Pair it with `Best_FaceID_v1.0_LoRA.safetensors` (Alissonerdx/LTX-Best-Face-ID) @ 1.0 on the model — the phase tag is that LoRA's trained convention and does little without it.
+
+GPU-verified A/B (same seed, t2v): conditioning alone visibly pulls identity toward the reference photo; reinforcer + Best-Face-ID locks it closest; strength 0 / disabled are bitwise no-ops (CPU-proven). Works with joint AV latents (this pack's prep nodes) — the video half is unbound automatically. `tools/smoke_ltx_reference.py` covers the rotation math, adaLN extension, per-instance install, injection round-trip, and face gating on CPU.
+
 ### Preprocessors
 
 This repo keeps only the **minimum** preprocessing this pack's own img2img nodes actually derive internally: **Depth Anything V2** and plain **`cv2.Canny`** — the two preprocessors `Krea2Img2Img`/`QwenImageImg2Img`/`Flux Klein img2img`'s `control_mode="auto_depth"`/`"auto_canny"` have always used. Nothing beyond that is registered as its own node here.
