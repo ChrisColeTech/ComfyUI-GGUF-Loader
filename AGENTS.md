@@ -3649,3 +3649,23 @@ Q8_0 GGUF DiT variant end-to-end. `tools/smoke_ltx25.py` (10 tests) covers
 the CPU-checkable math. giga-videos got the same recipe corrections in
 parallel (its ltx25 refine sigmas, sampler, upscaler file, holds, crf were
 all off before the same audit).
+
+## 2026-08-30 (later) - lora_1/2/3 removed; LTXV25VidToVideo full ltx23 mirror
+
+The generic numbered `lora_1/2/3` slots on LTXV25ImgToVideo were a spec
+invention (mine, in the build brief) - the ltx23 convention is NAMED
+purpose-specific selectors, and general LoRA attachment is external
+LoraLoaderModelOnly chaining on the model wire. The user rejected the slots
+("i didnt say make any slots generic") and, equally, rejected removal
+framings ("i didnt say remove anything") - what they wanted, confirmed via a
+side-by-side ASCII mockup of the two node UIs (do this FIRST next time), was
+the real mirror: `LTXV25VidToVideo` carrying LTXV23VidToVideo's exact surface
+(mode t2v/i2v/v2v, video, ic_lora + strength, guide_strength,
+keep_original_audio, latent_downscale_factor, reference_audio,
+length_from_audio, editanything_lora + strength + module_path,
+reference_mode) on the 2.5 two-stage recipe, plus `LTXV25CropVideoGuide`.
+img_compression is the one 2.5-specific widget. EA machinery is imported
+from ltx23.py, not duplicated; guides/holds/references all land on the
+stage-1 half-res grid; chain is prep -> distilled -> crop -> upscale ->
+refine -> decode. ImgToVideo lost only the numbered slots (LoRAs chain
+externally, matching LTXV23ImgToVideo graphs and the official workflow).

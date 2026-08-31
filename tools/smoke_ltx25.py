@@ -8,8 +8,11 @@ GPU/weight-free (CPU only, tiny tensors).
 
 Covers: stage-1 latent geometry (half the target resolution), the i2v hold
 strength math (LTXVImgToVideoInplace semantics), the two sigma presets
-verbatim, LoRA chaining order through the (spied) LoraLoaderModelOnly
-delegation, the x2 upscale + refine re-hold, and the AV decode wiring.
+verbatim, LTXV25VidToVideo's full 2.3-mirror surface (ic_lora guide append on
+the stage-1 grid + crop round-trip, EditAnything lora-then-patch chaining and
+Channel-A reference append, mode/selector validation, latent_downscale_factor
+against the half grid, reference_audio/keep_original_audio holds), the x2
+upscale + refine re-hold, and the AV decode wiring.
 
 Usage: python tools/smoke_ltx25.py
 """
@@ -176,32 +179,278 @@ def test_img_compression_delegates_to_core_preprocess():
           "LTXVPreprocess round-trip (18 alters pixels, 0 is a passthrough)")
 
 
-def test_lora_chaining_order_and_none_skip():
+class _FakeComponents:
+    def __init__(self, images, audio, frame_rate):
+        self.images = images
+        self.audio = audio
+        self.frame_rate = frame_rate
+
+
+class _FakeVideo:
+    def __init__(self, n_frames=25, h=256, w=448, fps=24.0, audio=None):
+        self.images = torch.rand(n_frames, h, w, 3)
+        self.fps = fps
+        self.audio = audio
+
+    def get_components(self):
+        return _FakeComponents(self.images, self.audio, self.fps)
+
+
+def _v2v(**kw):
+    node = ltx25.LTXV25VidToVideo()
+    args = dict(model="base-model", clip=_fake_clip(), vae=_FakeVideoVAE(),
+                audio_vae=_FakeAudioVAE(), mode="t2v", prompt="prompt",
+                negative_prompt="", width=448, height=256, length=121,
+                frame_rate=24.0, batch_size=1)
+    args.update(kw)
+    return node.prepare(**args)
+
+
+def _target_t(n_frames):
+    return ((ltx25._align_length(n_frames) - 1) // 8) + 1
+
+
+def test_v2v_ic_lora_appends_on_half_grid_and_crops_cleanly():
     orig_loader = ltx25.nodes.LoraLoaderModelOnly
     ltx25.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
     _FakeLoraLoaderModelOnly.calls = []
     try:
-        out_model, *_ = _prep(lora_1="a.safetensors", lora_1_strength=0.6,
-                              lora_2="none",
-                              lora_3="c.safetensors", lora_3_strength=0.9)
+        out_model, positive, negative, latent, frame_rate = _v2v(
+            mode="v2v", video=_FakeVideo(), ic_lora="beard_removal.safetensors",
+            ic_lora_strength=0.8, keep_original_audio=False)
     finally:
         ltx25.nodes.LoraLoaderModelOnly = orig_loader
 
-    # lora_2="none" skipped; order preserved; each load receives the PREVIOUS
-    # load's output (real chaining, like the workflow's two chained
-    # LoraLoaderModelOnly nodes).
+    assert out_model == ("lora-patched", "beard_removal.safetensors", "base-model"), (
+        "ic_lora set -> model must come back through the real LoraLoaderModelOnly "
+        "delegation")
     assert _FakeLoraLoaderModelOnly.calls == [
-        ("base-model", "a.safetensors", 0.6),
-        (("lora-patched", "a.safetensors", "base-model"), "c.safetensors", 0.9),
-    ]
-    assert out_model == ("lora-patched", "c.safetensors",
-                         ("lora-patched", "a.safetensors", "base-model"))
+        ("base-model", "beard_removal.safetensors", 0.8)]
+    assert frame_rate == 24.0  # taken from the (fake) clip
+    video_latent, audio_latent = latent["samples"].unbind()
 
-    out_model, *_ = _prep()
-    assert out_model == "base-model", "all-none -> model passes through untouched"
-    print("[ok] LTXV25ImgToVideo: lora_1/2/3 chain through comfy-core's real "
-          "LoraLoaderModelOnly in order, \"none\" entries skipped, all-none is a "
-          "pure passthrough")
+    target_t = _target_t(25)  # clip length wins over the length widget
+    # STAGE-1 half grid: target 448x256 -> stage 224x128 -> latent 4 x 7
+    assert video_latent.shape[-2:] == (128 // 32, 224 // 32)
+    assert video_latent.shape[2] > target_t  # guide frames appended on top
+
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+    assert num_keyframes > 0
+    assert video_latent.shape[2] - num_keyframes == target_t
+
+    crop_node = ltx25.LTXV25CropVideoGuide()
+    cpos, cneg, cropped = crop_node.crop(positive, negative, latent)
+    cropped_video, cropped_audio = cropped["samples"].unbind()
+    assert cropped_video.shape[2] == target_t
+    assert torch.equal(cropped_audio, audio_latent)
+    _, after = nodes_lt.get_keyframe_idxs(cpos, cropped_video.shape)
+    assert after == 0
+    print("[ok] LTXV25VidToVideo: ic_lora loads via comfy-core's real "
+          "LoraLoaderModelOnly and appends real guide frames on the STAGE-1 half "
+          "grid (real LTXVAddGuide), length/frame_rate from the clip; "
+          "LTXV25CropVideoGuide removes exactly them back off")
+
+
+def test_v2v_ic_lora_none_is_plain_shape_and_crop_is_noop():
+    out_model, positive, negative, latent, _ = _v2v(
+        mode="v2v", video=_FakeVideo(), ic_lora="none", keep_original_audio=False)
+    assert out_model == "base-model"  # no lora load, pure passthrough
+    video_latent, _ = latent["samples"].unbind()
+    assert video_latent.shape[2] == _target_t(25)  # nothing appended
+
+    crop_node = ltx25.LTXV25CropVideoGuide()
+    _, _, cropped = crop_node.crop(positive, negative, latent)
+    assert cropped is latent  # no-op passthrough
+    print("[ok] LTXV25VidToVideo: ic_lora=none -> plain shape (video only for "
+          "length/frame_rate), no lora load, LTXV25CropVideoGuide is a no-op")
+
+
+def test_v2v_i2v_hold_lands_on_stage_grid_with_video_guide_layered():
+    image = torch.rand(1, 256, 448, 3)
+    orig_loader = ltx25.nodes.LoraLoaderModelOnly
+    ltx25.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
+    _FakeLoraLoaderModelOnly.calls = []
+    try:
+        _, positive, _, latent, _ = _v2v(
+            mode="i2v", images=image, image_strength=0.7, img_compression=0,
+            video=_FakeVideo(), ic_lora="task.safetensors",
+            keep_original_audio=False)
+    finally:
+        ltx25.nodes.LoraLoaderModelOnly = orig_loader
+
+    video_latent, _ = latent["samples"].unbind()
+    assert video_latent.shape[2] > _target_t(25)  # guide still appended on top
+    mask_v, _ = latent["noise_mask"].unbind()
+    assert torch.allclose(mask_v[:, :, 0], torch.tensor(1.0 - 0.7)), \
+        "i2v hold still applied under the guide append"
+    assert torch.all(video_latent[:, :, 0] == 1.0), \
+        "held frame overwritten on the stage grid (fake encode = ones)"
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+    assert num_keyframes > 0
+    print("[ok] LTXV25VidToVideo: mode=i2v with video also connected - image hold "
+          "and IC-LoRA guide combine independently, both on the stage-1 grid")
+
+
+def test_v2v_mode_and_selector_validation_matrix():
+    image = torch.rand(1, 256, 448, 3)
+    cases = [
+        (dict(mode="v2v"), "video"),
+        (dict(mode="i2v"), "images"),
+        (dict(mode="t2v", video=_FakeVideo()), "t2v"),
+        (dict(mode="t2v", images=image), "t2v"),
+        (dict(mode="t2v", editanything_lora="ea.standard.safetensors"), "together"),
+        (dict(mode="t2v", editanything_module_path="ea.module.safetensors"), "together"),
+        (dict(mode="v2v", video=_FakeVideo(), ic_lora="task.safetensors",
+              editanything_lora="ea.standard.safetensors",
+              editanything_module_path="ea.module.safetensors"), "mutually exclusive"),
+    ]
+    for kw, needle in cases:
+        try:
+            _v2v(**kw)
+            assert False, f"expected ValueError for {kw}"
+        except ValueError as e:
+            assert needle in str(e), (kw, str(e))
+    print("[ok] LTXV25VidToVideo: mode/selector validation matrix matches the "
+          "2.3 node - required sockets, EA pair set together, ic_lora+EA "
+          "mutually exclusive")
+
+
+def test_v2v_latent_downscale_factor_validated_against_stage_grid():
+    orig_loader = ltx25.nodes.LoraLoaderModelOnly
+    ltx25.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
+    try:
+        # target 448x256 -> stage 224x128; factor 2 needs stage % 64 == 0,
+        # 224 % 64 = 32 -> must refuse with a stage-1 message.
+        try:
+            _v2v(mode="v2v", video=_FakeVideo(), ic_lora="task.safetensors",
+                 latent_downscale_factor=2.0, keep_original_audio=False)
+            assert False, "expected ValueError for factor 2 on a 224x128 stage grid"
+        except ValueError as e:
+            assert "STAGE-1" in str(e)
+        # 512x256 -> stage 256x128: 256 % 64 == 0 and 128 % 64 == 0 -> ok.
+        _, positive, _, latent, _ = _v2v(
+            mode="v2v", width=512, height=256, video=_FakeVideo(h=256, w=512),
+            ic_lora="task.safetensors", latent_downscale_factor=2.0,
+            keep_original_audio=False)
+    finally:
+        ltx25.nodes.LoraLoaderModelOnly = orig_loader
+    video_latent, _ = latent["samples"].unbind()
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+    assert num_keyframes > 0, "downscaled guide still appended via dilate_latent"
+    print("[ok] LTXV25VidToVideo: latent_downscale_factor divisibility is checked "
+          "against the stage-1 half resolution and the ref0.5-style guide still "
+          "appends when it divides")
+
+
+def test_v2v_editanything_chains_lora_then_patch_and_appends_reference():
+    import cctech_gguf_pkg.nodes.ltx23 as ltx23_mod
+
+    image = torch.rand(1, 256, 448, 3)
+    patch_calls = []
+
+    def _fake_patch(model, vae, reference_image, module_path, reference_mode):
+        patch_calls.append((model, module_path, reference_mode,
+                           tuple(reference_image.shape)))
+        return ("ea-patched", model)
+
+    orig_loader = ltx25.nodes.LoraLoaderModelOnly
+    orig_patch = ltx23_mod._apply_editanything_patch
+    ltx25.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
+    ltx23_mod._apply_editanything_patch = _fake_patch
+    _FakeLoraLoaderModelOnly.calls = []
+    try:
+        out_model, positive, _, latent, _ = _v2v(
+            mode="t2v", images=image, image_strength=0.7,
+            editanything_lora="ea.standard.safetensors",
+            editanything_lora_strength=0.9,
+            editanything_module_path="ea.module.safetensors",
+            reference_mode="first_frame_only")
+    finally:
+        ltx25.nodes.LoraLoaderModelOnly = orig_loader
+        ltx23_mod._apply_editanything_patch = orig_patch
+
+    # .standard LoRA first (LoraLoaderModelOnly), then the module patch on
+    # ITS output - the 2.3 order.
+    assert _FakeLoraLoaderModelOnly.calls == [
+        ("base-model", "ea.standard.safetensors", 0.9)]
+    assert patch_calls == [((("lora-patched", "ea.standard.safetensors",
+                              "base-model")), "ea.module.safetensors",
+                            "first_frame_only", (1, 256, 448, 3))]
+    assert out_model == ("ea-patched", ("lora-patched", "ea.standard.safetensors",
+                                        "base-model"))
+
+    video_latent, _ = latent["samples"].unbind()
+    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+    assert num_keyframes > 0, "Channel A reference guide appended"
+    mask_v, _ = latent["noise_mask"].unbind()
+    assert torch.all(mask_v[:, :, 0] == 1.0), \
+        "i2v hold skipped under EditAnything (images is the reference, not a hold)"
+    print("[ok] LTXV25VidToVideo: EditAnything chains the .standard LoRA through "
+          "LoraLoaderModelOnly then the module patch (2.3's own helper, spied), "
+          "appends the Channel-A reference guide, and skips the i2v hold")
+
+
+def test_v2v_reference_audio_sizes_length_and_holds_the_clip():
+    class _EncodingFSM(_FakeFSM):
+        def encode(self, waveform, sample_rate=None):
+            n = max(1, int(waveform.shape[-1] / sample_rate * 10))
+            return torch.full((1, 8, n, 16), 0.5)
+
+    audio_vae = _FakeAudioVAE()
+    audio_vae.first_stage_model = _EncodingFSM()
+    audio_vae.patcher = "fake-patcher"
+    audio_vae.device = torch.device("cpu")
+
+    orig_load = comfy.model_management.load_models_gpu
+    comfy.model_management.load_models_gpu = lambda *a, **kw: None
+    try:
+        # 2.0 s of audio @ 24 fps -> 49 frames (8k+1 aligned from 2*24+1)
+        ref = {"waveform": torch.zeros(1, 1, 32000), "sample_rate": 16000}
+        _, _, _, latent, _ = _v2v(audio_vae=audio_vae, reference_audio=ref,
+                                  length_from_audio=True)
+    finally:
+        comfy.model_management.load_models_gpu = orig_load
+
+    video_latent, audio_latent = latent["samples"].unbind()
+    assert video_latent.shape[2] == _target_t(int(2.0 * 24 + 1))
+    _, audio_mask = latent["noise_mask"].unbind()
+    assert torch.all(audio_mask[:, :, :audio_latent.shape[2] - 1] == 0.0) or \
+        torch.any(audio_mask == 0.0), "held audio region carries mask 0"
+    print("[ok] LTXV25VidToVideo: reference_audio + length_from_audio sizes the "
+          "video from the clip and holds the encoded audio (ltx23's helpers on "
+          "the 2.5 audio geometry)")
+
+
+def test_v2v_keep_original_audio_holds_source_track():
+    class _EncodingFSM(_FakeFSM):
+        def encode(self, waveform, sample_rate=None):
+            n = max(1, int(waveform.shape[-1] / sample_rate * 10))
+            return torch.full((1, 8, n, 16), 0.5)
+
+    audio_vae = _FakeAudioVAE()
+    audio_vae.first_stage_model = _EncodingFSM()
+    audio_vae.patcher = "fake-patcher"
+    audio_vae.device = torch.device("cpu")
+    src_audio = {"waveform": torch.zeros(1, 2, 48000), "sample_rate": 48000}
+
+    orig_load = comfy.model_management.load_models_gpu
+    comfy.model_management.load_models_gpu = lambda *a, **kw: None
+    try:
+        _, _, _, held, _ = _v2v(mode="v2v", audio_vae=audio_vae,
+                                video=_FakeVideo(audio=src_audio),
+                                keep_original_audio=True)
+        _, _, _, fresh, _ = _v2v(mode="v2v", audio_vae=audio_vae,
+                                 video=_FakeVideo(audio=src_audio),
+                                 keep_original_audio=False)
+    finally:
+        comfy.model_management.load_models_gpu = orig_load
+
+    _, held_mask = held["noise_mask"].unbind()
+    _, fresh_mask = fresh["noise_mask"].unbind()
+    assert torch.any(held_mask == 0.0), "on: source audio encoded and mask-held"
+    assert torch.all(fresh_mask == 1.0), "off: audio starts empty, model generates"
+    print("[ok] LTXV25VidToVideo: keep_original_audio on holds the source clip's "
+          "track (mask 0), off leaves the audio stream fully generated (mask 1)")
 
 
 def test_mode_validates_required_socket_is_connected():
@@ -416,7 +665,14 @@ if __name__ == "__main__":
     test_t2v_stage1_latent_geometry_is_half_resolution()
     test_i2v_hold_strength_math_matches_inplace_semantics()
     test_img_compression_delegates_to_core_preprocess()
-    test_lora_chaining_order_and_none_skip()
+    test_v2v_ic_lora_appends_on_half_grid_and_crops_cleanly()
+    test_v2v_ic_lora_none_is_plain_shape_and_crop_is_noop()
+    test_v2v_i2v_hold_lands_on_stage_grid_with_video_guide_layered()
+    test_v2v_mode_and_selector_validation_matrix()
+    test_v2v_latent_downscale_factor_validated_against_stage_grid()
+    test_v2v_editanything_chains_lora_then_patch_and_appends_reference()
+    test_v2v_reference_audio_sizes_length_and_holds_the_clip()
+    test_v2v_keep_original_audio_holds_source_track()
     test_mode_validates_required_socket_is_connected()
     test_latent_upscale_doubles_video_and_passes_audio_through()
     test_latent_upscale_rehold_applies_refine_strength()

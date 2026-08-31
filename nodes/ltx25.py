@@ -431,8 +431,7 @@ def _apply_i2v_hold(vae, images, video_samples, video_mask, strength, batch_size
 
 
 class LTXV25ImgToVideo:
-    """Prompts + stage-1 init latent for LTX-2.5: T2V and I2V, with multi-LoRA
-    chaining built in - no external LoraLoaderModelOnly wiring.
+    """Prompts + stage-1 init latent for LTX-2.5: T2V and I2V.
 
     ``mode`` (required, LTXV23VidToVideo's selector philosophy) declares which
     base behavior this call is: ``t2v`` (images must be disconnected) or
@@ -449,15 +448,16 @@ class LTXV25ImgToVideo:
     LTXVImgToVideoInplace), then LTXV25KSampler again on "refine (3 steps)",
     then LTXV25AVDecode.
 
-    ``lora_1``/``lora_2``/``lora_3`` ("none" = skip) chain through comfy-core's
-    real ``LoraLoaderModelOnly`` in order, each at its own strength - the same
-    multi-LoRA-by-chaining the official workflow wires by hand. Always take
-    ``model`` from THIS node's output when any selector is set.
+    LoRAs chain externally on the model wire (core LoraLoaderModelOnly
+    between LTXV25ModelsLoader and LTXV25KSampler), exactly as the official
+    workflow wires them - or use LTXV25VidToVideo below, whose named
+    ``ic_lora``/``editanything_lora`` selectors load their LoRAs in-node the
+    way LTXV23VidToVideo does.
 
-    No CropVideoGuide counterpart exists for this family on purpose:
-    LTXVImgToVideoInplace overwrites latent frames in place (nodes_lt.py:171)
-    rather than appending guide frames, so there is nothing to crop - the
-    sampled latent is already exactly the output timeline.
+    This node appends nothing to the latent (LTXVImgToVideoInplace overwrites
+    latent frames in place, nodes_lt.py:171), so its output needs no crop -
+    the family's LTXV25CropVideoGuide only matters after LTXV25VidToVideo's
+    guide-appending paths.
 
     No keep_original_audio either: that option is tied to a source VIDEO input
     (keep ITS audio), which this i2v-only prep node does not have; the audio
@@ -468,19 +468,18 @@ class LTXV25ImgToVideo:
     CATEGORY = LTX25_CATEGORY
     TITLE = "LTX-2.5 Img to Video ⚡"
     SEARCH_ALIASES = ['image to video', 'img2vid', 'i2v', 'text to video',
-                      't2v', 'empty latent', 'video conditioning', 'lora']
+                      't2v', 'empty latent', 'video conditioning']
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "latent", "frame_rate")
     FUNCTION = "prepare"
     DESCRIPTION = ("Prompts, half-res stage-1 init latent and noise masks for "
-                   "LTX-2.5 T2V/I2V, with up to three LoRAs chained in-node. "
+                   "LTX-2.5 T2V/I2V. "
                    "Feed into LTXV25KSampler (distilled), then "
                    "LTXV25LatentUpscale, LTXV25KSampler (refine), "
                    "LTXV25AVDecode.")
 
     @classmethod
     def INPUT_TYPES(s):
-        lora_choices = ["none"] + folder_paths.get_filename_list("loras")
         return {
             "required": {
                 "model": ("MODEL",),
@@ -532,20 +531,6 @@ class LTXV25ImgToVideo:
                                "input image (official value 18; 0 = off). Matches "
                                "the compression statistics the model was trained "
                                "on so the first frame doesn't pop."}),
-                "lora_1": (lora_choices, {"default": "none",
-                           "tooltip": "First LoRA, loaded onto model HERE via comfy-"
-                                      "core's LoraLoaderModelOnly (no external wiring). "
-                                      "\"none\" = skip."}),
-                "lora_1_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0,
-                                    "step": 0.01}),
-                "lora_2": (lora_choices, {"default": "none",
-                           "tooltip": "Second LoRA, chained after lora_1."}),
-                "lora_2_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0,
-                                    "step": 0.01}),
-                "lora_3": (lora_choices, {"default": "none",
-                           "tooltip": "Third LoRA, chained after lora_2."}),
-                "lora_3_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0,
-                                    "step": 0.01}),
             },
         }
 
@@ -553,10 +538,7 @@ class LTXV25ImgToVideo:
     def prepare(self, model, clip, mode, vae, audio_vae, prompt, negative_prompt,
                 width, height, length, frame_rate, batch_size, images=None,
                 image_strength=LTX25_I2V_STRENGTH,
-                img_compression=LTX25_IMG_COMPRESSION,
-                lora_1="none", lora_1_strength=1.0,
-                lora_2="none", lora_2_strength=1.0,
-                lora_3="none", lora_3_strength=1.0):
+                img_compression=LTX25_IMG_COMPRESSION):
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
             raise ValueError("audio_vae is not an LTX audio VAE; use "
@@ -567,14 +549,6 @@ class LTXV25ImgToVideo:
                              "disconnect it or pick i2v.")
         if mode == "i2v" and images is None:
             raise ValueError("LTX-2.5 i2v: mode=i2v needs images connected.")
-
-        for lora_name, strength in ((lora_1, lora_1_strength),
-                                    (lora_2, lora_2_strength),
-                                    (lora_3, lora_3_strength)):
-            if lora_name not in (None, "none", ""):
-                model = nodes.LoraLoaderModelOnly().load_lora_model_only(
-                    model, lora_name, strength)[0]
-                logger.info("LTX-2.5 prep: LoRA %s chained @ %.2f", lora_name, strength)
 
         # ── stage-1 video stream at HALF the target resolution (the official
         # workflow's a/2 math nodes), core EmptyLTXVLatentVideo's geometry ──
@@ -624,6 +598,501 @@ class LTXV25ImgToVideo:
                     ", image held @ %.2f over %d latent frame(s)" % (image_strength, held_t)
                     if images is not None else "")
         return (model, positive, negative, latent, frame_rate)
+
+
+class LTXV25VidToVideo:
+    """LTXV23VidToVideo, mirrored widget-for-widget onto the LTX-2.5 recipe:
+    T2V/I2V/V2V with LoRA selection and reference-conditioning all built into
+    this one node - no external LoraLoaderModelOnly wiring, no separate
+    "is X attached" boolean toggles. Every mechanism is driven purely by
+    whether its selector is set (a real filename) or left at "none".
+
+    The ONE difference from its 2.3 sibling (besides defaults) is
+    ``img_compression`` - the LTX-2.5 recipe's core LTXVPreprocess H.264
+    round-trip on the i2v hold image - and the fact that, like
+    LTXV25ImgToVideo, the init latent is built at HALF the target
+    ``width``/``height`` (the official recipe's stage-1 ``a/2`` math; the
+    latent upscaler doubles it back). Every conditioning - the i2v hold, the
+    IC-LoRA video guide, the EditAnything reference - lands on that half-res
+    stage-1 grid.
+
+    ``mode`` (required) declares which of the three base behaviors this call
+    is: ``t2v`` (images/video must be disconnected), ``i2v`` (``images``
+    required - first-frame hold at ``image_strength``), or ``v2v`` (``video``
+    required - IC-LoRA guide injection, see ``ic_lora``). i2v/v2v can layer
+    on top of each other exactly as in 2.3 - ``mode`` only says which one is
+    the PRIMARY, required source.
+
+    ``ic_lora`` (optional selector, "none" = off) loads an IC-LoRA task
+    adapter directly onto ``model`` inside this node (comfy-core's real
+    ``LoraLoaderModelOnly.load_lora_model_only``) at ``ic_lora_strength``,
+    then injects ``video``'s frames as extra guide tokens via comfy-core's
+    real ``LTXVAddGuide.get_latent_index()/append_keyframe()`` delegation at
+    ``guide_strength`` - the exact same calls LTXV23VidToVideo makes, on the
+    half-res grid. ``latent_downscale_factor`` behaves identically (the
+    divisibility check runs against the STAGE-1 half resolution, where the
+    guide actually lands). ``ic_lora="none"``: ``video`` is only used for
+    length/frame_rate/original audio. When ``video`` is connected,
+    ``length``/``frame_rate`` are taken FROM it (logged).
+    ``keep_original_audio``/``reference_audio``/``length_from_audio`` reuse
+    ltx23's proven audio helpers unchanged - they read all geometry off the
+    audio VAE, so the 2.5 audio VAE just works.
+
+    ``editanything_lora`` + ``editanything_module_path`` (set together;
+    mutually exclusive with ``ic_lora``) activate the EditAnything
+    subject-injection recipe through ltx23's own patch machinery
+    (``_apply_editanything_patch`` - imported, not duplicated; 2.3 and 2.5
+    share the ltxav architecture and latent geometry, 128ch / 32x spatial /
+    8x temporal / 48 blocks, so the module attaches the same way). The
+    reference guide (Channel A) is appended at the half-res grid.
+    ``reference_mode`` is 2.3's, unchanged. NOTE: the EditAnything and
+    IC-LoRA files on disk were trained against 2.3 - they load cleanly onto
+    2.5 (same key layout, as with the ID-LoRAs), but cross-version quality
+    is whatever the weights give you.
+
+    Chain: this node -> LTXV25KSampler "distilled (8 steps)" ->
+    **LTXV25CropVideoGuide** (strip appended guides - BEFORE the upscale, or
+    the upscaler doubles the guide frames too) -> LTXV25LatentUpscale ->
+    LTXV25KSampler "refine (3 steps)" -> LTXV25AVDecode. The crop is a no-op
+    when nothing was appended, so the chain is safe to leave wired for plain
+    t2v/i2v calls too.
+    """
+
+    CATEGORY = LTX25_CATEGORY
+    TITLE = "LTX-2.5 Video to Video (IC-LoRA) ⚡"
+    SEARCH_ALIASES = ['video to video', 'vid2vid', 'v2v', 'ic-lora', 'ic lora',
+                      'video guide', 'video conditioning', 'image to video',
+                      'img2vid', 'lora']
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "frame_rate")
+    FUNCTION = "prepare"
+    DESCRIPTION = ("Prompts and half-res stage-1 init latent for LTX-2.5 "
+                   "T2V/I2V/V2V - LoRA selection and EditAnything "
+                   "reference-conditioning both built in, no external "
+                   "LoraLoaderModelOnly wiring needed. Feed the outputs into "
+                   "LTXV25KSampler (distilled), then LTXV25CropVideoGuide "
+                   "before LTXV25LatentUpscale and the refine pass.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        lora_choices = ["none"] + folder_paths.get_filename_list("loras")
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "mode": (["t2v", "i2v", "v2v"], {"default": "t2v",
+                          "tooltip": "Which base behavior this call is. t2v: images/video "
+                                     "must be disconnected. i2v: images required (video may "
+                                     "still layer on top as an IC-LoRA guide). v2v: video "
+                                     "required (images may still layer on top as a first-"
+                                     "frame hold)."}),
+                "vae": ("VAE", {"tooltip": "The loader's vae (video VAE) output."}),
+                "audio_vae": ("VAE", {"tooltip": "The loader's audio_vae output."}),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True,
+                                      "tooltip": "With ic_lora set: describe the OUTPUT "
+                                                 "you want - most IC-LoRAs are trained on an "
+                                                 "instruction-style caption describing the "
+                                                 "transformed result. With EditAnything: an "
+                                                 "imperative ADD instruction, e.g. 'Add a "
+                                                 "<detailed appearance> <placement in frame> "
+                                                 "<relation to the scene>' (the official "
+                                                 "trained format - the reference photo "
+                                                 "supplies identity, the prompt supplies "
+                                                 "placement/attributes). Otherwise: describe "
+                                                 "the scene and its motion, a caption not an "
+                                                 "instruction."}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 1280, "min": 64,
+                                  "max": nodes.MAX_RESOLUTION, "step": 2,
+                                  "tooltip": "FINAL output width. Stage 1 samples at "
+                                             "half this (the official recipe) and the "
+                                             "latent upscaler doubles it back."}),
+                "height": ("INT", {"default": 704, "min": 64,
+                                   "max": nodes.MAX_RESOLUTION, "step": 2,
+                                   "tooltip": "FINAL output height - stage 1 runs at "
+                                              "half, like width."}),
+                "length": ("INT", {"default": 121, "min": 9,
+                                   "max": nodes.MAX_RESOLUTION, "step": 8,
+                                   "tooltip": "Frames; 8k+1 tiles exactly. Ignored (taken "
+                                              "from the clip instead) when video is "
+                                              "connected."}),
+                "frame_rate": ("FLOAT", {"default": FPS, "min": 1.0, "max": 120.0,
+                                         "step": 0.01,
+                                         "tooltip": "Ignored (taken from the clip instead) "
+                                                    "when video is connected."}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "First frame(s) for image-to-video (ordinary "
+                                    "i2v hold, independent of video/ic_lora below) - "
+                                    "resized and CENTER-CROPPED to the stage-1 grid. With "
+                                    "EditAnything active, images is instead the REFERENCE "
+                                    "photo (the subject to inject - one photo, plain/white "
+                                    "background strongly recommended, that's what the "
+                                    "mechanism was trained on): appended as clean reference "
+                                    "tokens the model attends to, NOT held as a first frame "
+                                    "(image_strength is ignored under EditAnything)."}),
+                "image_strength": ("FLOAT", {
+                    "default": LTX25_I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "images only. How much of the init image(s) to keep. 0.7 is "
+                               "the official 2.5 stage-1 value; 1.0 locks the first "
+                               "frames hard."}),
+                "img_compression": ("INT", {
+                    "default": LTX25_IMG_COMPRESSION, "min": 0, "max": 100,
+                    "tooltip": "i2v hold only (the one 2.5-specific widget). Core "
+                               "LTXVPreprocess's H.264 crf round-trip on the input "
+                               "image (official value 18; 0 = off)."}),
+                "video": ("VIDEO", {"tooltip": "Source clip for IC-LoRA video-to-video "
+                                    "(see ic_lora) and/or its original audio (see "
+                                    "keep_original_audio). Sets length/frame_rate from itself."}),
+                "ic_lora": (lora_choices, {"default": "none",
+                            "tooltip": "video only. The IC-LoRA task adapter (beard removal, "
+                                       "HDR grading, motion tracking, ...) - loaded onto model "
+                                       "HERE (no external LoraLoaderModelOnly needed) at "
+                                       "ic_lora_strength, then drives the actual vid2vid guide-"
+                                       "injection mechanism. \"none\" = video is used only for "
+                                       "length/frame_rate/original audio, ignored for guidance "
+                                       "- useful for A/B-ing whether the IC-LoRA is doing "
+                                       "anything."}),
+                "ic_lora_strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0,
+                                     "step": 0.01,
+                                     "tooltip": "ic_lora only. Same as LoraLoaderModelOnly's "
+                                                "strength_model."}),
+                "guide_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                                   "tooltip": "ic_lora only. How strongly the reference is "
+                                              "held. 1.0 = fully held (official default)."}),
+                "keep_original_audio": ("BOOLEAN", {"default": True,
+                               "tooltip": "video only. On = output keeps the source clip's "
+                                          "own audio unchanged. Off = the model generates "
+                                          "new audio from scratch instead."}),
+                "latent_downscale_factor": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0,
+                                            "step": 1.0,
+                                            "tooltip": "ic_lora only. Only for IC-LoRAs "
+                                                       "trained on a downscaled reference "
+                                                       "grid (rare - check the LoRA's model "
+                                                       "card / reference_downscale_factor "
+                                                       "metadata; most use 1.0). Checked "
+                                                       "against the stage-1 half resolution, "
+                                                       "where the guide lands."}),
+                "reference_audio": ("AUDIO", {"tooltip": "Drive generation from a voice/sound "
+                                              "clip with no source video. Not meant to be "
+                                              "combined with video+keep_original_audio."}),
+                "length_from_audio": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "With reference_audio and no video: size the video to the clip."}),
+                "editanything_lora": (lora_choices, {"default": "none",
+                                      "tooltip": "The EditAnything .standard.safetensors LoRA "
+                                                 "half - loaded onto model HERE at "
+                                                 "editanything_lora_strength (no external "
+                                                 "LoraLoaderModelOnly needed). \"none\" = off. "
+                                                 "Needs editanything_module_path set too - "
+                                                 "either alone does nothing useful, they're "
+                                                 "trained jointly. Trained on 2.3; loads onto "
+                                                 "2.5's identical architecture."}),
+                "editanything_lora_strength": ("FLOAT", {"default": 1.0, "min": -100.0,
+                                               "max": 100.0, "step": 0.01,
+                                               "tooltip": "editanything_lora only. Same as "
+                                                          "LoraLoaderModelOnly's strength_model."}),
+                "editanything_module_path": (lora_choices, {"default": "none",
+                    "tooltip": "The EditAnything .module.safetensors file (NOT a LoRA - real "
+                               "extra layers, loaded by this pack's own patch mechanism), "
+                               "from the loras folder. \"none\" = off. Needs "
+                               "editanything_lora and `images` connected too."}),
+                "reference_mode": (["per_batch_item", "first_frame_only"], {
+                    "default": "first_frame_only",
+                    "tooltip": "Needs editanything_module_path set. Controls how `images`'s "
+                               "batch is used as the EditAnything reference (independent of "
+                               "its ordinary i2v-hold use). per_batch_item: each image in "
+                               "the batch is encoded and used as its OWN distinct reference "
+                               "- image i drives sample i of the sampling batch. "
+                               "first_frame_only (default): use only images[0], ignore "
+                               "the rest - the vid2vid recipe."}),
+            },
+        }
+
+    @torch.inference_mode()
+    def prepare(self, model, clip, vae, audio_vae, mode, prompt, negative_prompt, width, height,
+                length, frame_rate, batch_size, images=None, image_strength=LTX25_I2V_STRENGTH,
+                img_compression=LTX25_IMG_COMPRESSION, video=None, ic_lora="none",
+                ic_lora_strength=1.0, guide_strength=1.0, keep_original_audio=True,
+                latent_downscale_factor=1.0, reference_audio=None, length_from_audio=True,
+                editanything_lora="none", editanything_lora_strength=1.0,
+                editanything_module_path="none", reference_mode="first_frame_only"):
+        from .ltx23 import (_apply_editanything_patch, _encode_reference_audio,
+                            _fit_audio_latent)
+
+        fsm = getattr(audio_vae, "first_stage_model", None)
+        if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
+            raise ValueError("audio_vae is not an LTX audio VAE; use "
+                             "ltx-2.5-audio-vae-bf16.safetensors in the audio_vae slot.")
+
+        ic_lora_attached = ic_lora not in (None, "none", "")
+        editanything_lora_attached = editanything_lora not in (None, "none", "")
+        edit_anything = editanything_module_path not in (None, "none", "")
+        if editanything_lora_attached != edit_anything:
+            raise ValueError("LTX-2.5 v2v: editanything_lora and editanything_module_path must "
+                             "be set together (both \"none\" or both a real file) - either "
+                             "alone does nothing, they're trained jointly.")
+        if ic_lora_attached and edit_anything:
+            raise ValueError("LTX-2.5 v2v: ic_lora and EditAnything are mutually exclusive "
+                             "(separate model modes, never trained together) - EditAnything's "
+                             "own .standard.safetensors LoRA IS the task adapter for its "
+                             "recipe; set ic_lora to \"none\".")
+
+        if mode == "t2v" and video is not None:
+            raise ValueError("LTX-2.5 v2v: mode=t2v but video is connected - disconnect it "
+                             "or pick v2v.")
+        if mode == "t2v" and images is not None and not edit_anything:
+            raise ValueError("LTX-2.5 v2v: mode=t2v but images is connected - disconnect it, "
+                             "pick i2v, or set editanything_lora/editanything_module_path if "
+                             "images is meant as an EditAnything reference, not an i2v hold.")
+        if mode == "i2v" and images is None:
+            raise ValueError("LTX-2.5 v2v: mode=i2v needs images connected.")
+        if mode == "v2v" and video is None:
+            raise ValueError("LTX-2.5 v2v: mode=v2v needs video connected.")
+
+        if ic_lora_attached:
+            model = nodes.LoraLoaderModelOnly().load_lora_model_only(
+                model, ic_lora, ic_lora_strength)[0]
+        if editanything_lora_attached:
+            model = nodes.LoraLoaderModelOnly().load_lora_model_only(
+                model, editanything_lora, editanything_lora_strength)[0]
+        if edit_anything:
+            if images is None:
+                raise ValueError("LTX-2.5 v2v: editanything_module_path is set but "
+                                 "images isn't connected (images doubles as the EditAnything "
+                                 "reference photo(s) here - no separate reference_image slot).")
+            try:
+                model = _apply_editanything_patch(
+                    model, vae, images, editanything_module_path, reference_mode)
+            except Exception as exc:
+                raise RuntimeError(
+                    "LTX-2.5 v2v: EditAnything module failed to attach to this "
+                    "model - the .module file targets the ltxav block layout "
+                    f"(2.3 and 2.5 share it); underlying error: {exc}") from exc
+
+        video_frames = video_audio = None
+        if video is not None:
+            components = video.get_components()
+            video_frames = components.images
+            video_audio = components.audio
+            src_length = _align_length(video_frames.shape[0])
+            src_fps = float(components.frame_rate)
+            if src_length != _align_length(length) or src_fps != frame_rate:
+                logger.info("LTX-2.5 v2v: video connected - length %d -> %d, "
+                            "frame_rate %.2f -> %.2f (taken from the clip)",
+                            length, src_length, frame_rate, src_fps)
+            length, frame_rate = src_length, src_fps
+        elif reference_audio is not None and length_from_audio:
+            seconds = reference_audio["waveform"].shape[-1] / reference_audio["sample_rate"]
+            length = _align_length(seconds * frame_rate + 1)
+            logger.info("LTX-2.5 a2v: %.2fs of audio -> %d frames @ %.2f fps",
+                        seconds, length, frame_rate)
+        else:
+            length = _align_length(length)
+
+        # ── stage-1 grid at HALF the target resolution (the 2.5 recipe) ──
+        stage_w, stage_h = width // 2, height // 2
+        t_latent = video_latent_t(length)
+        device = comfy.model_management.intermediate_device()
+        video_samples = torch.zeros(
+            [batch_size, VIDEO_LATENT_CHANNELS, t_latent,
+             stage_h // VIDEO_SPATIAL_RATIO, stage_w // VIDEO_SPATIAL_RATIO], device=device)
+        video_mask = torch.ones((batch_size, 1, t_latent, 1, 1),
+                                dtype=torch.float32, device=device)
+
+        if images is not None and not edit_anything:
+            pixels = _preprocess_images(images[:, :, :, :3], img_compression)
+            _apply_i2v_hold(vae, pixels, video_samples, video_mask,
+                            image_strength, batch_size)
+        elif images is not None and edit_anything:
+            # Under EditAnything, images is the REFERENCE, never an i2v hold
+            # (holding the reference as frame 1 was the "hard photo cut"
+            # glitch the 2.3 port already root-caused) - skipped regardless
+            # of image_strength. img_compression only touches the i2v hold.
+            logger.info("LTX-2.5 v2v: edit_anything active - images used as EditAnything "
+                        "reference only, i2v hold skipped (image_strength ignored)")
+
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
+        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
+        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
+
+        scale_factors = getattr(vae, "downscale_index_formula", None)
+        if scale_factors is None and (edit_anything
+                                      or (video is not None and ic_lora_attached)):
+            raise ValueError("LTX-2.5 v2v: this video VAE exposes no "
+                             "downscale_index_formula - the guide-append path needs "
+                             "the real LTX-2.5 video VAE loaded via LTXV25ModelsLoader.")
+
+        # ── EditAnything Channel A: reference latent appended as clean guide
+        # tokens at the STAGE-1 grid (same LTXVAddGuide delegation as 2.3,
+        # frame_idx 0, strength 1.0, causal_fix) ──
+        if edit_anything:
+            import comfy_extras.nodes_lt as nodes_lt
+
+            ref_pixels = comfy.utils.common_upscale(
+                images[:1].movedim(-1, 1), stage_w, stage_h, "bilinear", "center"
+            ).movedim(1, -1)[:, :, :, :3]
+            ref_guide_latent = _match_batch(vae.encode(ref_pixels), batch_size)
+            frame_idx, _ = nodes_lt.LTXVAddGuide.get_latent_index(
+                positive, t_latent, ref_guide_latent.shape[2], 0, scale_factors,
+                latent_shape=video_samples.shape)
+            positive, negative, video_samples, video_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, frame_idx, video_samples, video_mask, ref_guide_latent,
+                1.0, scale_factors, causal_fix=True)
+            logger.info("LTX-2.5 EditAnything: reference guide %s appended @ strength 1.0 "
+                        "(frame_idx=%d)", tuple(ref_guide_latent.shape), frame_idx)
+
+        # ── source-video guide append (task IC-LoRA or EditAnything), on the
+        # STAGE-1 grid - same mechanism/order as the 2.3 node ──
+        if video is not None and (ic_lora_attached or edit_anything):
+            import comfy_extras.nodes_lt as nodes_lt
+
+            time_scale = scale_factors[0]
+            n = video_frames.shape[0]
+            guide_frames = video_frames[:((n - 1) // time_scale) * time_scale + 1]
+            target_w = int(stage_w / latent_downscale_factor)
+            target_h = int(stage_h / latent_downscale_factor)
+            guide_pixels = comfy.utils.common_upscale(
+                guide_frames.movedim(-1, 1), target_w, target_h, "bilinear", "center"
+            ).movedim(1, -1)[:, :, :, :3]
+            guide_latent = _match_batch(vae.encode(guide_pixels), batch_size)
+
+            guide_mask = None
+            if latent_downscale_factor > 1:
+                block = int(VIDEO_SPATIAL_RATIO * latent_downscale_factor)
+                if stage_w % block != 0 or stage_h % block != 0:
+                    raise ValueError(
+                        f"LTX-2.5 v2v: with latent_downscale_factor {latent_downscale_factor} "
+                        f"the STAGE-1 half resolution must be divisible by {block} (the "
+                        f"downscaled guide still has to land on whole "
+                        f"{VIDEO_SPATIAL_RATIO}px latents) - got {stage_w}x{stage_h} "
+                        f"(target {width}x{height}). Round width/height up to a multiple "
+                        f"of {2 * block}.")
+                guide_latent, guide_mask = nodes_lt.LTXVAddGuide.dilate_latent(
+                    guide_latent, latent_downscale_factor)
+
+            frame_idx, _ = nodes_lt.LTXVAddGuide.get_latent_index(
+                positive, t_latent, guide_latent.shape[2], 0, scale_factors,
+                latent_shape=video_samples.shape)
+            positive, negative, video_samples, video_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, frame_idx, video_samples, video_mask, guide_latent,
+                guide_strength, scale_factors, guide_mask=guide_mask,
+                latent_downscale_factor=latent_downscale_factor, causal_fix=True)
+            logger.info("LTX-2.5 v2v: guide %s appended @ strength %.2f (frame_idx=%d)",
+                        tuple(guide_latent.shape), guide_strength, frame_idx)
+        elif video is not None:
+            logger.info("LTX-2.5 v2v: ic_lora=none - video used for length/frame_rate/"
+                        "held audio only, ignored for guidance")
+
+        # ── audio stream: held source/reference audio, or empty (model
+        # generates it) - ltx23's helpers read all geometry off the VAE ──
+        audio_shape, _ = audio_latent_shape(audio_vae, length, frame_rate, batch_size)
+        target = list(audio_shape)
+        if video is not None and keep_original_audio and video_audio is not None:
+            audio_latent, audio_mask = _encode_reference_audio(
+                audio_vae, video_audio, length / frame_rate)
+            audio_latent, audio_mask = _fit_audio_latent(audio_latent, audio_mask, target)
+            audio_latent = _match_batch(audio_latent, batch_size).to(video_samples.device)
+            audio_mask = _match_batch(audio_mask, batch_size).to(video_samples.device)
+        elif video is None and reference_audio is not None:
+            audio_latent, audio_mask = _encode_reference_audio(
+                audio_vae, reference_audio, length / frame_rate)
+            audio_latent, audio_mask = _fit_audio_latent(audio_latent, audio_mask, target)
+            audio_latent = _match_batch(audio_latent, batch_size).to(video_samples.device)
+            audio_mask = _match_batch(audio_mask, batch_size).to(video_samples.device)
+        else:
+            audio_latent = torch.zeros(target, device=video_samples.device)
+            audio_mask = torch.ones_like(audio_latent)
+
+        latent = {
+            "samples": comfy.nested_tensor.NestedTensor((video_samples, audio_latent)),
+            "noise_mask": comfy.nested_tensor.NestedTensor((video_mask, audio_mask)),
+            "downscale_ratio_spacial": VIDEO_SPATIAL_RATIO,
+        }
+        logger.info("LTX-2.5 v2v prep: stage 1 %dx%d (target %dx%d), video %s mask %s, "
+                    "audio %s mask %s%s%s",
+                    stage_w, stage_h, width, height,
+                    tuple(video_samples.shape), tuple(video_mask.shape),
+                    tuple(audio_latent.shape), tuple(audio_mask.shape),
+                    ", image held @ %.2f" % image_strength
+                    if images is not None and not edit_anything else "",
+                    ", audio held" if (video is not None and keep_original_audio
+                                       and video_audio is not None)
+                    or (video is None and reference_audio is not None) else "")
+        return (model, positive, negative, latent, frame_rate)
+
+
+class LTXV25CropVideoGuide:
+    """Strip the guide reference frames LTXV25VidToVideo appended, after the
+    distilled sampling pass and BEFORE LTXV25LatentUpscale (the upscaler has
+    no idea which frames are guides - cropping after it would double the
+    guide frames spatially and then remove the wrong count).
+
+    Same thin wrapper around comfy-core's get_keyframe_idxs as
+    LTXV23CropVideoGuide, applied to the video half of the joint AV latent.
+    A no-op (returns the latent unchanged) when no guide was ever appended -
+    safe to leave wired in plain t2v/i2v graphs.
+    """
+
+    CATEGORY = LTX25_CATEGORY
+    TITLE = "LTX-2.5 Crop Video Guide ⚡"
+    SEARCH_ALIASES = ['crop guide', 'remove guide', 'strip reference', 'ic-lora',
+                      'vid2vid', 'v2v']
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "crop"
+    DESCRIPTION = ("Strip the guide reference frames LTXV25VidToVideo appended, "
+                   "after the distilled pass and before LTXV25LatentUpscale. "
+                   "No-op if none were appended.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent": ("LATENT",),
+            },
+        }
+
+    def crop(self, positive, negative, latent):
+        import comfy_extras.nodes_lt as nodes_lt
+
+        samples = latent["samples"]
+        if not getattr(samples, "is_nested", False):
+            raise ValueError("LTX-2.5 Crop Video Guide: latent isn't a joint AV "
+                             "latent - expected LTXV25KSampler's output.")
+        video, audio = samples.unbind()
+
+        video_mask = audio_mask = None
+        noise_mask = latent.get("noise_mask")
+        if noise_mask is not None:
+            video_mask, audio_mask = noise_mask.unbind()
+
+        _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video.shape)
+        if num_keyframes == 0:
+            return (positive, negative, latent)
+
+        cropped_video = video[:, :, :-num_keyframes]
+        cropped_mask = video_mask[:, :, :-num_keyframes] if video_mask is not None else None
+
+        positive = node_helpers.conditioning_set_values(
+            positive, {"keyframe_idxs": None, "guide_attention_entries": None})
+        negative = node_helpers.conditioning_set_values(
+            negative, {"keyframe_idxs": None, "guide_attention_entries": None})
+
+        out = latent.copy()
+        out["samples"] = comfy.nested_tensor.NestedTensor((cropped_video, audio))
+        if cropped_mask is not None and audio_mask is not None:
+            out["noise_mask"] = comfy.nested_tensor.NestedTensor((cropped_mask, audio_mask))
+        else:
+            out.pop("noise_mask", None)
+
+        logger.info("LTX-2.5 crop guide: removed %d guide frame(s), video %s -> %s",
+                    num_keyframes, tuple(video.shape), tuple(cropped_video.shape))
+        return (positive, negative, out)
 
 
 # ── sampling ────────────────────────────────────────────────────────────────
@@ -768,6 +1237,10 @@ class LTXV25LatentUpscale:
     at ``image_strength`` 1.0 (the workflow's second LTXVImgToVideoInplace) -
     leave it disconnected for T2V, where the upscaled latent goes to the
     refine pass with no mask (core LTXVLatentUpsampler's own behavior).
+
+    If the latent came from LTXV25VidToVideo with guides appended (ic_lora /
+    EditAnything), run LTXV25CropVideoGuide BEFORE this node - the upscaler
+    cannot tell guide frames from output frames and would double them too.
     """
 
     CATEGORY = LTX25_CATEGORY
@@ -901,6 +1374,8 @@ NODE_CLASS_MAPPINGS = {
     "LTXV25EmptyLatentAVBatch": LTXV25EmptyLatentAVBatch,
     "LTXV25ModelsLoader": LTXV25ModelsLoader,
     "LTXV25ImgToVideo": LTXV25ImgToVideo,
+    "LTXV25VidToVideo": LTXV25VidToVideo,
+    "LTXV25CropVideoGuide": LTXV25CropVideoGuide,
     "LTXV25KSampler": LTXV25KSampler,
     "LTXV25LatentUpscale": LTXV25LatentUpscale,
     "LTXV25AVDecode": LTXV25AVDecode,
@@ -910,6 +1385,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV25EmptyLatentAVBatch": LTXV25EmptyLatentAVBatch.TITLE,
     "LTXV25ModelsLoader": LTXV25ModelsLoader.TITLE,
     "LTXV25ImgToVideo": LTXV25ImgToVideo.TITLE,
+    "LTXV25VidToVideo": LTXV25VidToVideo.TITLE,
+    "LTXV25CropVideoGuide": LTXV25CropVideoGuide.TITLE,
     "LTXV25KSampler": LTXV25KSampler.TITLE,
     "LTXV25LatentUpscale": LTXV25LatentUpscale.TITLE,
     "LTXV25AVDecode": LTXV25AVDecode.TITLE,
