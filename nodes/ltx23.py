@@ -38,15 +38,10 @@ model generates the remainder.
 import logging
 import math
 import re
-import types
 from fractions import Fraction
 
-import comfy.ldm.common_dit
-import comfy.ldm.lightricks.model
 import comfy.model_management
 import comfy.nested_tensor
-import comfy.patcher_extension
-import comfy.quant_ops
 import comfy.sample
 import comfy.samplers
 import comfy.sd
@@ -55,7 +50,6 @@ import folder_paths
 import node_helpers
 import nodes
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 try:
@@ -295,648 +289,6 @@ class LTXV23ModelsLoader:
                 _load_vae(audio_vae_name, want_audio=True))
 
 
-# ── EditAnything reference conditioning ─────────────────────────────────────
-#
-# Ported from D:\Projects\Wan2GP-main\models\ltx2\editanything.py (a separate
-# multi-model video UI's from-scratch LTX-2.3 pipeline - read directly, not
-# guessed) - the mechanism behind Lightricks/DeepBeepMeep's public
-# "EditAnything" LoRA (huggingface.co/DeepBeepMeep/LTX-2,
-# edit_anything_reference_v0.1_r128_*): injects one reference photo's
-# identity into a generation via THREE simultaneous paths, not one:
-#
-#   1. the reference image gets VAE-encoded and appended as extra guide
-#      tokens the model cross-attends to (comfy-core's own LTXVAddGuide -
-#      the exact mechanism LTXV23VidToVideo's ic_lora selector already uses,
-#      nothing new needed for this path);
-#   2. a small extra cross-attention ("ref_attn") on transformer blocks 12-35
-#      only, run against a 32-token pooled summary of the reference latent,
-#      added as a tiny residual (scale 0.01) right after each block's own
-#      attn2 - EDITANYTHING_REF_START/END_BLOCK below;
-#   3. a global AdaLN modulation vector (scale 2.0), pooled from the same
-#      reference latent, added directly into the model's embedded timestep
-#      before any transformer block runs.
-#
-# Paths 2 and 3 are NOT LoRA weights - the .module.safetensors half of the
-# EditAnything release is real extra architecture (new nn.Linear/LayerNorm
-# layers with their own trained weights) that has to be loaded and wired
-# into the model's forward pass directly. comfy has no built-in support for
-# this, so it's grafted on here via the same clone-then-patch discipline
-# this pack already uses (Krea2's _apply_identity_edit_patch,
-# Krea2ControlLoRALoader's wrapper) - never touching comfy's own classes,
-# only cloned model instances.
-#
-# comfy/ldm/lightricks/model.py's BasicTransformerBlock.forward() (verified
-# by direct read this session) is an ordinary Python method on an ordinary
-# nn.Module - patchable per-INSTANCE (never per-class, that would leak into
-# every other loaded model) via a bound-method replacement. The patched
-# version below is a faithful copy of that method's real body (not a
-# re-derivation) with the ref_attn residual inserted at the exact point
-# Wan2GP's own transformer.py:281-294 inserts it: after attn2, before the
-# feed-forward. THIS WILL DRIFT if comfy's own BasicTransformerBlock.forward
-# changes in a future ComfyUI update - the module docstring on
-# _patched_block_forward below carries the same warning, check it first if
-# EditAnything output ever looks wrong after a ComfyUI update.
-
-EDITANYTHING_REF_START_BLOCK = 12
-EDITANYTHING_REF_END_BLOCK = 35
-EDITANYTHING_REF_CONTEXT_SCALE = 0.01
-EDITANYTHING_REF_TOKEN_SCALE = 0.25
-EDITANYTHING_ADALN_SCALE = 2.0
-
-# The .module.safetensors file isn't a LoRA (comfy's own LoRA loader can't
-# apply it - see _apply_editanything_patch's docstring), but it ships from
-# the SAME HuggingFace release as its .standard.safetensors LoRA half and
-# belongs in the same place a user would look for either: the real comfy
-# `loras` folder_paths category (models/loras and whatever extra roots are
-# registered there), not a bespoke category of its own - deploy both files
-# side by side (e.g. models/loras/ltxv/) same as any other LTX-2.3 LoRA.
-# Also register this pack's own D: archive location as an extra `loras`
-# search root, so a fresh download there is discoverable without a manual
-# copy into the portable install's models/loras.
-import os as _os
-_EDITANYTHING_EXTRA_DIR = r"D:\models\image-models-dev\ltxv23\edit_anything"
-if _os.path.isdir(_EDITANYTHING_EXTRA_DIR):
-    folder_paths.add_model_folder_path("loras", _EDITANYTHING_EXTRA_DIR)
-
-
-class _EditAnythingLoRALinear(nn.Module):
-    """A frozen base nn.Linear plus a LoRA delta, both real weights loaded
-    from the .module.safetensors file - not comfy's own LoRA machinery
-    (this isn't a patch onto an existing Linear's weight, it's a standalone
-    extra attention module comfy never had in the first place)."""
-
-    def __init__(self, base_linear, lora_a, lora_b):
-        super().__init__()
-        object.__setattr__(self, "base_linear", base_linear)
-        self.lora_A = nn.Parameter(lora_a, requires_grad=False)
-        self.lora_B = nn.Parameter(lora_b, requires_grad=False)
-
-    def forward(self, x):
-        out = self.base_linear(x)
-        lora_dtype = self.lora_A.dtype
-        lora_out = F.linear(F.linear(x.to(dtype=lora_dtype), self.lora_A), self.lora_B)
-        return out.add(lora_out.to(device=out.device, dtype=out.dtype))
-
-
-class _EditAnythingRefAttention(nn.Module):
-    """The extra ref_attn cross-attention grafted onto one transformer
-    block - reuses that block's own attn2 for q/k/v/out projection shapes
-    and normalization (q_norm/k_norm), LoRA-augmented from the module file's
-    per-block weights. Ported from editanything.py's EditAnythingRefAttention."""
-
-    def __init__(self, base_attn, state, prefix):
-        super().__init__()
-        object.__setattr__(self, "base_attn", base_attn)
-        self.heads = int(base_attn.heads)
-        self.dim_head = int(base_attn.dim_head)
-        self.to_q = _EditAnythingLoRALinear(base_attn.to_q, state[f"{prefix}to_q.lora_A.weight"], state[f"{prefix}to_q.lora_B.weight"])
-        self.to_k = _EditAnythingLoRALinear(base_attn.to_k, state[f"{prefix}to_k.lora_A.weight"], state[f"{prefix}to_k.lora_B.weight"])
-        self.to_v = _EditAnythingLoRALinear(base_attn.to_v, state[f"{prefix}to_v.lora_A.weight"], state[f"{prefix}to_v.lora_B.weight"])
-        self.to_out = _EditAnythingLoRALinear(base_attn.to_out[0], state[f"{prefix}to_out.0.lora_A.weight"], state[f"{prefix}to_out.0.lora_B.weight"])
-
-    def forward(self, x, context):
-        q = self.to_q(x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        b = q.shape[0]
-        q = q.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
-        k = k.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
-        v = v.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(b, -1, self.heads * self.dim_head)
-        return self.to_out(out)
-
-
-class _EditAnythingRefVisualProj(nn.Module):
-    """Pools a VAE-encoded reference latent into 32 tokens (path 2 above).
-    Ported from editanything.py's EditAnythingRefVisualProj - real weights
-    (fc1/proj/norm/pos_embed), loaded strict from the module file."""
-
-    def __init__(self, state):
-        super().__init__()
-        fc1_w, proj_w = state["fc1.weight"], state["proj.weight"]
-        self.fc1 = nn.Linear(fc1_w.shape[1], fc1_w.shape[0], bias="fc1.bias" in state)
-        self.proj = nn.Linear(proj_w.shape[1], proj_w.shape[0], bias="proj.bias" in state)
-        self.norm = nn.LayerNorm(proj_w.shape[0])
-        self.pos_embed = nn.Parameter(state["pos_embed"], requires_grad=False)
-        self.load_state_dict(state, strict=True)
-        self.requires_grad_(False)
-
-    def forward(self, ref_latent, token_scale=EDITANYTHING_REF_TOKEN_SCALE):
-        ref_frame = ref_latent.mean(dim=2)  # (B,C,T,H,W) -> (B,C,H,W), collapse time
-        local = F.adaptive_avg_pool2d(ref_frame, (4, 8)).permute(0, 2, 3, 1).reshape(ref_frame.shape[0], 32, -1)
-        global_mean = ref_frame.mean(dim=(-2, -1))
-        global_std = ref_frame.std(dim=(-2, -1), unbiased=False)
-        stats = torch.cat([global_mean, global_std], dim=-1).unsqueeze(1).expand(-1, local.shape[1], -1)
-        tokens = torch.cat([local, stats], dim=-1)
-        # .mean()/.std() above can silently promote a bf16 input back to
-        # float32 (confirmed via a real GPU traceback: "mat1 and mat2 must
-        # have the same dtype, but got BFloat16 and Float" right here) -
-        # re-cast to the Linear's own weight dtype explicitly rather than
-        # trust it survived the pooling/reduction chain unchanged.
-        tokens = tokens.to(dtype=self.fc1.weight.dtype)
-        tokens = self.proj(F.silu(self.fc1(tokens)))
-        tokens = self.norm(tokens)
-        tokens = tokens + self.pos_embed[:, :tokens.shape[1]].to(device=tokens.device, dtype=tokens.dtype)
-        return tokens * float(token_scale)
-
-
-class _EditAnythingRefAdaLNProj(nn.Module):
-    """Pools the same reference latent into the global AdaLN modulation
-    vector (path 3 above). Ported from editanything.py's
-    EditAnythingRefAdaLNProj."""
-
-    def __init__(self, state):
-        super().__init__()
-        fc1_w, proj_w = state["fc1.weight"], state["proj.weight"]
-        self.fc1 = nn.Linear(fc1_w.shape[1], fc1_w.shape[0], bias="fc1.bias" in state)
-        self.proj = nn.Linear(proj_w.shape[1], proj_w.shape[0], bias="proj.bias" in state)
-        self.load_state_dict(state, strict=True)
-        self.requires_grad_(False)
-
-    def forward(self, ref_latent, adaln_scale=EDITANYTHING_ADALN_SCALE):
-        ref_frame = ref_latent.mean(dim=2)
-        avg_1x1 = F.adaptive_avg_pool2d(ref_frame, (1, 1)).flatten(1)
-        avg_2x2 = F.adaptive_avg_pool2d(ref_frame, (2, 2)).flatten(1)
-        max_1x1 = F.adaptive_max_pool2d(ref_frame, (1, 1)).flatten(1)
-        pooled = torch.cat([avg_1x1, avg_2x2, max_1x1], dim=-1)
-        # see _EditAnythingRefVisualProj.forward's comment - pooling/
-        # reduction ops can silently promote a bf16 input back to float32.
-        pooled = pooled.to(dtype=self.fc1.weight.dtype)
-        return self.proj(F.silu(self.fc1(pooled))) * float(adaln_scale)
-
-
-def _patched_block_forward(self, x, context=None, attention_mask=None, timestep=None, pe=None,
-                           transformer_options={}, self_attention_mask=None, prompt_timestep=None):
-    """Instance-level replacement for ONE patched BasicTransformerBlock's
-    forward - a faithful copy of comfy/ldm/lightricks/model.py's real
-    BasicTransformerBlock.forward (verified against that file directly this
-    session; re-check it if EditAnything output ever looks wrong after a
-    ComfyUI update, this is a real fork, not a wrapper) with exactly one
-    addition: the ref_attn residual, inserted at the identical point
-    Wan2GP's own transformer.py:281-294 inserts it - after attn2, before
-    the feed-forward. Only ever bound onto blocks EDITANYTHING_REF_START_BLOCK..
-    _END_BLOCK on a CLONED model (see _install_editanything_module) - never
-    onto comfy's own class, which would leak into every other loaded model."""
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-        self.scale_shift_table[None, None, :6].to(device=x.device, dtype=x.dtype)
-        + timestep.reshape(x.shape[0], timestep.shape[1], self.scale_shift_table.shape[0], -1)[:, :, :6, :]
-    ).unbind(dim=2)
-
-    if comfy.model_management.in_training:
-        norm_x = comfy.ldm.common_dit.rms_norm(x) * (1 + scale_msa) + shift_msa
-    else:
-        norm_x = comfy.quant_ops.ck.rms_adaln(x, scale_msa, shift_msa)
-
-    x += self.attn1(norm_x, pe=pe, mask=self_attention_mask, transformer_options=transformer_options) * gate_msa
-
-    if self.cross_attention_adaln:
-        shift_q_mca, scale_q_mca, gate_mca = (
-            self.scale_shift_table[None, None, 6:9].to(device=x.device, dtype=x.dtype)
-            + timestep.reshape(x.shape[0], timestep.shape[1], self.scale_shift_table.shape[0], -1)[:, :, 6:9, :]
-        ).unbind(dim=2)
-        x += comfy.ldm.lightricks.model.apply_cross_attention_adaln(
-            x, context, self.attn2, shift_q_mca, scale_q_mca, gate_mca,
-            self.prompt_scale_shift_table, prompt_timestep, attention_mask, transformer_options,
-        )
-    else:
-        x += self.attn2(x, context=context, mask=attention_mask, transformer_options=transformer_options)
-
-    # ── the one addition: EditAnything's ref_attn residual ──
-    ref_context = transformer_options.get("editanything_ref_context")
-    if ref_context is not None and EDITANYTHING_REF_START_BLOCK <= self.idx <= EDITANYTHING_REF_END_BLOCK:
-        ref_out = self.ref_attn(comfy.ldm.common_dit.rms_norm(x), ref_context.to(device=x.device, dtype=x.dtype))
-        x = x + ref_out * EDITANYTHING_REF_CONTEXT_SCALE
-
-    y = comfy.ldm.common_dit.rms_norm(x)
-    y = torch.addcmul(y, y, scale_mlp).add_(shift_mlp)
-    x.addcmul_(self.ff(y), gate_mlp)
-
-    return x
-
-
-def _patched_av_block_forward(self, x, v_context=None, a_context=None, attention_mask=None, v_timestep=None,
-                              a_timestep=None, v_pe=None, a_pe=None, v_cross_pe=None, a_cross_pe=None,
-                              v_cross_scale_shift_timestep=None, a_cross_scale_shift_timestep=None,
-                              v_cross_gate_timestep=None, a_cross_gate_timestep=None, transformer_options=None,
-                              self_attention_mask=None, v_prompt_timestep=None, a_prompt_timestep=None):
-    """Instance-level replacement for ONE patched BasicAVTransformerBlock's
-    forward - a faithful copy of comfy/ldm/lightricks/av_model.py's real
-    BasicAVTransformerBlock.forward (verified against that file directly
-    this session, lines 260-389; re-check it if EditAnything output ever
-    looks wrong after a ComfyUI update, this is a real fork, not a
-    wrapper) with exactly one addition: the ref_attn residual, applied to
-    `vx` (the video stream - EditAnything is a purely visual signal, `ax`/
-    audio is never touched) right before the video feedforward, after
-    every other video-branch update (self-attn, text cross-attn, and any
-    audio<->video cross-attn) is done - the same relative position ("after
-    attn2, before the feed-forward") Wan2GP's own transformer.py:281-294
-    uses for the simpler, non-AV block, generalized to this block's extra
-    audio-cross-attention stage in between. THIS pack's real production
-    models are always the joint AV model (comfy.ldm.lightricks.av_model),
-    never the plain BasicTransformerBlock - _patched_block_forward above
-    is kept for the base (non-AV) case, but is not what actually runs in
-    this pack's own real usage. Only ever bound onto blocks
-    EDITANYTHING_REF_START_BLOCK.._END_BLOCK on a CLONED model (see
-    _install_editanything_module) - never onto comfy's own class, which
-    would leak into every other loaded model."""
-    run_vx = transformer_options.get("run_vx", True)
-    run_ax = transformer_options.get("run_ax", True)
-
-    vx, ax = x
-    run_ax = run_ax and ax.numel() > 0
-    run_a2v = run_vx and transformer_options.get("a2v_cross_attn", True) and ax.numel() > 0
-    run_v2a = run_ax and transformer_options.get("v2a_cross_attn", True)
-
-    # video
-    if run_vx:
-        # video self-attention
-        vshift_msa, vscale_msa = (self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(0, 2)))
-        if comfy.model_management.in_training:
-            norm_vx = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_msa) + vshift_msa
-        else:
-            norm_vx = comfy.quant_ops.ck.rms_adaln(vx, vscale_msa, vshift_msa)
-        del vshift_msa, vscale_msa
-        attn1_out = self.attn1(norm_vx, pe=v_pe, mask=self_attention_mask, transformer_options=transformer_options)
-        del norm_vx
-        # video cross-attention
-        vgate_msa = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(2, 3))[0]
-        vx.addcmul_(attn1_out, vgate_msa)
-        del vgate_msa, attn1_out
-        vx.add_(self._apply_text_cross_attention(
-            vx, v_context, self.attn2, self.scale_shift_table,
-            getattr(self, 'prompt_scale_shift_table', None),
-            v_timestep, v_prompt_timestep, attention_mask, transformer_options,)
-        )
-
-    # audio
-    if run_ax:
-        # audio self-attention
-        ashift_msa, ascale_msa = (self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 2)))
-        norm_ax = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_msa) + ashift_msa
-        del ashift_msa, ascale_msa
-        attn1_out = self.audio_attn1(norm_ax, pe=a_pe, transformer_options=transformer_options)
-        del norm_ax
-        # audio cross-attention
-        agate_msa = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(2, 3))[0]
-        ax.addcmul_(attn1_out, agate_msa)
-        del agate_msa, attn1_out
-        ax.add_(self._apply_text_cross_attention(
-            ax, a_context, self.audio_attn2, self.audio_scale_shift_table,
-            getattr(self, 'audio_prompt_scale_shift_table', None),
-            a_timestep, a_prompt_timestep, attention_mask, transformer_options,)
-        )
-
-    # video - audio cross attention.
-    if run_a2v or run_v2a:
-        ax_norm3 = comfy.ldm.common_dit.rms_norm(ax)
-
-        # audio to video cross attention
-        if run_a2v:
-            scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v = self.get_ada_values(
-                self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0], a_cross_scale_shift_timestep)[:2]
-            scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v = self.get_ada_values(
-                self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0], v_cross_scale_shift_timestep)[:2]
-
-            if comfy.model_management.in_training:
-                vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + scale_ca_video_hidden_states_a2v_v) + shift_ca_video_hidden_states_a2v_v
-            else:
-                vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v)
-            ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
-            del scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v, scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v
-
-            a2v_out = self.audio_to_video_attn(vx_scaled, context=ax_scaled, pe=v_cross_pe, k_pe=a_cross_pe, transformer_options=transformer_options)
-            del vx_scaled, ax_scaled
-
-            gate_out_a2v = self.get_ada_values(self.scale_shift_table_a2v_ca_video[4:, :], vx.shape[0], v_cross_gate_timestep)[0]
-            vx.addcmul_(a2v_out, gate_out_a2v)
-            del gate_out_a2v, a2v_out
-
-        # video to audio cross attention
-        if run_v2a:
-            scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a = self.get_ada_values(
-                self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0], a_cross_scale_shift_timestep)[2:4]
-            scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a = self.get_ada_values(
-                self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0], v_cross_scale_shift_timestep)[2:4]
-
-            ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
-            if comfy.model_management.in_training:
-                vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
-            else:
-                vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a)
-            del scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a, scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a
-
-            v2a_out = self.video_to_audio_attn(ax_scaled, context=vx_scaled, pe=a_cross_pe, k_pe=v_cross_pe, transformer_options=transformer_options)
-            del ax_scaled, vx_scaled
-
-            gate_out_v2a = self.get_ada_values(self.scale_shift_table_a2v_ca_audio[4:, :], ax.shape[0], a_cross_gate_timestep)[0]
-            ax.addcmul_(v2a_out, gate_out_v2a)
-            del gate_out_v2a, v2a_out
-
-    # ── the one addition: EditAnything's ref_attn residual (video only) ──
-    if run_vx:
-        ref_context = (transformer_options or {}).get("editanything_ref_context")
-        if ref_context is not None and EDITANYTHING_REF_START_BLOCK <= self.idx <= EDITANYTHING_REF_END_BLOCK:
-            ref_out = self.ref_attn(comfy.ldm.common_dit.rms_norm(vx), ref_context.to(device=vx.device, dtype=vx.dtype))
-            vx.add_(ref_out * EDITANYTHING_REF_CONTEXT_SCALE)
-            del ref_out
-
-    # video feedforward
-    if run_vx:
-        vshift_mlp, vscale_mlp = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(3, 5))
-        if comfy.model_management.in_training:
-            vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_mlp) + vshift_mlp
-        else:
-            vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, vscale_mlp, vshift_mlp)
-        del vshift_mlp, vscale_mlp
-
-        ff_out = self.ff(vx_scaled)
-        del vx_scaled
-
-        vgate_mlp = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(5, 6))[0]
-        vx.addcmul_(ff_out, vgate_mlp)
-        del vgate_mlp, ff_out
-
-    # audio feedforward
-    if run_ax:
-        ashift_mlp, ascale_mlp = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(3, 5))
-        ax_scaled = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_mlp) + ashift_mlp
-        del ashift_mlp, ascale_mlp
-
-        ff_out = self.audio_ff(ax_scaled)
-        del ax_scaled
-
-        agate_mlp = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(5, 6))[0]
-        ax.addcmul_(ff_out, agate_mlp)
-        del agate_mlp, ff_out
-
-    return vx, ax
-
-    y = comfy.ldm.common_dit.rms_norm(x)
-    y = torch.addcmul(y, y, scale_mlp).add_(shift_mlp)
-    x.addcmul_(self.ff(y), gate_mlp)
-
-    return x
-
-
-def _install_editanything_module(model, module_path):
-    """Load the EditAnything .module.safetensors file (NOT a LoRA) onto a
-    CLONED model's diffusion_model: attach the two proj modules, attach and
-    patch ref_attn on blocks EDITANYTHING_REF_START_BLOCK.._END_BLOCK only
-    (the file carries ref_attn weights for all 48 blocks, but Wan2GP's own
-    hardcoded start/end block range only ever fires 12-35 - the rest are
-    dead weight in the file itself, skip loading them). Mutates `model` (a
-    ModelPatcher, expected already cloned by the caller) in place; returns
-    nothing. Also patches _prepare_timestep on the SAME clone's diffusion
-    model to add ref_adaln - see LTXV23EditAnythingPatch.patch() for how
-    ref_context/ref_adaln get computed and threaded through."""
-    sd = comfy.utils.load_torch_file(module_path)
-    dm = model.model.diffusion_model
-    # comfy.utils.load_torch_file() loads onto CPU regardless of where the
-    # rest of the model lives - the module's new submodules must be moved
-    # onto the model's real compute device or their first real forward call
-    # raises a CPU/CUDA mismatch (confirmed via a real traceback: "mat1 is
-    # on cuda:0, different from other tensors on cpu").
-    #
-    # next(dm.parameters()).device is WRONG here and was tried first - it
-    # reports wherever the model's weights CURRENTLY sit at this exact
-    # moment (_install_editanything_module runs during node prep, before
-    # comfy's own model management has necessarily streamed the model onto
-    # GPU for the actual sampling step under offload/low-vram modes), not
-    # where they'll actually run. comfy.model_management.get_torch_device()
-    # is the real target compute device regardless of current placement -
-    # the SAME call ref_latent below already (correctly) uses to land on
-    # cuda:0, per the traceback itself ("mat1 is on cuda:0" - the input
-    # activations were already using this convention; only the newly
-    # attached weights weren't).
-    target_device = comfy.model_management.get_torch_device()
-
-    def _strip(prefix):
-        return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
-
-    visual_state = _strip("ref_visual_proj.")
-    if not visual_state:
-        raise ValueError(f"{module_path}: no ref_visual_proj.* tensors found - "
-                         "not an EditAnything .module.safetensors file?")
-    adaln_state = _strip("ref_adaln_proj.")
-    dm.editanything_ref_visual_proj = _EditAnythingRefVisualProj(visual_state).to(device=target_device)
-    dm.editanything_ref_adaln_proj = _EditAnythingRefAdaLNProj(adaln_state).to(device=target_device)
-
-    patched = 0
-    for i, block in enumerate(dm.transformer_blocks):
-        if not (EDITANYTHING_REF_START_BLOCK <= i <= EDITANYTHING_REF_END_BLOCK):
-            continue
-        prefix = f"diffusion_model.transformer_blocks.{i}.ref_attn."
-        if f"{prefix}to_q.lora_A.weight" not in sd:
-            continue
-        block.idx = i
-        block.ref_attn = _EditAnythingRefAttention(block.attn2, sd, prefix).to(device=target_device)
-        # This pack's real production models are always the joint AV model
-        # (comfy.ldm.lightricks.av_model.BasicAVTransformerBlock) - a
-        # genuinely different, larger class from the base
-        # BasicTransformerBlock, with its own audio<->video cross-attention
-        # stages (confirmed via a real GPU traceback + direct read of
-        # av_model.py, not assumed - duck-typed via `audio_attn1` rather
-        # than an isinstance check against that exact class, to avoid a
-        # hard import dependency on it).
-        is_av_block = hasattr(block, "audio_attn1")
-        block.forward = types.MethodType(
-            _patched_av_block_forward if is_av_block else _patched_block_forward, block)
-        patched += 1
-    if patched == 0:
-        raise ValueError(f"{module_path}: no ref_attn weights matched blocks "
-                         f"{EDITANYTHING_REF_START_BLOCK}-{EDITANYTHING_REF_END_BLOCK}")
-    logger.info("LTX-2.3 EditAnything: module installed, %d block(s) patched", patched)
-
-    original_prepare_timestep = dm._prepare_timestep
-
-    def _add_ref_adaln(v_timestep, ref_adaln):
-        # v_timestep is a plain tensor for the base (non-AV) LTX model, but
-        # for this pack's real joint AV model (comfy/ldm/lightricks/
-        # av_model.py's AVLTXModel) it's a CompressedTimestep wrapper
-        # (__slots__: data/batch_size/num_frames/patches_per_frame/
-        # feature_dim, not a tensor itself - confirmed via a real
-        # traceback + direct read of av_model.py) storing the real tensor
-        # in `.data`, possibly frame-compressed rather than per-token.
-        # ref_adaln is a single global vector per batch item (no per-
-        # frame/per-token variation), so adding it to the COMPRESSED
-        # `.data` (before expansion back to per-token) is exactly
-        # equivalent to adding it after expansion - broadcast-add onto
-        # whichever tensor is actually there, real or compressed.
-        target = v_timestep.data if hasattr(v_timestep, "data") and not torch.is_tensor(v_timestep) else v_timestep
-        ref_adaln = ref_adaln.to(device=target.device, dtype=target.dtype)
-        if ref_adaln.ndim == 2:
-            ref_adaln = ref_adaln.unsqueeze(1)
-        if torch.is_tensor(v_timestep):
-            return v_timestep + ref_adaln
-        v_timestep.data = v_timestep.data + ref_adaln
-        return v_timestep
-
-    def _prepare_timestep_with_ref_adaln(self, *args, **kwargs):
-        timestep, embedded_timestep, prompt_timestep = original_prepare_timestep(*args, **kwargs)
-        ref_adaln = getattr(self, "_editanything_ref_adaln", None)
-        if ref_adaln is not None:
-            if isinstance(timestep, list):
-                # joint AV model: [v_timestep, a_timestep, cross_av_timestep_ss,
-                # v_prompt_timestep, a_prompt_timestep] - EditAnything is a
-                # purely visual reference signal, only the video component
-                # (index 0) gets it.
-                timestep = list(timestep)
-                timestep[0] = _add_ref_adaln(timestep[0], ref_adaln)
-            else:
-                timestep = _add_ref_adaln(timestep, ref_adaln)
-        return timestep, embedded_timestep, prompt_timestep
-
-    dm._prepare_timestep = types.MethodType(_prepare_timestep_with_ref_adaln, dm)
-
-
-def _apply_editanything_patch(model, vae, reference_image, module_path, reference_mode="per_batch_item"):
-    """Clone `model` and add LTX-2.3's EditAnything reference-conditioning
-    path to the clone - a small extra cross-attention on transformer blocks
-    12-35 plus a global timestep modulation, both driven by `reference_image`.
-    See the "EditAnything reference conditioning" module docstring above for
-    the full mechanism and where it was ported from. Shared by
-    LTXV23VidToVideo's built-in `editanything_lora`/`editanything_module_path`
-    selectors (the primary way to use this - see its docstring, mirrors
-    Krea2Img2Img's `identity_edit` toggle) and the standalone
-    LTXV23EditAnythingPatch node (for patching a model ahead of a different
-    conditioning-prep node, e.g. LTXV23ImgToVideo).
-
-    Needs BOTH EditAnything files, from the same HuggingFace release
-    (DeepBeepMeep/LTX-2, edit_anything_reference_v0.1_r128_*):
-      - the .standard.safetensors half is an ORDINARY LoRA - load it via
-        comfy-core's real LoraLoaderModelOnly (this function never touches
-        LoRA weights itself, only the extra .module architecture below).
-      - the .module.safetensors half is what `module_path` points at here -
-        real extra layers with their own trained weights, not something
-        comfy's own LoRA loader can apply.
-    Without the LoRA loaded, this patch alone is very unlikely to produce a
-    recognizable result - the module's ref_attn/AdaLN paths were trained
-    jointly with the LoRA's own attention deltas, not standalone.
-
-    `reference_image` is VAE-encoded once here (not per sampling step).
-    `reference_mode`: `per_batch_item` (default) encodes each image in the
-    batch SEPARATELY and keeps them as distinct references, one per sample
-    in the eventual sampling batch (tiled/truncated to fit - vae.encode()
-    always collapses a single call's input batch into temporal frames of
-    ONE video, comfy/sd.py VAE.encode, so a batch is encoded one image at a
-    time and concatenated, never blended); `first_frame_only` uses only
-    `reference_image[0]`, logging how many extra images were dropped - the
-    right choice for vid2vid, where the reference batch isn't meant to line
-    up with the sampling batch. `model` is cloned before any patching - the
-    source model object passed in is never mutated.
-    """
-    m = model.clone()
-    _install_editanything_module(m, folder_paths.get_full_path_or_raise(
-        "loras", module_path))
-    dm = m.model.diffusion_model
-
-    pixels = reference_image[:, :, :, :3]
-    if reference_mode == "first_frame_only":
-        if pixels.shape[0] > 1:
-            logger.info("LTX-2.3 EditAnything: reference_mode=first_frame_only, "
-                        "using only the first of %d images", pixels.shape[0])
-        pixels = pixels[:1]
-
-    ref_latents = [vae.encode(pixels[i:i + 1]) for i in range(pixels.shape[0])]
-    ref_latent = torch.cat(ref_latents, dim=0)
-    ref_latent = m.model.process_latent_in(ref_latent).to(
-        device=comfy.model_management.get_torch_device())
-
-    visual_param = next(dm.editanything_ref_visual_proj.parameters())
-    ref_context = dm.editanything_ref_visual_proj(
-        ref_latent.to(dtype=visual_param.dtype)).detach()
-    adaln_param = next(dm.editanything_ref_adaln_proj.parameters())
-    ref_adaln = dm.editanything_ref_adaln_proj(
-        ref_latent.to(dtype=adaln_param.dtype)).detach()
-
-    def wrapper(executor, x, timesteps, context, attention_mask, frame_rate=25,
-                transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
-        # x is a plain list [video_x, audio_x] for this joint AV model, not
-        # a single tensor - confirmed via a real traceback ("'list' object
-        # has no attribute 'shape'") and comfy's own real code doing the
-        # exact same isinstance(x, list) check for the same reason
-        # (comfy/ldm/lightricks/model.py:993-995, batch_size = x[0].shape[0]).
-        batch_size = x[0].shape[0] if isinstance(x, list) else x.shape[0]
-        transformer_options = dict(transformer_options)
-        transformer_options["editanything_ref_context"] = _match_batch(ref_context, batch_size)
-        dm._editanything_ref_adaln = _match_batch(ref_adaln, batch_size)
-        return executor(x, timesteps, context, attention_mask, frame_rate,
-                        transformer_options, keyframe_idxs, denoise_mask=denoise_mask, **kwargs)
-
-    m.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "editanything_ref", wrapper)
-    logger.info("LTX-2.3 EditAnything: patch applied, %d reference(s) (%s), shape %s",
-                pixels.shape[0], reference_mode, tuple(pixels.shape))
-    return m
-
-
-class LTXV23EditAnythingPatch:
-    """Standalone form of LTX-2.3's EditAnything reference-conditioning
-    patch - see LTXV23VidToVideo's `editanything_lora`/`editanything_module_path`
-    selectors instead for the primary, one-node way to use this (mirrors
-    Krea2Img2Img's `identity_edit` toggle: the patch is built into the main
-    conditioning node there too). Use THIS node only when you need the
-    patched model ahead of a DIFFERENT conditioning-prep node - e.g.
-    LTXV23ImgToVideo, or a plain txt2video graph with no video/vid2vid
-    involved at all - since LTXV23VidToVideo's selectors only exist on that
-    one node.
-
-    Wire the SAME reference photo into this node's `reference_image` AND
-    whatever conditioning node's `image` input for the intended full
-    recipe (the guide-token append and the EditAnything path are
-    complementary, not alternatives).
-    """
-
-    CATEGORY = LTX23_CATEGORY
-    TITLE = "LTX-2.3 EditAnything Reference Patch ⚡"
-    SEARCH_ALIASES = ['edit anything', 'reference conditioning', 'identity insert',
-                      'add person', 'reference image', 'ic-lora']
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "patch"
-    DESCRIPTION = ("Standalone EditAnything reference-conditioning patch (extra "
-                   "cross-attention + timestep modulation from one or more "
-                   "reference photos) for use ahead of a conditioning-prep node "
-                   "other than LTXV23VidToVideo, which has this built in via the "
-                   "editanything_lora/editanything_module_path selectors. Load "
-                   "the EditAnything LoRA separately (stock LoraLoaderModelOnly) "
-                   "before this.")
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "vae": ("VAE", {"tooltip": "Video VAE - encodes reference_image into "
-                                "the same latent space the module's proj layers expect."}),
-                "reference_image": ("IMAGE", {"tooltip": "The person/subject to inject. "
-                                    "A batch of N images gives N distinct references, one "
-                                    "per generation in the sampling batch (tiled/truncated "
-                                    "to fit) - see reference_mode for the vid2vid case."}),
-                "module_path": (folder_paths.get_filename_list("loras"), {
-                    "tooltip": "The EditAnything .module.safetensors file, from the "
-                               "loras folder (it's not a LoRA itself, but ships from "
-                               "the same release - keep it next to its .standard.safetensors "
-                               "half, which loads separately via LoraLoaderModelOnly)."}),
-                "reference_mode": (["per_batch_item", "first_frame_only"], {
-                    "default": "per_batch_item",
-                    "tooltip": "per_batch_item: each image in reference_image's batch is "
-                               "encoded and used as its OWN distinct reference (not "
-                               "blended) - image i drives sample i of the sampling batch, "
-                               "tiled/truncated if the counts don't match. "
-                               "first_frame_only: use only reference_image[0], ignore the "
-                               "rest - the vid2vid recipe (one clean reference identity "
-                               "against a single video), avoids a mismatched-count surprise "
-                               "when reference_image's batch isn't meant to map 1:1 onto "
-                               "the sampling batch."}),
-            },
-        }
-
-    @torch.inference_mode()
-    def patch(self, model, vae, reference_image, module_path, reference_mode="per_batch_item"):
-        return (_apply_editanything_patch(model, vae, reference_image, module_path, reference_mode),)
-
-
 # ── conditioning / latent prep ──────────────────────────────────────────────
 
 def _encode_reference_audio(audio_vae, audio, duration_s):
@@ -1148,12 +500,12 @@ class LTXV23ImgToVideo:
 
 
 class LTXV23VidToVideo:
-    """Prompts + init latent for LTX-2.3: T2V/I2V/V2V, with LoRA selection
-    and reference-conditioning all built into this one node - no external
+    """Prompts + init latent for LTX-2.3: T2V/I2V/V2V, with the IC-LoRA
+    task adapter loaded right in this node - no external
     LoraLoaderModelOnly wiring, no separate "is X attached" boolean toggles.
-    Every mechanism here is driven purely by whether its selector is set
+    The mechanism is driven purely by whether its selector is set
     (a real filename) or left at "none" - matching this node's `model`
-    input/output design (patched model out, or the original unpatched
+    input/output design (LoRA-loaded model out, or the original untouched
     model straight through, if nothing was selected).
 
     `mode` (required) declares which of the three base behaviors this call
@@ -1191,40 +543,11 @@ class LTXV23VidToVideo:
     A2V path, unchanged, for driving generation from a voice/sound clip
     with no source video at all.
 
-    `editanything_lora` + `editanything_module_path` (both optional
-    selectors, "none" = off - EITHER alone does nothing useful, they're
-    trained jointly; mutually exclusive with `ic_lora`, whose task-adapter
-    role EditAnything's own LoRA fills) activate LTX-2.3's EditAnything
-    subject-injection recipe, ported faithfully from Wan2GP's real
-    pipeline (traced, not guessed). Four things happen at once, matching
-    the trained recipe exactly:
-      1. `images[0]` (the reference photo - `identity_edit`-style reuse of
-         the `images` input, one subject, plain/white background
-         recommended) is VAE-encoded and APPENDED as clean reference
-         tokens at frame_idx 0 / strength 1.0 (Wan2GP's
-         VideoConditionByReferenceLatent - the mechanism's main identity
-         carrier). It is NOT held as an output frame; `image_strength` is
-         ignored under EditAnything.
-      2. The source `video` (when connected, mode=v2v) is appended as
-         clean guide tokens at frame_idx 0 / `guide_strength` (default
-         1.0) - same append `ic_lora` uses, active here WITHOUT `ic_lora`
-         (Wan2GP EditAnything conditions on the source video this way;
-         it is not a partial-denoise v2v).
-      3+4. The `.module.safetensors` extra layers add the ref_attn
-         residual (blocks 12-35, x0.01) and the ref_adaln timestep shift
-         (x2.0) - see `_apply_editanything_patch`. The `.standard` LoRA
-         loads via the same `LoraLoaderModelOnly` delegation as
-         `ic_lora`, at `editanything_lora_strength`.
-    Prompt format: imperative "Add <appearance> <placement> <scene
-    relation>" (official trained format). The returned `model` is the
-    patched clone (or the original, unpatched, if neither selector is
-    set); always take `model` from THIS node's output, not the original
-    upstream model, whenever any selector here is used.
-
-    All three LoRA-adjacent selectors (`ic_lora`, `editanything_lora`,
-    `editanything_module_path`) list comfy's real `loras` folder_paths
-    category - the same place a plain `LoraLoaderModelOnly` looks, so any
-    file placed there for one is visible to all.
+    The returned `model` is the LoRA-loaded clone (or the original,
+    untouched, if `ic_lora` is "none"); always take `model` from THIS
+    node's output, not the original upstream model, whenever the selector
+    is used. `ic_lora` lists comfy's real `loras` folder_paths category -
+    the same place a plain `LoraLoaderModelOnly` looks.
 
     This node calls comfy-core's real LTXVAddGuide.get_latent_index()/
     append_keyframe() directly (comfy_extras.nodes_lt, always present
@@ -1252,11 +575,11 @@ class LTXV23VidToVideo:
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "latent", "frame_rate")
     FUNCTION = "prepare"
-    DESCRIPTION = ("Prompts and init latent for LTX-2.3 T2V/I2V/V2V - LoRA "
-                   "selection and EditAnything reference-conditioning both "
-                   "built in, no external LoraLoaderModelOnly wiring "
-                   "needed. Feed the outputs into LTXV23KSampler, then "
-                   "LTXV23CropVideoGuide before LTXV23AVDecode.")
+    DESCRIPTION = ("Prompts and init latent for LTX-2.3 T2V/I2V/V2V - the "
+                   "IC-LoRA task adapter loads right in the node, no "
+                   "external LoraLoaderModelOnly wiring needed. Feed the "
+                   "outputs into LTXV23KSampler, then LTXV23CropVideoGuide "
+                   "before LTXV23AVDecode.")
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1277,13 +600,7 @@ class LTXV23VidToVideo:
                                       "tooltip": "With ic_lora set: describe the OUTPUT "
                                                  "you want - most IC-LoRAs are trained on an "
                                                  "instruction-style caption describing the "
-                                                 "transformed result. With EditAnything: an "
-                                                 "imperative ADD instruction, e.g. 'Add a "
-                                                 "<detailed appearance> <placement in frame> "
-                                                 "<relation to the scene>' (the official "
-                                                 "trained format - the reference photo "
-                                                 "supplies identity, the prompt supplies "
-                                                 "placement/attributes). Otherwise: describe "
+                                                 "transformed result. Otherwise: describe "
                                                  "the scene and its motion, a caption not an "
                                                  "instruction."}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
@@ -1304,13 +621,7 @@ class LTXV23VidToVideo:
             "optional": {
                 "images": ("IMAGE", {"tooltip": "First frame(s) for image-to-video (ordinary "
                                     "i2v hold, independent of video/ic_lora below) - "
-                                    "resized and CENTER-CROPPED to width x height. With "
-                                    "EditAnything active, images is instead the REFERENCE "
-                                    "photo (the subject to inject - one photo, plain/white "
-                                    "background strongly recommended, that's what the "
-                                    "mechanism was trained on): appended as clean reference "
-                                    "tokens the model attends to, NOT held as a first frame "
-                                    "(image_strength is ignored under EditAnything)."}),
+                                    "resized and CENTER-CROPPED to width x height."}),
                 "image_strength": ("FLOAT", {
                     "default": I2V_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "images only. How much of the init image(s) to keep. 0.7 is "
@@ -1353,34 +664,6 @@ class LTXV23VidToVideo:
                 "length_from_audio": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "With reference_audio and no video: size the video to the clip."}),
-                "editanything_lora": (lora_choices, {"default": "none",
-                                      "tooltip": "The EditAnything .standard.safetensors LoRA "
-                                                 "half - loaded onto model HERE at "
-                                                 "editanything_lora_strength (no external "
-                                                 "LoraLoaderModelOnly needed). \"none\" = off. "
-                                                 "Needs editanything_module_path set too - "
-                                                 "either alone does nothing useful, they're "
-                                                 "trained jointly."}),
-                "editanything_lora_strength": ("FLOAT", {"default": 1.0, "min": -100.0,
-                                               "max": 100.0, "step": 0.01,
-                                               "tooltip": "editanything_lora only. Same as "
-                                                          "LoraLoaderModelOnly's strength_model."}),
-                "editanything_module_path": (lora_choices, {"default": "none",
-                    "tooltip": "The EditAnything .module.safetensors file (NOT a LoRA - real "
-                               "extra layers, loaded by this pack's own patch mechanism), "
-                               "from the loras folder. \"none\" = off. Needs "
-                               "editanything_lora and `images` connected too."}),
-                "reference_mode": (["per_batch_item", "first_frame_only"], {
-                    "default": "first_frame_only",
-                    "tooltip": "Needs editanything_module_path set. Controls how `images`'s "
-                               "batch is used as the EditAnything reference (independent of "
-                               "its ordinary i2v-hold use). per_batch_item: each image in "
-                               "the batch is encoded and used as its OWN distinct reference "
-                               "(not blended) - image i drives sample i of the sampling "
-                               "batch, tiled/truncated if the counts don't match. "
-                               "first_frame_only (default here): use only images[0], ignore "
-                               "the rest - the vid2vid recipe (one clean reference identity "
-                               "against a single video)."}),
             },
         }
 
@@ -1389,40 +672,20 @@ class LTXV23VidToVideo:
                 length, frame_rate, batch_size, images=None, image_strength=I2V_STRENGTH,
                 video=None, ic_lora="none", ic_lora_strength=1.0, guide_strength=1.0,
                 keep_original_audio=True, latent_downscale_factor=1.0, reference_audio=None,
-                length_from_audio=True, editanything_lora="none", editanything_lora_strength=1.0,
-                editanything_module_path="none", reference_mode="first_frame_only"):
+                length_from_audio=True):
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
             raise ValueError("audio_vae is not an LTX audio VAE; use the kit's "
                              "*_audio_vae.safetensors in the audio_vae slot.")
 
         ic_lora_attached = ic_lora not in (None, "none", "")
-        editanything_lora_attached = editanything_lora not in (None, "none", "")
-        edit_anything = editanything_module_path not in (None, "none", "")
-        if editanything_lora_attached != edit_anything:
-            raise ValueError("LTX-2.3 v2v: editanything_lora and editanything_module_path must "
-                             "be set together (both \"none\" or both a real file) - either "
-                             "alone does nothing, they're trained jointly.")
-        if ic_lora_attached and edit_anything:
-            raise ValueError("LTX-2.3 v2v: ic_lora and EditAnything are mutually exclusive "
-                             "(Wan2GP treats them as separate model modes and they were never "
-                             "trained together) - EditAnything's own .standard.safetensors LoRA "
-                             "IS the task adapter for its recipe; set ic_lora to \"none\".")
 
-        # images is dual-purpose: ordinary i2v hold AND (when edit_anything
-        # is on) the EditAnything reference photo(s) - mode=t2v only
-        # forbids it when it would otherwise ONLY be doing the (unwanted,
-        # in t2v) i2v hold job; with edit_anything on, images connected
-        # under t2v is the "no first-frame hold, just inject this
-        # identity" recipe (pair with image_strength=0 to suppress the
-        # hold entirely).
         if mode == "t2v" and video is not None:
             raise ValueError("LTX-2.3 v2v: mode=t2v but video is connected - disconnect it "
                              "or pick v2v.")
-        if mode == "t2v" and images is not None and not edit_anything:
-            raise ValueError("LTX-2.3 v2v: mode=t2v but images is connected - disconnect it, "
-                             "pick i2v, or set editanything_lora/editanything_module_path if "
-                             "images is meant as an EditAnything reference, not an i2v hold.")
+        if mode == "t2v" and images is not None:
+            raise ValueError("LTX-2.3 v2v: mode=t2v but images is connected - disconnect it "
+                             "or pick i2v.")
         if mode == "i2v" and images is None:
             raise ValueError("LTX-2.3 v2v: mode=i2v needs images connected.")
         if mode == "v2v" and video is None:
@@ -1431,16 +694,6 @@ class LTXV23VidToVideo:
         if ic_lora_attached:
             model = nodes.LoraLoaderModelOnly().load_lora_model_only(
                 model, ic_lora, ic_lora_strength)[0]
-        if editanything_lora_attached:
-            model = nodes.LoraLoaderModelOnly().load_lora_model_only(
-                model, editanything_lora, editanything_lora_strength)[0]
-        if edit_anything:
-            if images is None:
-                raise ValueError("LTX-2.3 v2v: editanything_module_path is set but "
-                                 "images isn't connected (images doubles as the EditAnything "
-                                 "reference photo(s) here - no separate reference_image slot).")
-            model = _apply_editanything_patch(
-                model, vae, images, editanything_module_path, reference_mode)
 
         video_frames = video_audio = None
         if video is not None:
@@ -1469,67 +722,22 @@ class LTXV23VidToVideo:
              height // VIDEO_SPATIAL_RATIO, width // VIDEO_SPATIAL_RATIO], device=device)
         video_mask = torch.ones((batch_size, 1, t_latent, 1, 1),
                                 dtype=torch.float32, device=device)
-        if images is not None and not edit_anything:
+        if images is not None:
             pixels = comfy.utils.common_upscale(
                 images.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             t = _match_batch(vae.encode(pixels[:, :, :, :3]), batch_size)
             video_samples[:, :, :t.shape[2]] = t.to(video_samples.device, video_samples.dtype)
             video_mask[:, :, :t.shape[2]] = 1.0 - image_strength
-        elif images is not None and edit_anything:
-            # Under EditAnything, images is the REFERENCE, never an i2v hold:
-            # Wan2GP's reference is a parallel clean token block the model
-            # attends to (VideoConditionByReferenceLatent), NOT a frame of
-            # the output timeline. Holding the reference photo as frame 1
-            # was exactly the "hard photo cut then unrelated video" glitch
-            # observed in real output - so the hold is skipped entirely
-            # here, regardless of image_strength.
-            logger.info("LTX-2.3 v2v: edit_anything active - images used as EditAnything "
-                        "reference only, i2v hold skipped (image_strength ignored)")
 
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_prompt))
         positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
         negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
-        # ── EditAnything Channel A: reference latent appended as clean guide
-        # tokens (Wan2GP's VideoConditionByReferenceLatent - editanything.py:175,
-        # reference_video_cond.py:16-58: frame_idx=0, strength=1.0, causal_fix,
-        # denoise_mask=0). This is the mechanism's MAIN identity carrier - the
-        # ref_attn (0.01 residual) and ref_adaln paths in
-        # _apply_editanything_patch are the two smaller channels. Appended
-        # BEFORE the source-video guide block, matching Wan2GP's conditioning
-        # order (ref conditionings += before control-video conditionings).
-        # Same delegation as the video guide below: comfy-core's real
-        # LTXVAddGuide, the identical mechanism the official Ingredients
-        # workflow uses to append reference IMAGES (LTXAddVideoICLoRAGuide
-        # @ frame_idx 0, strength 1).
-        if edit_anything:
-            import comfy_extras.nodes_lt as nodes_lt
-
-            scale_factors = vae.downscale_index_formula
-            # Wan2GP takes exactly ONE reference image (ref_images[0],
-            # one_image_ref_only) - Channel A always uses images[0], even
-            # under reference_mode=per_batch_item (which only varies the
-            # per-batch ref_attn/ref_adaln signals).
-            ref_pixels = comfy.utils.common_upscale(
-                images[:1].movedim(-1, 1), width, height, "bilinear", "center"
-            ).movedim(1, -1)[:, :, :, :3]
-            ref_guide_latent = _match_batch(vae.encode(ref_pixels), batch_size)
-            frame_idx, _ = nodes_lt.LTXVAddGuide.get_latent_index(
-                positive, t_latent, ref_guide_latent.shape[2], 0, scale_factors,
-                latent_shape=video_samples.shape)
-            positive, negative, video_samples, video_mask = nodes_lt.LTXVAddGuide.append_keyframe(
-                positive, negative, frame_idx, video_samples, video_mask, ref_guide_latent,
-                1.0, scale_factors, causal_fix=True)
-            logger.info("LTX-2.3 EditAnything: reference guide %s appended @ strength 1.0 "
-                        "(frame_idx=%d)", tuple(ref_guide_latent.shape), frame_idx)
-
-        # Source-video guide append: active for a task IC-LoRA *or* for
-        # EditAnything (Wan2GP appends the source video as clean guide tokens
-        # at frame_idx 0 strength 1.0 in EditAnything mode too - it is NOT a
-        # v2v partial-denoise; without this append the model has no
-        # connection to the source clip at all).
-        if video is not None and (ic_lora_attached or edit_anything):
+        # Source-video guide append: the task IC-LoRA's conditioning - the
+        # clip's frames become clean guide tokens the model attends to at
+        # matching timeline positions.
+        if video is not None and ic_lora_attached:
             import comfy_extras.nodes_lt as nodes_lt
 
             scale_factors = vae.downscale_index_formula
@@ -2171,9 +1379,7 @@ class LTXV23RefineSampler:
 class LTXV23LatentUpscale:
     """Standalone x2 spatial latent upscale (the same _upsample_video_latent
     the refine sampler uses internally, exposed as its own step) - for
-    composing a custom two-stage flow, e.g. the EditAnything recipe: sample
-    the ADD at half resolution (where guide tokens don't drown the edit -
-    Wan2GP's own stage 1 runs at half res for exactly this reason), crop the
+    composing a custom two-stage flow: sample at half resolution, crop the
     guides, upscale x2 here, then run LTXV23KSampler with the "refine
     (3 steps)" schedule on the result. Feed the CROPPED conditioning to the
     refine pass - the keyframe coords would misalign after upscaling."""
@@ -2539,7 +1745,6 @@ class LTXV23IDLoraAssembler:
 
 NODE_CLASS_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader,
-    "LTXV23EditAnythingPatch": LTXV23EditAnythingPatch,
     "LTXV23ImgToVideo": LTXV23ImgToVideo,
     "LTXV23VidToVideo": LTXV23VidToVideo,
     "LTXV23RemovePerson": LTXV23RemovePerson,
@@ -2556,7 +1761,6 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXV23ModelsLoader": LTXV23ModelsLoader.TITLE,
-    "LTXV23EditAnythingPatch": LTXV23EditAnythingPatch.TITLE,
     "LTXV23ImgToVideo": LTXV23ImgToVideo.TITLE,
     "LTXV23VidToVideo": LTXV23VidToVideo.TITLE,
     "LTXV23RemovePerson": LTXV23RemovePerson.TITLE,

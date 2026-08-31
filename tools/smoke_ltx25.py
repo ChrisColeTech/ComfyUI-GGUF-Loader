@@ -8,9 +8,8 @@ GPU/weight-free (CPU only, tiny tensors).
 
 Covers: stage-1 latent geometry (half the target resolution), the i2v hold
 strength math (LTXVImgToVideoInplace semantics), the two sigma presets
-verbatim, LTXV25VidToVideo's full 2.3-mirror surface (ic_lora guide append on
-the stage-1 grid + crop round-trip, EditAnything lora-then-patch chaining and
-Channel-A reference append, mode/selector validation, latent_downscale_factor
+verbatim, LTXV25VidToVideo's 2.3-mirror surface (ic_lora guide append on
+the stage-1 grid + crop round-trip, mode validation, latent_downscale_factor
 against the half grid, reference_audio/keep_original_audio holds), the x2
 upscale + refine re-hold, and the AV decode wiring.
 
@@ -298,11 +297,6 @@ def test_v2v_mode_and_selector_validation_matrix():
         (dict(mode="i2v"), "images"),
         (dict(mode="t2v", video=_FakeVideo()), "t2v"),
         (dict(mode="t2v", images=image), "t2v"),
-        (dict(mode="t2v", editanything_lora="ea.standard.safetensors"), "together"),
-        (dict(mode="t2v", editanything_module_path="ea.module.safetensors"), "together"),
-        (dict(mode="v2v", video=_FakeVideo(), ic_lora="task.safetensors",
-              editanything_lora="ea.standard.safetensors",
-              editanything_module_path="ea.module.safetensors"), "mutually exclusive"),
     ]
     for kw, needle in cases:
         try:
@@ -310,9 +304,8 @@ def test_v2v_mode_and_selector_validation_matrix():
             assert False, f"expected ValueError for {kw}"
         except ValueError as e:
             assert needle in str(e), (kw, str(e))
-    print("[ok] LTXV25VidToVideo: mode/selector validation matrix matches the "
-          "2.3 node - required sockets, EA pair set together, ic_lora+EA "
-          "mutually exclusive")
+    print("[ok] LTXV25VidToVideo: mode validation matrix matches the 2.3 node - "
+          "each mode demands its required socket, t2v rejects extras")
 
 
 def test_v2v_latent_downscale_factor_validated_against_stage_grid():
@@ -340,54 +333,6 @@ def test_v2v_latent_downscale_factor_validated_against_stage_grid():
     print("[ok] LTXV25VidToVideo: latent_downscale_factor divisibility is checked "
           "against the stage-1 half resolution and the ref0.5-style guide still "
           "appends when it divides")
-
-
-def test_v2v_editanything_chains_lora_then_patch_and_appends_reference():
-    import cctech_gguf_pkg.nodes.ltx23 as ltx23_mod
-
-    image = torch.rand(1, 256, 448, 3)
-    patch_calls = []
-
-    def _fake_patch(model, vae, reference_image, module_path, reference_mode):
-        patch_calls.append((model, module_path, reference_mode,
-                           tuple(reference_image.shape)))
-        return ("ea-patched", model)
-
-    orig_loader = ltx25.nodes.LoraLoaderModelOnly
-    orig_patch = ltx23_mod._apply_editanything_patch
-    ltx25.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
-    ltx23_mod._apply_editanything_patch = _fake_patch
-    _FakeLoraLoaderModelOnly.calls = []
-    try:
-        out_model, positive, _, latent, _ = _v2v(
-            mode="t2v", images=image, image_strength=0.7,
-            editanything_lora="ea.standard.safetensors",
-            editanything_lora_strength=0.9,
-            editanything_module_path="ea.module.safetensors",
-            reference_mode="first_frame_only")
-    finally:
-        ltx25.nodes.LoraLoaderModelOnly = orig_loader
-        ltx23_mod._apply_editanything_patch = orig_patch
-
-    # .standard LoRA first (LoraLoaderModelOnly), then the module patch on
-    # ITS output - the 2.3 order.
-    assert _FakeLoraLoaderModelOnly.calls == [
-        ("base-model", "ea.standard.safetensors", 0.9)]
-    assert patch_calls == [((("lora-patched", "ea.standard.safetensors",
-                              "base-model")), "ea.module.safetensors",
-                            "first_frame_only", (1, 256, 448, 3))]
-    assert out_model == ("ea-patched", ("lora-patched", "ea.standard.safetensors",
-                                        "base-model"))
-
-    video_latent, _ = latent["samples"].unbind()
-    _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
-    assert num_keyframes > 0, "Channel A reference guide appended"
-    mask_v, _ = latent["noise_mask"].unbind()
-    assert torch.all(mask_v[:, :, 0] == 1.0), \
-        "i2v hold skipped under EditAnything (images is the reference, not a hold)"
-    print("[ok] LTXV25VidToVideo: EditAnything chains the .standard LoRA through "
-          "LoraLoaderModelOnly then the module patch (2.3's own helper, spied), "
-          "appends the Channel-A reference guide, and skips the i2v hold")
 
 
 def test_v2v_reference_audio_sizes_length_and_holds_the_clip():
@@ -696,7 +641,6 @@ if __name__ == "__main__":
     test_v2v_i2v_hold_lands_on_stage_grid_with_video_guide_layered()
     test_v2v_mode_and_selector_validation_matrix()
     test_v2v_latent_downscale_factor_validated_against_stage_grid()
-    test_v2v_editanything_chains_lora_then_patch_and_appends_reference()
     test_v2v_reference_audio_sizes_length_and_holds_the_clip()
     test_v2v_keep_original_audio_holds_source_track()
     test_mode_validates_required_socket_is_connected()

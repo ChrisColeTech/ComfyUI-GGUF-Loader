@@ -3699,3 +3699,28 @@ Verified result: ltx25_swap (512x896x73, seed 42) - start-frame woman doing
 the source dancer's per-frame poses, exact original audio. ref0.5 rule on
 2.5: factor 2.0 relative to the STAGE-1 grid; stage-1 dims must divide by
 64 => target width/height must be multiples of 128.
+
+## 2026-08-31 - EditAnything removed entirely (user decision)
+
+EditAnything is gone from the pack: the LTXV23EditAnythingPatch node, the
+editanything_lora/editanything_lora_strength/editanything_module_path/
+reference_mode selectors on BOTH VidToVideo nodes, the whole ported patch
+machinery in ltx23.py (module classes, patched block forwards, ref_adaln
+wrapper, ~640 lines), the Channel-A reference appends, the EA hold-skip
+branches, the ic_lora exclusivity checks (moot now), the
+smoke_ltx23_editanything.py suite, and all EA docs.
+
+Why: across every verification attempt on the 10Eros checkpoint - full res,
+half res, white-background reference - the add-effect never visibly
+materialized (scratchpad frames eaw_01-03 show the source clip faithfully
+reproduced with NO added subject; the user's own runs matched). The
+mechanism fired (channels active, source followed); the trained effect did
+not survive the checkpoint drift from stock LTX-2.3. The user's verdict
+after live runs: remove it and standardize on the pose/union-control
+IC-LoRA recipe ("the controlnet"), which is GPU-verified on both 2.3 and
+2.5 (ltxv_v2v_best / ltx25_v2v.json).
+
+The ic_lora v2v path is byte-identical in behavior; audio helpers
+(_encode_reference_audio/_fit_audio_latent) stay - they serve
+keep_original_audio/reference_audio and ltx25 imports them. Suites after
+removal: smoke_ltx23_vid2vid 8/8, smoke_ltx25 16/16, pytest 84/84.
