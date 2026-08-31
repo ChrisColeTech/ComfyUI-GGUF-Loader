@@ -308,19 +308,25 @@ def test_v2v_mode_and_selector_validation_matrix():
           "each mode demands its required socket, t2v rejects extras")
 
 
-def test_v2v_latent_downscale_factor_validated_against_stage_grid():
+def test_v2v_latent_downscale_factor_snaps_to_nearest_grid():
     orig_loader = ltx25.nodes.LoraLoaderModelOnly
     ltx25.nodes.LoraLoaderModelOnly = _FakeLoraLoaderModelOnly
     try:
-        # target 448x256 -> stage 224x128; factor 2 needs stage % 64 == 0,
-        # 224 % 64 = 32 -> must refuse with a stage-1 message.
-        try:
-            _v2v(mode="v2v", video=_FakeVideo(), ic_lora="task.safetensors",
-                 latent_downscale_factor=2.0, keep_original_audio=False)
-            assert False, "expected ValueError for factor 2 on a 224x128 stage grid"
-        except ValueError as e:
-            assert "STAGE-1" in str(e)
-        # 512x256 -> stage 256x128: 256 % 64 == 0 and 128 % 64 == 0 -> ok.
+        # target 448x256 -> stage 224x128 -> latent 7x4; factor 2 needs even
+        # cell counts, so the grid snaps DOWN to 6x4 (effective stage 192x128,
+        # effective target 384x256) instead of erroring - core's own floor
+        # philosophy, audible via a log line. The official ResolutionSelector
+        # workflow feeds arbitrary sizes; this is what makes them just work.
+        _, positive, _, latent, _ = _v2v(
+            mode="v2v", video=_FakeVideo(), ic_lora="task.safetensors",
+            latent_downscale_factor=2.0, keep_original_audio=False)
+        video_latent, _ = latent["samples"].unbind()
+        assert tuple(video_latent.shape[-2:]) == (4, 6), \
+            f"stage grid must snap 7->6 cells wide, got {tuple(video_latent.shape[-2:])}"
+        _, nk = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
+        assert nk > 0, "downscaled guide appended on the snapped grid"
+
+        # Already-compatible size passes through unchanged: 512x256 -> 8x4.
         _, positive, _, latent, _ = _v2v(
             mode="v2v", width=512, height=256, video=_FakeVideo(h=256, w=512),
             ic_lora="task.safetensors", latent_downscale_factor=2.0,
@@ -328,11 +334,12 @@ def test_v2v_latent_downscale_factor_validated_against_stage_grid():
     finally:
         ltx25.nodes.LoraLoaderModelOnly = orig_loader
     video_latent, _ = latent["samples"].unbind()
+    assert tuple(video_latent.shape[-2:]) == (4, 8)
     _, num_keyframes = nodes_lt.get_keyframe_idxs(positive, video_latent.shape)
     assert num_keyframes > 0, "downscaled guide still appended via dilate_latent"
-    print("[ok] LTXV25VidToVideo: latent_downscale_factor divisibility is checked "
-          "against the stage-1 half resolution and the ref0.5-style guide still "
-          "appends when it divides")
+    print("[ok] LTXV25VidToVideo: incompatible sizes snap DOWN to the nearest "
+          "factor-aligned latent grid (logged, never an error), compatible "
+          "sizes pass through exactly")
 
 
 def test_v2v_reference_audio_sizes_length_and_holds_the_clip():
@@ -640,7 +647,7 @@ if __name__ == "__main__":
     test_v2v_ic_lora_none_is_plain_shape_and_crop_is_noop()
     test_v2v_i2v_hold_lands_on_stage_grid_with_video_guide_layered()
     test_v2v_mode_and_selector_validation_matrix()
-    test_v2v_latent_downscale_factor_validated_against_stage_grid()
+    test_v2v_latent_downscale_factor_snaps_to_nearest_grid()
     test_v2v_reference_audio_sizes_length_and_holds_the_clip()
     test_v2v_keep_original_audio_holds_source_track()
     test_mode_validates_required_socket_is_connected()

@@ -3724,3 +3724,19 @@ The ic_lora v2v path is byte-identical in behavior; audio helpers
 (_encode_reference_audio/_fit_audio_latent) stay - they serve
 keep_original_audio/reference_audio and ltx25 imports them. Suites after
 removal: smoke_ltx23_vid2vid 8/8, smoke_ltx25 16/16, pytest 84/84.
+
+## 2026-08-31 (v2.14.1) - v2v resolution: snap to grid instead of erroring
+
+The user's ResolutionSelector fed 728x1296 into the v2v ds2 path and hit the
+divisibility ValueError - but NO LTX-2.5 graph can render that size; the
+OFFICIAL workflow silently floors it through core's latent arithmetic. The
+error (inherited from the 2.3 pattern) was fighting core's own floor
+philosophy. Both VidToVideo nodes now snap width/height DOWN to the nearest
+latent grid compatible with latent_downscale_factor (even cell counts at
+ds2) and LOG the effective size ("target 728x1296 -> effective 640x1280 ...")
+instead of raising - core floors silently, we floor audibly. The only
+remaining ValueError is target-too-small-for-factor. GPU-verified at the
+exact failing size. Ops note: the port-8188 server can be the USER's own
+instance running pre-deploy code - a stale-looking error with mismatched
+traceback source lines means the process predates the file on disk; check
+which instance owns the port before debugging "impossible" errors.

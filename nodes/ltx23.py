@@ -715,6 +715,29 @@ class LTXV23VidToVideo:
         else:
             length = _align_length(length)
 
+        # The latent grid floors to whole 32px cells (core's own arithmetic);
+        # with latent_downscale_factor > 1 the cell count must also divide by
+        # the factor so the downscaled guide scatters onto every factor-th
+        # cell. Snap DOWN to the nearest compatible grid and say so - core
+        # floors silently, this floors audibly.
+        guide_factor = (max(1, int(latent_downscale_factor))
+                        if video is not None and ic_lora_attached else 1)
+        lat_w = width // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
+        lat_h = height // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
+        if lat_w < guide_factor or lat_h < guide_factor:
+            raise ValueError(
+                f"LTX-2.3 v2v: target {width}x{height} is too small for "
+                f"latent_downscale_factor {latent_downscale_factor} - needs at "
+                f"least {guide_factor * VIDEO_SPATIAL_RATIO}px per side.")
+        if (lat_w * VIDEO_SPATIAL_RATIO, lat_h * VIDEO_SPATIAL_RATIO) != (width, height):
+            logger.info(
+                "LTX-2.3 v2v: target %dx%d -> effective %dx%d (nearest latent "
+                "grid%s; the typed size is not producible on this grid)",
+                width, height, lat_w * VIDEO_SPATIAL_RATIO, lat_h * VIDEO_SPATIAL_RATIO,
+                " aligned for downscale_factor %d" % guide_factor
+                if guide_factor > 1 else "")
+            width, height = lat_w * VIDEO_SPATIAL_RATIO, lat_h * VIDEO_SPATIAL_RATIO
+
         t_latent = ((length - 1) // VIDEO_TEMPORAL_RATIO) + 1
         device = comfy.model_management.intermediate_device()
         video_samples = torch.zeros(
@@ -753,13 +776,8 @@ class LTXV23VidToVideo:
 
             guide_mask = None
             if latent_downscale_factor > 1:
-                block = int(VIDEO_SPATIAL_RATIO * latent_downscale_factor)
-                if width % block != 0 or height % block != 0:
-                    raise ValueError(
-                        f"LTX-2.3 v2v: with latent_downscale_factor {latent_downscale_factor} "
-                        f"the target size must be divisible by {block} (the downscaled guide "
-                        f"still has to land on whole {VIDEO_SPATIAL_RATIO}px latents) - got "
-                        f"{width}x{height}. Round width/height up to a multiple of {block}.")
+                # width/height were snapped to a factor-compatible latent grid
+                # above, so the guide always lands on whole 32px cells here.
                 guide_latent, guide_mask = nodes_lt.LTXVAddGuide.dilate_latent(
                     guide_latent, latent_downscale_factor)
 

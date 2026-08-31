@@ -812,8 +812,34 @@ class LTXV25VidToVideo:
         else:
             length = _align_length(length)
 
-        # ── stage-1 grid at HALF the target resolution (the 2.5 recipe) ──
-        stage_w, stage_h = width // 2, height // 2
+        # ── stage-1 grid at HALF the target resolution (the 2.5 recipe).
+        # The latent grid floors to whole 32px cells - core's own
+        # EmptyLTXVLatentVideo arithmetic, which is why the official workflow
+        # accepts any ResolutionSelector value and quietly renders the floored
+        # size. With latent_downscale_factor > 1 the cell count must also
+        # divide by the factor (the downscaled guide scatters onto every
+        # factor-th cell), so snap DOWN to the nearest compatible grid and SAY
+        # so - core floors silently, this floors audibly. ──
+        guide_factor = (max(1, int(latent_downscale_factor))
+                        if video is not None and ic_lora_attached else 1)
+        lat_w = (width // 2) // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
+        lat_h = (height // 2) // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
+        if lat_w < guide_factor or lat_h < guide_factor:
+            raise ValueError(
+                f"LTX-2.5 v2v: target {width}x{height} is too small for "
+                f"latent_downscale_factor {latent_downscale_factor} - the stage-1 "
+                f"half resolution needs at least {2 * guide_factor * VIDEO_SPATIAL_RATIO}px "
+                f"per side at the target.")
+        stage_w = lat_w * VIDEO_SPATIAL_RATIO
+        stage_h = lat_h * VIDEO_SPATIAL_RATIO
+        if (stage_w, stage_h) != (width // 2, height // 2):
+            logger.info(
+                "LTX-2.5 v2v: target %dx%d -> effective %dx%d (nearest latent "
+                "grid%s; the typed size is not producible on this grid)",
+                width, height, stage_w * 2, stage_h * 2,
+                " aligned for downscale_factor %d" % guide_factor
+                if guide_factor > 1 else "")
+            width, height = stage_w * 2, stage_h * 2
         t_latent = video_latent_t(length)
         device = comfy.model_management.intermediate_device()
         video_samples = torch.zeros(
@@ -843,20 +869,9 @@ class LTXV25VidToVideo:
         if video is not None and ic_lora_attached:
             import comfy_extras.nodes_lt as nodes_lt
 
-            # Geometry gate FIRST - encoding an off-grid guide crashes deep
-            # inside the VAE's einops rearrange, which is exactly the failure
-            # this error message exists to preempt.
-            if latent_downscale_factor > 1:
-                block = int(VIDEO_SPATIAL_RATIO * latent_downscale_factor)
-                if stage_w % block != 0 or stage_h % block != 0:
-                    raise ValueError(
-                        f"LTX-2.5 v2v: with latent_downscale_factor {latent_downscale_factor} "
-                        f"the STAGE-1 half resolution must be divisible by {block} (the "
-                        f"downscaled guide still has to land on whole "
-                        f"{VIDEO_SPATIAL_RATIO}px latents) - got {stage_w}x{stage_h} "
-                        f"(target {width}x{height}). Round width/height up to a multiple "
-                        f"of {2 * block}.")
-
+            # stage_w/stage_h were snapped to a factor-compatible latent grid
+            # above, so the guide encode below always lands on whole 32px
+            # cells - no divisibility error can occur here any more.
             time_scale = scale_factors[0]
             n = video_frames.shape[0]
             guide_frames = video_frames[:((n - 1) // time_scale) * time_scale + 1]
