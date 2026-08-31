@@ -129,6 +129,46 @@ def _align_length(length):
     return length
 
 
+def _snap_target_keep_aspect(width, height, unit, label, factor):
+    """Snap a typed target size to the pixel grid ``unit`` (32 x the guide's
+    latent_downscale_factor), choosing the candidate whose ASPECT is closest
+    to what was typed - never by flooring each side independently, which at
+    coarse units (128px at factor 2) can shear the aspect and center-crop
+    the inputs hard.
+
+    For each of floor/ceil of the width, the aspect-matching height is
+    rounded to the grid; ties on aspect error break toward the pixel count
+    closest to the request. Raises only when the target can't fit one guide
+    cell per side at all.
+    """
+    if width < unit or height < unit:
+        raise ValueError(
+            f"{label}: target {width}x{height} is too small for "
+            f"latent_downscale_factor {factor} - needs at least {unit}px "
+            f"per side.")
+    if width % unit == 0 and height % unit == 0:
+        return width, height
+    aspect = width / height
+    candidates = set()
+    for w in {width // unit * unit, -(-width // unit) * unit}:
+        if w < unit:
+            continue
+        h_ideal = w / aspect
+        for h in {int(h_ideal // unit) * unit, int(-(-h_ideal // unit)) * unit,
+                  height // unit * unit, -(-height // unit) * unit}:
+            if h >= unit:
+                candidates.add((w, h))
+    def _score(wh):
+        w, h = wh
+        # aspect error first, then closest pixel count, then the smaller
+        # size (deterministic on exact ties; cheaper render, never a
+        # surprise VRAM jump above the request).
+        return (abs((w / h) - aspect) / aspect,
+                abs(w * h - width * height),
+                w * h)
+    return min(candidates, key=_score)
+
+
 def distilled_sigma_schedule(steps, denoise=1.0, sigmas=None):
     """The LTX-2 distilled sigmas, resampled to ``steps``.
 
@@ -715,28 +755,27 @@ class LTXV23VidToVideo:
         else:
             length = _align_length(length)
 
-        # The latent grid floors to whole 32px cells (core's own arithmetic);
-        # with latent_downscale_factor > 1 the cell count must also divide by
-        # the factor so the downscaled guide scatters onto every factor-th
-        # cell. Snap DOWN to the nearest compatible grid and say so - core
-        # floors silently, this floors audibly.
+        # The latent grid needs whole 32px cells (core's own arithmetic); with
+        # latent_downscale_factor > 1 the cell count must also divide by the
+        # factor. Snap to the grid size whose SHAPE is closest to what was
+        # typed - flooring each side independently distorts the aspect (at
+        # factor 2 the steps are coarse; 728x1296 floored to 640x1280 turned
+        # 0.56 into 0.50 and center-cropped everything hard). ASPECT first,
+        # then closest pixel count; log the effective size.
         guide_factor = (max(1, int(latent_downscale_factor))
                         if video is not None and ic_lora_attached else 1)
-        lat_w = width // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
-        lat_h = height // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
-        if lat_w < guide_factor or lat_h < guide_factor:
-            raise ValueError(
-                f"LTX-2.3 v2v: target {width}x{height} is too small for "
-                f"latent_downscale_factor {latent_downscale_factor} - needs at "
-                f"least {guide_factor * VIDEO_SPATIAL_RATIO}px per side.")
-        if (lat_w * VIDEO_SPATIAL_RATIO, lat_h * VIDEO_SPATIAL_RATIO) != (width, height):
+        eff_w, eff_h = _snap_target_keep_aspect(
+            width, height, VIDEO_SPATIAL_RATIO * guide_factor, "LTX-2.3 v2v",
+            latent_downscale_factor)
+        if (eff_w, eff_h) != (width, height):
             logger.info(
-                "LTX-2.3 v2v: target %dx%d -> effective %dx%d (nearest latent "
-                "grid%s; the typed size is not producible on this grid)",
-                width, height, lat_w * VIDEO_SPATIAL_RATIO, lat_h * VIDEO_SPATIAL_RATIO,
+                "LTX-2.3 v2v: target %dx%d -> effective %dx%d (closest "
+                "aspect-preserving latent grid%s; the typed size is not "
+                "producible on this grid)",
+                width, height, eff_w, eff_h,
                 " aligned for downscale_factor %d" % guide_factor
                 if guide_factor > 1 else "")
-            width, height = lat_w * VIDEO_SPATIAL_RATIO, lat_h * VIDEO_SPATIAL_RATIO
+            width, height = eff_w, eff_h
 
         t_latent = ((length - 1) // VIDEO_TEMPORAL_RATIO) + 1
         device = comfy.model_management.intermediate_device()

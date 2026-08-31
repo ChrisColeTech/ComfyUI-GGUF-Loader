@@ -3740,3 +3740,13 @@ exact failing size. Ops note: the port-8188 server can be the USER's own
 instance running pre-deploy code - a stale-looking error with mismatched
 traceback source lines means the process predates the file on disk; check
 which instance owns the port before debugging "impossible" errors.
+
+## 2026-08-31 (v2.14.2) - aspect-preserving grid snap
+
+v2.14.1's per-side floor sheared the aspect at coarse grid units (728x1296
+@ ds2 floored to 640x1280: 0.56 -> 0.50, center-crop ate the frame sides -
+user: "over cropping"). `_snap_target_keep_aspect` (ltx23.py, shared) now
+picks the candidate grid size with the CLOSEST ASPECT to the typed target
+(then closest pixel count, then smaller - deterministic ties). 728x1296 @
+ds2 -> 640x1152 (1.1% aspect err); exact-grid sizes pass through untouched.
+GPU-verified: framing matches the source again.

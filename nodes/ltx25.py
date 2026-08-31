@@ -768,7 +768,8 @@ class LTXV25VidToVideo:
                 img_compression=LTX25_IMG_COMPRESSION, video=None, ic_lora="none",
                 ic_lora_strength=1.0, guide_strength=1.0, keep_original_audio=True,
                 latent_downscale_factor=1.0, reference_audio=None, length_from_audio=True):
-        from .ltx23 import _encode_reference_audio, _fit_audio_latent
+        from .ltx23 import (_encode_reference_audio, _fit_audio_latent,
+                            _snap_target_keep_aspect)
 
         fsm = getattr(audio_vae, "first_stage_model", None)
         if fsm is None or not hasattr(fsm, "num_of_latents_from_frames"):
@@ -822,24 +823,22 @@ class LTXV25VidToVideo:
         # so - core floors silently, this floors audibly. ──
         guide_factor = (max(1, int(latent_downscale_factor))
                         if video is not None and ic_lora_attached else 1)
-        lat_w = (width // 2) // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
-        lat_h = (height // 2) // VIDEO_SPATIAL_RATIO // guide_factor * guide_factor
-        if lat_w < guide_factor or lat_h < guide_factor:
-            raise ValueError(
-                f"LTX-2.5 v2v: target {width}x{height} is too small for "
-                f"latent_downscale_factor {latent_downscale_factor} - the stage-1 "
-                f"half resolution needs at least {2 * guide_factor * VIDEO_SPATIAL_RATIO}px "
-                f"per side at the target.")
-        stage_w = lat_w * VIDEO_SPATIAL_RATIO
-        stage_h = lat_h * VIDEO_SPATIAL_RATIO
-        if (stage_w, stage_h) != (width // 2, height // 2):
+        # Target-space grid unit: 32px latent cells on the HALF-res stage,
+        # times the guide factor. Snap by CLOSEST ASPECT, not per-side floor
+        # (which shears the shape at coarse units and over-crops the inputs).
+        eff_w, eff_h = _snap_target_keep_aspect(
+            width, height, 2 * VIDEO_SPATIAL_RATIO * guide_factor,
+            "LTX-2.5 v2v", latent_downscale_factor)
+        if (eff_w, eff_h) != (width, height):
             logger.info(
-                "LTX-2.5 v2v: target %dx%d -> effective %dx%d (nearest latent "
-                "grid%s; the typed size is not producible on this grid)",
-                width, height, stage_w * 2, stage_h * 2,
+                "LTX-2.5 v2v: target %dx%d -> effective %dx%d (closest "
+                "aspect-preserving latent grid%s; the typed size is not "
+                "producible on this grid)",
+                width, height, eff_w, eff_h,
                 " aligned for downscale_factor %d" % guide_factor
                 if guide_factor > 1 else "")
-            width, height = stage_w * 2, stage_h * 2
+            width, height = eff_w, eff_h
+        stage_w, stage_h = width // 2, height // 2
         t_latent = video_latent_t(length)
         device = comfy.model_management.intermediate_device()
         video_samples = torch.zeros(
