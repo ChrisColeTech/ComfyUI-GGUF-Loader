@@ -515,9 +515,15 @@ def test_latent_upscale_doubles_video_and_passes_audio_through():
     up_video, up_audio = upscaled["samples"].unbind()
     assert tuple(up_video.shape) == (1, 128, 16, 8, 14), "video must double in H/W only"
     assert torch.equal(up_audio, audio), "audio must pass through untouched"
-    assert "noise_mask" not in upscaled, "no images -> mask dropped (core behavior)"
+    # The mask SURVIVES the upscale: the video half is a per-frame broadcast
+    # (resolution-independent), the audio half belongs to the untouched audio
+    # latent. Dropping it here is what let the refine pass regenerate held
+    # audio (heard live as wrong audio on keep_original_audio).
+    mask_v, mask_a = upscaled["noise_mask"].unbind()
+    assert tuple(mask_v.shape) == (1, 1, 16, 1, 1)
+    assert torch.equal(mask_a, torch.ones_like(audio))
     print("[ok] LTXV25LatentUpscale: x2 on the video half only, audio passthrough, "
-          "stale noise_mask dropped when no re-hold is requested")
+          "noise mask carried through so held audio/frames survive the refine pass")
 
 
 def test_latent_upscale_rehold_applies_refine_strength():
@@ -547,8 +553,25 @@ def test_latent_upscale_rehold_applies_refine_strength():
         "refine re-hold must default to the official 1.0 (mask 1 - 1.0 = 0)"
     assert torch.all(mask_v[:, :, 1:] == 1.0)
     assert torch.all(mask_a == 1.0)
+
+    # With an incoming HELD audio mask (keep_original_audio), the re-hold
+    # branch must preserve it - not rebuild it as ones.
+    held_audio_mask = torch.zeros_like(audio)
+    latent2 = {"samples": comfy.nested_tensor.NestedTensor((video, audio)),
+               "noise_mask": comfy.nested_tensor.NestedTensor(
+                   (torch.ones(1, 1, 16, 1, 1), held_audio_mask))}
+    orig_load = comfy.model_management.load_models_gpu
+    comfy.model_management.load_models_gpu = lambda *a, **kw: None
+    try:
+        upscaled2, = ltx25.LTXV25LatentUpscale().upscale(
+            latent2, _FakeUpscaleModel(), _upscale_vae(),
+            images=image, img_compression=0)
+    finally:
+        comfy.model_management.load_models_gpu = orig_load
+    _, mask_a2 = upscaled2["noise_mask"].unbind()
+    assert torch.all(mask_a2 == 0.0), "held audio mask must survive the re-hold"
     print("[ok] LTXV25LatentUpscale: wiring images re-holds the first frame on the "
-          "upscaled latent @ the official 1.0 and rebuilds the joint noise mask")
+          "upscaled latent @ the official 1.0 and PRESERVES a held audio mask")
 
 
 class _FakeDualCFGGuider:
@@ -614,12 +637,15 @@ def test_ksampler_composes_dual_cfg_guider_with_exact_sigmas():
     n_video, n_audio = g1.sample_args["noise"].unbind()
     v, a = latent["samples"].unbind()
     assert n_video.shape == v.shape and n_audio.shape == a.shape
-    assert "noise_mask" not in out and out["samples"].is_nested
-    assert "noise_mask" not in out2
+    # Unlike core SamplerCustomAdvanced, the mask is KEPT on the output - the
+    # family's two-pass chain needs holds (audio, first frame) to survive to
+    # the refine sampler.
+    assert out["noise_mask"] is latent["noise_mask"] and out["samples"].is_nested
     print("[ok] LTXV25KSampler: composes core's Guider_LTXAVDualCFG(video/audio "
           "cfg) + sampler_object(euler_ancestral) + prepare_noise on the nested "
-          "latent, passing the preset sigmas through verbatim and the joint "
-          "noise mask as denoise_mask")
+          "latent, passing the preset sigmas through verbatim, the joint noise "
+          "mask as denoise_mask, and KEEPING the mask on the output for the "
+          "refine pass")
 
 
 class _FakeDecodeVideoVAE:

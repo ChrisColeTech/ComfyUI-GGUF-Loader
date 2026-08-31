@@ -949,6 +949,20 @@ class LTXV25VidToVideo:
         if video is not None and (ic_lora_attached or edit_anything):
             import comfy_extras.nodes_lt as nodes_lt
 
+            # Geometry gate FIRST - encoding an off-grid guide crashes deep
+            # inside the VAE's einops rearrange, which is exactly the failure
+            # this error message exists to preempt.
+            if latent_downscale_factor > 1:
+                block = int(VIDEO_SPATIAL_RATIO * latent_downscale_factor)
+                if stage_w % block != 0 or stage_h % block != 0:
+                    raise ValueError(
+                        f"LTX-2.5 v2v: with latent_downscale_factor {latent_downscale_factor} "
+                        f"the STAGE-1 half resolution must be divisible by {block} (the "
+                        f"downscaled guide still has to land on whole "
+                        f"{VIDEO_SPATIAL_RATIO}px latents) - got {stage_w}x{stage_h} "
+                        f"(target {width}x{height}). Round width/height up to a multiple "
+                        f"of {2 * block}.")
+
             time_scale = scale_factors[0]
             n = video_frames.shape[0]
             guide_frames = video_frames[:((n - 1) // time_scale) * time_scale + 1]
@@ -961,15 +975,6 @@ class LTXV25VidToVideo:
 
             guide_mask = None
             if latent_downscale_factor > 1:
-                block = int(VIDEO_SPATIAL_RATIO * latent_downscale_factor)
-                if stage_w % block != 0 or stage_h % block != 0:
-                    raise ValueError(
-                        f"LTX-2.5 v2v: with latent_downscale_factor {latent_downscale_factor} "
-                        f"the STAGE-1 half resolution must be divisible by {block} (the "
-                        f"downscaled guide still has to land on whole "
-                        f"{VIDEO_SPATIAL_RATIO}px latents) - got {stage_w}x{stage_h} "
-                        f"(target {width}x{height}). Round width/height up to a multiple "
-                        f"of {2 * block}.")
                 guide_latent, guide_mask = nodes_lt.LTXVAddGuide.dilate_latent(
                     guide_latent, latent_downscale_factor)
 
@@ -1185,7 +1190,14 @@ class LTXV25KSampler:
         out = out.to(comfy.model_management.intermediate_device())
 
         latent["samples"] = out
-        latent.pop("noise_mask", None)
+        # Deliberately UNLIKE core SamplerCustomAdvanced: the noise mask is kept
+        # on the output. This family samples twice (distilled -> refine), and
+        # held regions - keep_original_audio / reference_audio's audio hold,
+        # the i2v first-frame hold - must stay held through the refine pass or
+        # it regenerates them (heard live as "the audio is wrong": stage 1 held
+        # the source audio, the maskless refine pass then replaced it). The
+        # mask shapes are per-frame broadcasts, so they stay valid downstream;
+        # LTXV25CropVideoGuide and LTXV25LatentUpscale both carry them.
         return (latent,)
 
 
@@ -1222,7 +1234,11 @@ def _upsample_video_latent(latent, upscale_model, vae):
 
     out = latent.copy()
     out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
-    out.pop("noise_mask", None)  # the upsampled latent has no held frames left
+    # The incoming noise mask survives the x2: the video half is a per-frame
+    # broadcast (B,1,T,1,1) - resolution-independent - and the audio half
+    # belongs to the audio latent, which passes through untouched. Dropping it
+    # here (the old behavior) is what let the refine pass regenerate held
+    # audio (keep_original_audio) and held frames.
     return out
 
 
@@ -1295,14 +1311,24 @@ class LTXV25LatentUpscale:
         if images is not None:
             batch_size = video.shape[0]
             video = video.clone()
-            video_mask = torch.ones((batch_size, 1, video.shape[2], 1, 1),
-                                    dtype=torch.float32, device=video.device)
+            # Start from the SURVIVING masks (they carry any audio hold from
+            # keep_original_audio/reference_audio); rebuild only the video
+            # half's first-frame region for the re-hold.
+            prev = upscaled.get("noise_mask")
+            if prev is not None:
+                video_mask, audio_mask = prev.unbind()
+                video_mask = video_mask.clone().to(video.device)
+                audio_mask = audio_mask.to(audio.device)
+            else:
+                video_mask = torch.ones((batch_size, 1, video.shape[2], 1, 1),
+                                        dtype=torch.float32, device=video.device)
+                audio_mask = torch.ones_like(audio)
             pixels = _preprocess_images(images[:, :, :, :3], img_compression)
             held_t = _apply_i2v_hold(vae, pixels, video, video_mask,
                                      image_strength, batch_size)
             upscaled["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
             upscaled["noise_mask"] = comfy.nested_tensor.NestedTensor(
-                (video_mask, torch.ones_like(audio)))
+                (video_mask, audio_mask))
             logger.info("LTX-2.5 latent upscale: first frame re-held @ %.2f over "
                         "%d latent frame(s)", image_strength, held_t)
         return (upscaled,)

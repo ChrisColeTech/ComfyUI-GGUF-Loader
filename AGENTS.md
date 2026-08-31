@@ -3669,3 +3669,33 @@ from ltx23.py, not duplicated; guides/holds/references all land on the
 stage-1 half-res grid; chain is prep -> distilled -> crop -> upscale ->
 refine -> decode. ImgToVideo lost only the numbered slots (LoRAs chain
 externally, matching LTXV23ImgToVideo graphs and the official workflow).
+
+## 2026-08-30 (v2.13.1) - v2v verified for real: two hold-survival bugs + validation order
+
+The v2.13.0 v2v "proof" was a FALSE PASS (output = reconstruction of the
+source; a different-subject prompt was ignored - the ltx23 copy-lock
+signature). The real person-swap recipe (pose skeleton guide + start-frame
+identity @1.0 + union-control ref0.5 + latent_downscale_factor 2.0) then
+exposed three bugs, all fixed and GPU-verified:
+
+1. latent_downscale_factor divisibility was validated AFTER the guide VAE
+   encode -> einops crash inside the VAE instead of the clear error. Gate
+   moved before the encode.
+2. LTXV25KSampler popped noise_mask from its output and
+   _upsample_video_latent popped it too, so NO hold survived to the refine
+   pass - held source audio (keep_original_audio) was regenerated from
+   scratch (user: "that audio is wrong"). The family now carries the mask
+   through the whole distilled -> crop -> upscale -> refine chain (video
+   mask is per-frame broadcast, resolution-independent; audio latent passes
+   through the upscaler untouched). Deliberate divergence from core
+   SamplerCustomAdvanced, documented in-code.
+3. Exact-audio delivery is WORKFLOW wiring, not the node (same as ltx23's
+   gold workflow): re-mux the source waveform over the decoded frames
+   (GetVideoComponents -> CreateVideo(audio=source)). ltx25_v2v.json ships
+   this wiring; measured output-vs-source waveform correlation 0.999 (the
+   VAE-round-trip hold alone gives envelope ~0.76).
+
+Verified result: ltx25_swap (512x896x73, seed 42) - start-frame woman doing
+the source dancer's per-frame poses, exact original audio. ref0.5 rule on
+2.5: factor 2.0 relative to the STAGE-1 grid; stage-1 dims must divide by
+64 => target width/height must be multiples of 128.
