@@ -836,29 +836,69 @@ def _patched_prepare_timestep(self, timestep, batch_size, hidden_dtype, **kwargs
 
 # ── output-side strip + per-instance installation ───────────────────────────
 
-class _UnpatchifyWrapper:
-    """Strip the reference prefix from output tokens before reshape."""
+def _strip_ref_from_timestep(emb, ref_seq_len, ref_frames):
+    """Undo _prepare_timestep's prefix extension on one embedded-timestep
+    entry: CompressedTimestep-like objects are trimmed in compressed form
+    (the exact mirror of the two extension branches), per-token tensors by
+    row slice. Broadcast [B, 1, D] entries are untouched."""
+    if (hasattr(emb, "data") and hasattr(emb, "num_frames")
+            and hasattr(emb, "patches_per_frame")):
+        trim = ref_frames if emb.patches_per_frame > 1 else ref_seq_len
+        if trim > 0 and emb.num_frames > trim:
+            emb.data = emb.data[:, trim:].contiguous()
+            emb.num_frames = emb.num_frames - trim
+        return emb
+    if isinstance(emb, torch.Tensor) and emb.dim() >= 2 and emb.shape[1] > 1:
+        return emb[:, ref_seq_len:]
+    return emb
 
-    def __init__(self, original_unpatchify, model_ref):
-        self._original_unpatchify = original_unpatchify
+
+class _ProcessOutputWrapper:
+    """Strip the reference prefix from the video tokens BEFORE the original
+    _process_output runs.
+
+    The strip used to live in a patchifier.unpatchify wrap - too late: on
+    the keyframe/guide path (i2v inplace holds, v2v guide frames)
+    _process_output scatters the tokens back through grid_mask
+    (``full_x[:, grid_mask, :] = x``) BEFORE unpatchify, and the
+    still-prefixed tokens crashed it (found live on the 2.5 i2v graph:
+    "value tensor of shape [11160, 128] cannot be broadcast to indexing
+    result of shape [1, 10980, 128]" - 180 = the reference prefix). This
+    seam is the one comfy itself uses for its reference-AUDIO tokens
+    (av_model._process_output trims ref_audio_seq_len at the top)."""
+
+    def __init__(self, original_process_output, model_ref):
+        self._original = original_process_output
         self._model_ref = model_ref
 
-    def __call__(self, latents, **kwargs):
-        ref_seq_len = int(getattr(self._model_ref, "_pending_ref_seq_len", 0) or 0)
+    def __call__(self, x, embedded_timestep, keyframe_idxs, **kwargs):
+        m = self._model_ref
+        ref_seq_len = int(getattr(m, "_pending_ref_seq_len", 0) or 0)
+        ref_frames = int(getattr(m, "_pending_ref_frames", 0) or 0) or 1
         if ref_seq_len > 0:
-            latents = latents[:, ref_seq_len:, :]
-            self._model_ref._pending_ref_seq_len = 0
-        return self._original_unpatchify(latents, **kwargs)
+            if isinstance(x, (list, tuple)) and len(x) == 2:
+                # AV model: [video_tokens, audio_tokens] - only video carries
+                # the reference prefix (comfy trims its ref AUDIO itself).
+                vx = x[0][:, ref_seq_len:]
+                v_emb = _strip_ref_from_timestep(
+                    embedded_timestep[0], ref_seq_len, ref_frames)
+                x = [vx, x[1]]
+                embedded_timestep = [v_emb, embedded_timestep[1]]
+            elif isinstance(x, torch.Tensor):
+                x = x[:, ref_seq_len:]
+                embedded_timestep = _strip_ref_from_timestep(
+                    embedded_timestep, ref_seq_len, ref_frames)
+            m._pending_ref_seq_len = 0
+        return self._original(x, embedded_timestep, keyframe_idxs, **kwargs)
 
 
-def _apply_patchifier_wrap(model_instance):
-    patchifier = model_instance.patchifier
-    if getattr(patchifier, "_ltx_ref_wrapped", False):
+def _apply_process_output_wrap(model_instance):
+    if getattr(model_instance, "_ltx_ref_out_wrapped", False):
         return False
-    original_unpatchify = patchifier.unpatchify
-    patchifier.unpatchify = _UnpatchifyWrapper(original_unpatchify, model_instance)
-    patchifier._ltx_ref_wrapped = True
-    patchifier._ltx_ref_original_unpatchify = original_unpatchify
+    original = model_instance._process_output
+    model_instance._process_output = _ProcessOutputWrapper(original, model_instance)
+    model_instance._ltx_ref_out_wrapped = True
+    model_instance._ltx_ref_original_process_output = original
     return True
 
 
@@ -899,7 +939,7 @@ def _install_reference_patches(model):
         logger.info("[LTX Ref] instance patches installed on %s",
                     type(dm).__name__)
 
-    _apply_patchifier_wrap(dm)
+    _apply_process_output_wrap(dm)
     return dm
 
 

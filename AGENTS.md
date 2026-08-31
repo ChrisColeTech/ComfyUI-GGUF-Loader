@@ -3782,3 +3782,21 @@ reproduce single-image bit-for-bit). Ids unchanged (CCTech prefix - the 10s
 pack is still installed, bare ids would collide). GPU proof: the two-node
 graphs render BIT-IDENTICAL to the six-node family at the same seed (PSNR
 inf on both the conditioning A/B and the reinforcer+Best-Face-ID run).
+
+## 2026-08-31 (v2.16.2) - reference strip moved before the grid_mask scatter
+
+User hit "shape mismatch: value tensor of shape [11160, 128] cannot be
+broadcast to indexing result of shape [1, 10980, 128]" on LTXV25KSampler
+with the Reinforcer + Best-Face-ID. Root cause: the reference-prefix strip
+lived in a patchifier.unpatchify wrap, but on any keyframe/guide path (2.5
+i2v inplace, v2v guide frames) comfy's _process_output scatters tokens back
+through grid_mask (model.py:1433 ``full_x[:, grid_mask, :] = x``) BEFORE
+unpatchify - the still-prefixed tokens crashed the scatter. Every earlier
+GPU proof was plain t2v (no scatter), which is why it slipped through.
+Fix: _ProcessOutputWrapper strips tokens + timestep rows (CompressedTimestep
+trimmed in compressed form) at the TOP of _process_output - the same seam
+comfy uses for its reference-AUDIO trim. 2.3 regression at 41dB vs the old
+seam = matmul-tiling float noise only (row count changed for norm/proj);
+the user's exact 2.5 graph now renders. Debug lesson repeated: a deploy
+without a server restart tests the OLD code - the first "verification" of
+this fix was meaningless for exactly that reason.

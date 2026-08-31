@@ -11,8 +11,8 @@ adaLN prefix extension incl. CompressedTimestep-shaped objects and the
 zero_ref_timesteps flag; the conditioning attach path (normalization,
 strength, 4D->5D, target_latent pixel resize, strength=0 clear); sequence
 windowing; per-instance patch installation (class untouched, idempotent,
-unpatchify wrap); the patched _process_input's passthrough and injection
-(real patchifier + real coord math); the unpatchify prefix strip; face mask
+_process_output wrap); the patched _process_input's passthrough and injection
+(real patchifier + real coord math); the pre-scatter prefix strip; face mask
 gating; auto-face-crop bbox tracking; and the reinforcer end-to-end with a
 stubbed face detector.
 
@@ -112,6 +112,11 @@ class _FakeDM:
 
     def patchify_proj(self, tokens):
         return self._proj(tokens)
+
+    def _process_output(self, x, embedded_timestep, keyframe_idxs, **kwargs):
+        # Real LTXAVModel does norm/scale-shift/scatter/unpatchify here; the
+        # wrap under test must strip the reference prefix BEFORE this runs.
+        return x
 
 
 class _CompressedTimestepStub:
@@ -265,8 +270,8 @@ def test_conditioning_attach_and_clear():
     assert dm._process_input.__func__ is ltx_ref._patched_process_input
     assert dm._prepare_timestep.__func__ is ltx_ref._patched_prepare_timestep
     assert dm._ltx_zero_ref_timesteps is True
-    assert isinstance(dm.patchifier.unpatchify, ltx_ref._UnpatchifyWrapper)
-    inner = dm.patchifier.unpatchify
+    assert isinstance(dm._process_output, ltx_ref._ProcessOutputWrapper)
+    inner = dm._process_output
     to = m2.model_options["transformer_options"]
     ref = to["reference_latent"]
     # ones latent -> process_latent_in(1.0) = 3.0 proves normalization ran.
@@ -281,7 +286,7 @@ def test_conditioning_attach_and_clear():
     # strength scaling multiplies the normalized latent; also proves the
     # second install is a no-op (users may chain both reference nodes).
     (m3,) = node.attach(model, _FakeVAE(), image, strength=0.5)
-    assert dm.patchifier.unpatchify is inner, "double-install must not re-wrap"
+    assert dm._process_output is inner, "double-install must not re-wrap"
     assert dm._ltx_zero_ref_timesteps is False, \
         "each attach applies its own zero_ref_timesteps setting"
     assert torch.all(
@@ -382,18 +387,68 @@ def test_process_input_passthrough_and_injection():
     finally:
         ltx_ref._ORIGINAL_PROCESS_INPUT = orig
 
-    # Unpatchify wrapper strips the prefix and resets the counter.
-    wrapper = ltx_ref._UnpatchifyWrapper(lambda lat, **kw: lat, dm)
+    # _process_output wrapper strips the prefix BEFORE the original runs -
+    # the original is where the keyframe path's grid_mask scatter lives
+    # (``full_x[:, grid_mask, :] = x``), which is exactly what crashed live
+    # on the 2.5 i2v graph when the strip still sat later in unpatchify
+    # ("value tensor of shape [11160, 128] cannot be broadcast to indexing
+    # result of shape [1, 10980, 128]").
+    seen = {}
+
+    def _original(x, embedded_timestep, keyframe_idxs, **kwargs):
+        seen["x"] = x
+        seen["emb"] = embedded_timestep
+        return x
+
+    wrapper = ltx_ref._ProcessOutputWrapper(_original, dm)
+
+    # AV list case with a per-token video timestep: both stripped, audio
+    # untouched, counter reset.
     dm._pending_ref_seq_len = 4
-    out = wrapper(torch.randn(1, 16, 2))
-    assert out.shape == (1, 12, 2)
+    dm._pending_ref_frames = 1
+    vx, ax = torch.randn(1, 16, 2), torch.randn(1, 7, 2)
+    v_emb, a_emb = torch.randn(1, 16, 3), torch.randn(1, 7, 3)
+    wrapper([vx, ax], [v_emb, a_emb], None)
+    assert seen["x"][0].shape == (1, 12, 2), "video prefix stripped pre-original"
+    assert torch.equal(seen["x"][0], vx[:, 4:])
+    assert seen["x"][1] is ax, "audio tokens untouched"
+    assert seen["emb"][0].shape == (1, 12, 3)
+    assert seen["emb"][1] is a_emb
     assert dm._pending_ref_seq_len == 0
-    out2 = wrapper(torch.randn(1, 12, 2))
-    assert out2.shape == (1, 12, 2), "no prefix -> passthrough"
+
+    # No pending prefix -> bitwise passthrough.
+    wrapper([vx, ax], [v_emb, a_emb], None)
+    assert seen["x"][0] is vx
+
+    # CompressedTimestep-like entries are trimmed in compressed form -
+    # the exact mirror of the extension: by ref FRAMES when compressed
+    # (patches_per_frame > 1), by ref tokens when uncompressed.
+    class _CT:
+        def __init__(self, data, num_frames, ppf):
+            self.data, self.num_frames, self.patches_per_frame = data, num_frames, ppf
+
+    dm._pending_ref_seq_len = 4
+    dm._pending_ref_frames = 2
+    ct = _CT(torch.randn(1, 10, 3), 10, 2)  # 8 real frames + 2 ref frames
+    wrapper([vx, ax], [ct, a_emb], None)
+    assert seen["emb"][0].num_frames == 8
+    assert seen["emb"][0].data.shape == (1, 8, 3)
+
+    dm._pending_ref_seq_len = 4
+    dm._pending_ref_frames = 1
+    ct = _CT(torch.randn(1, 16, 3), 16, 1)  # uncompressed: per-token
+    wrapper([vx, ax], [ct, a_emb], None)
+    assert seen["emb"][0].num_frames == 12
+
+    # Plain-tensor (non-AV) case still works.
+    dm._pending_ref_seq_len = 4
+    out = wrapper(torch.randn(1, 16, 2), torch.randn(1, 16, 3), None)
+    assert out.shape == (1, 12, 2)
     print("[ok] patched _process_input: bitwise passthrough without a "
           "reference, token/coord prepend + proj + pending state with one, "
           "latent-space resize fallback, prefix_continuous shift, "
-          "unpatchify strip")
+          "_process_output strip before the grid_mask scatter (AV + plain, "
+          "CompressedTimestep compressed/uncompressed)")
 
 
 def test_prepare_timestep_extension():
