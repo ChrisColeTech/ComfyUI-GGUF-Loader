@@ -125,28 +125,26 @@ class _CompressedTimestepStub:
 
 def test_input_types_pinned():
     expect = {
-        "CCTechLTXReferenceEnable":
-            (["model"], ["zero_ref_timesteps", "verbose"]),
         "CCTechLTXReferenceConditioning":
             (["model", "vae", "image"],
-             ["target_latent", "strength", "position_mode", "verbose"]),
-        "CCTechLTXReferenceSequenceConditioning":
-            (["model", "vae", "images"],
-             ["target_latent", "start_frame", "num_frames", "strength",
-              "position_mode", "verbose"]),
-        "CCTechLTXReferenceProbe": (["model"], []),
-        "CCTechLTXReferenceBypass": (["model"], []),
+             ["target_latent", "strength", "position_mode", "start_frame",
+              "num_frames", "zero_ref_timesteps", "verbose"]),
         "CCTechLTXFaceIdentityReinforcer":
             (["model", "vae", "reference_image", "target_latent"],
              ["identity_strength", "face_padding", "auto_face_crop",
               "crop_zoom_factor", "spatial_gating", "placement_mode",
               "source_id", "phase_scale", "reference_image_2", "debug"]),
     }
+    assert set(ltx_ref.NODE_CLASS_MAPPINGS) == set(expect), \
+        "exactly the two consolidated nodes are registered"
     for name, (req, opt) in expect.items():
         cls = ltx_ref.NODE_CLASS_MAPPINGS[name]
         it = cls.INPUT_TYPES()
         assert list(it["required"]) == req, (name, list(it["required"]))
         assert list(it.get("optional", {})) == opt, (name, list(it.get("optional", {})))
+        title = ltx_ref.NODE_DISPLAY_NAME_MAPPINGS[name]
+        assert title.startswith("LTX") and title.endswith("⚡"), \
+            "plain 'Name ⚡' titles, no leading emoji"
     # Source-pack defaults survive the port.
     it = ltx_ref.CCTechLTXFaceIdentityReinforcer.INPUT_TYPES()["optional"]
     assert it["source_id"][1]["default"] == 2.0
@@ -154,8 +152,12 @@ def test_input_types_pinned():
     assert it["placement_mode"][0] == ["i2v_safe", "t2v_overlap", "prefix"]
     it = ltx_ref.CCTechLTXReferenceConditioning.INPUT_TYPES()["optional"]
     assert it["position_mode"][0] == ["reference", "prefix_continuous"]
-    print("[ok] all six node surfaces mirror the 10s pack exactly "
-          "(names, order, defaults)")
+    # Windowing defaults reproduce single-image behavior.
+    assert it["start_frame"][1]["default"] == 0
+    assert it["num_frames"][1]["default"] == 1
+    assert it["zero_ref_timesteps"][1]["default"] is False
+    print("[ok] the two consolidated node surfaces are pinned "
+          "(names, order, defaults, plain titles)")
 
 
 def test_phase_rotation_math():
@@ -233,12 +235,26 @@ def test_modulation_prefix_extension():
 
 
 def test_conditioning_attach_and_clear():
+    class_pi = av_model.LTXAVModel._process_input
+    class_pt = av_model.LTXAVModel._prepare_timestep
+
     dm = _FakeDM()
     model = _FakeModelPatcher(dm)
     node = ltx_ref.CCTechLTXReferenceConditioning()
 
     image = torch.rand(1, 64, 96, 3)
-    (m2,) = node.attach(model, _FakeVAE(), image)
+    (m2,) = node.attach(model, _FakeVAE(), image, zero_ref_timesteps=True)
+
+    # The node installs the forward patch itself (old Enable node folded in):
+    # per-instance bound methods only, class untouched, idempotent.
+    assert av_model.LTXAVModel._process_input is class_pi
+    assert av_model.LTXAVModel._prepare_timestep is class_pt
+    assert dm._cctech_ltx_ref_installed
+    assert dm._process_input.__func__ is ltx_ref._patched_process_input
+    assert dm._prepare_timestep.__func__ is ltx_ref._patched_prepare_timestep
+    assert dm._ltx_zero_ref_timesteps is True
+    assert isinstance(dm.patchifier.unpatchify, ltx_ref._UnpatchifyWrapper)
+    inner = dm.patchifier.unpatchify
     to = m2.model_options["transformer_options"]
     ref = to["reference_latent"]
     # ones latent -> process_latent_in(1.0) = 3.0 proves normalization ran.
@@ -250,8 +266,12 @@ def test_conditioning_attach_and_clear():
     # Original model untouched (clone-then-attach).
     assert "reference_latent" not in model.model_options["transformer_options"]
 
-    # strength scaling multiplies the normalized latent.
+    # strength scaling multiplies the normalized latent; also proves the
+    # second install is a no-op (users may chain both reference nodes).
     (m3,) = node.attach(model, _FakeVAE(), image, strength=0.5)
+    assert dm.patchifier.unpatchify is inner, "double-install must not re-wrap"
+    assert dm._ltx_zero_ref_timesteps is False, \
+        "each attach applies its own zero_ref_timesteps setting"
     assert torch.all(
         m3.model_options["transformer_options"]["reference_latent"] == 1.5)
 
@@ -261,61 +281,37 @@ def test_conditioning_attach_and_clear():
     assert m4.model_options["transformer_options"]["reference_latent"].shape \
         == (1, 128, 1, 4, 7)
 
-    # strength=0 bypasses and clears.
-    (m5,) = node.attach(m2, _FakeVAE(), image, strength=0.0)
-    assert "reference_latent" not in m5.model_options["transformer_options"]
-    assert getattr(m5.model.diffusion_model, "_ltx_reference_latent", None) is None
-    print("[ok] Reference Conditioning: process_latent_in normalization, "
-          "strength scale, target_latent pixel resize, dual-channel attach, "
-          "strength=0 clear")
-
-
-def test_sequence_windowing():
-    dm = _FakeDM()
-    model = _FakeModelPatcher(dm)
-    node = ltx_ref.CCTechLTXReferenceSequenceConditioning()
+    # Multi-frame batch + start_frame/num_frames = the old Sequence node's
+    # windowing, now on this node.
     frames = torch.rand(20, 64, 96, 3)
-    (m2,) = node.attach(model, _FakeVAE(), frames, start_frame=5, num_frames=9)
-    ref = m2.model_options["transformer_options"]["reference_latent"]
-    # fake VAE keeps F: 9 frames -> F=9 latent frames at 2x3 spatial.
-    assert ref.shape == (1, 128, 9, 2, 3)
+    (m6,) = node.attach(model, _FakeVAE(), frames, start_frame=5, num_frames=9)
+    ref6 = m6.model_options["transformer_options"]["reference_latent"]
+    # fake VAE keeps F: 9 frames -> F=9 latent frames at 2x3 spatial
+    # (times the process_latent_in affine: 1*2+1=3).
+    assert ref6.shape == (1, 128, 9, 2, 3)
 
     class _VAE4D:
         def encode(self, image):
             f, h, w, c = image.shape
             return torch.ones(f, 128, h // 32, w // 32)
 
-    (m3,) = node.attach(model, _VAE4D(), frames, num_frames=4)
-    ref3 = m3.model_options["transformer_options"]["reference_latent"]
-    assert ref3.shape == (1, 128, 4, 2, 3), "4D VAE output stacks N as F"
-    print("[ok] Reference Sequence: frame windowing and 4D->5D stacking")
+    (m7,) = node.attach(model, _VAE4D(), frames, num_frames=4)
+    ref7 = m7.model_options["transformer_options"]["reference_latent"]
+    assert ref7.shape == (1, 128, 4, 2, 3), "4D VAE output stacks N as F"
+    # Defaults on a batch take frame 0 only - single-image behavior.
+    (m8,) = node.attach(model, _FakeVAE(), frames)
+    assert m8.model_options["transformer_options"]["reference_latent"].shape \
+        == (1, 128, 1, 2, 3)
 
-
-def test_enable_installs_per_instance_only():
-    class_pi = av_model.LTXAVModel._process_input
-    class_pt = av_model.LTXAVModel._prepare_timestep
-
-    dm = _FakeDM()
-    model = _FakeModelPatcher(dm)
-    node = ltx_ref.CCTechLTXReferenceEnable()
-    (m2,) = node.enable(model, zero_ref_timesteps=True)
-
-    # Class stays untouched - the deliberate deviation from the source pack.
-    assert av_model.LTXAVModel._process_input is class_pi
-    assert av_model.LTXAVModel._prepare_timestep is class_pt
-
-    assert dm._cctech_ltx_ref_installed
-    assert dm._process_input.__func__ is ltx_ref._patched_process_input
-    assert dm._prepare_timestep.__func__ is ltx_ref._patched_prepare_timestep
-    assert dm._ltx_zero_ref_timesteps is True
-    assert isinstance(dm.patchifier.unpatchify, ltx_ref._UnpatchifyWrapper)
-
-    # Idempotent: second enable doesn't double-wrap.
-    inner = dm.patchifier.unpatchify
-    node.enable(model)
-    assert dm.patchifier.unpatchify is inner
-    print("[ok] Reference Enable: per-instance bound-method install, class "
-          "untouched, idempotent, unpatchify wrapped, zero flag set")
+    # strength=0 bypasses and clears.
+    (m5,) = node.attach(m2, _FakeVAE(), image, strength=0.0)
+    assert "reference_latent" not in m5.model_options["transformer_options"]
+    assert getattr(m5.model.diffusion_model, "_ltx_reference_latent", None) is None
+    print("[ok] Reference Conditioning: self-install (per-instance, class "
+          "untouched, idempotent, zero flag), process_latent_in "
+          "normalization, strength scale, target_latent pixel resize, "
+          "frame windowing + 4D->5D stacking, dual-channel attach, "
+          "strength=0 clear")
 
 
 def test_process_input_passthrough_and_injection():
@@ -512,8 +508,6 @@ if __name__ == "__main__":
     test_phase_rotation_math()
     test_modulation_prefix_extension()
     test_conditioning_attach_and_clear()
-    test_sequence_windowing()
-    test_enable_installs_per_instance_only()
     test_process_input_passthrough_and_injection()
     test_prepare_timestep_extension()
     test_face_mask_gating()

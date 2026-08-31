@@ -1448,75 +1448,31 @@ def _encode_reference_image(vae, image, label):
 
 # ── nodes ───────────────────────────────────────────────────────────────────
 
-class CCTechLTXReferenceEnable:
-    """Patch the LTX model to accept a reference latent as a token prefix."""
-
-    CATEGORY = LTX_REF_CATEGORY
-    TITLE = "\U0001f517 LTX Reference Enable \u26a1"
-    SEARCH_ALIASES = ['reference', 'identity', 'memory', 'prefix injection',
-                      'best face id']
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "enable"
-    DESCRIPTION = (
-        "Patches an LTX-AV model (2.3 or 2.5) to accept a reference latent "
-        "that gets prepended to the video token sequence inside the "
-        "transformer. Works as a complementary identity-injection mechanism "
-        "- most useful combined with standard i2v frame_0 latent "
-        "conditioning. Pair with LTX Reference Conditioning to attach an "
-        "image. The patches activate only when a reference latent is "
-        "provided; safe passthrough otherwise.")
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-            },
-            "optional": {
-                "zero_ref_timesteps": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Mark reference tokens as sigma=0 (clean "
-                               "reference). Default OFF based on empirical "
-                               "testing - most LTX2.3 checkpoints produce "
-                               "better output when reference tokens share "
-                               "target's noise sigma. Enable only if a "
-                               "checkpoint was trained for clean-reference "
-                               "memory.",
-                }),
-                "verbose": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable detailed per-call logging. Useful for "
-                               "debugging the first time you wire up this "
-                               "node. Disable for normal use.",
-                }),
-            },
-        }
-
-    def enable(self, model, zero_ref_timesteps=False, verbose=False):
-        global _VERBOSE
-        _VERBOSE = bool(verbose)
-
-        dm = _install_reference_patches(model)
-        dm._ltx_zero_ref_timesteps = bool(zero_ref_timesteps)
-        return (model.clone(),)
-
-
 class CCTechLTXReferenceConditioning:
-    """Encode an image to a reference latent and attach it to MODEL."""
+    """Encode an image (or frame window) to a reference latent and attach it.
+
+    Self-contained: installs the per-instance forward patch itself (the old
+    separate Enable node was folded in here), so always take MODEL from this
+    node's output.
+    """
 
     CATEGORY = LTX_REF_CATEGORY
-    TITLE = "\U0001f3b4 LTX Reference Conditioning \u26a1"
-    SEARCH_ALIASES = ['reference', 'identity', 'reference image', 'memory']
+    TITLE = "LTX Reference Conditioning ⚡"
+    SEARCH_ALIASES = ['reference', 'identity', 'reference image', 'memory',
+                      'prefix injection', 'best face id']
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "attach"
     DESCRIPTION = (
         "Encodes an image through the LTX video VAE and attaches the "
         "resulting latent to the MODEL as a reference for prefix injection "
-        "during sampling. Requires LTX Reference Enable upstream. "
-        "Complementary to standard i2v latent conditioning - different "
-        "intervention points, can be combined.")
+        "during sampling. The forward patch installs itself on the model "
+        "instance - always take MODEL from this node's output. A batched "
+        "IMAGE input plus start_frame/num_frames selects a multi-frame "
+        "reference window (motion/temporal style context). Complementary "
+        "to standard i2v latent conditioning - different intervention "
+        "points, can be combined. strength 0.0 is a clean bypass that "
+        "also clears prior reference state.")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1524,7 +1480,11 @@ class CCTechLTXReferenceConditioning:
             "required": {
                 "model": ("MODEL",),
                 "vae": ("VAE",),
-                "image": ("IMAGE",),
+                "image": ("IMAGE", {
+                    "tooltip": "Reference image. A multi-frame batch (video "
+                               "frames) is windowed via start_frame/"
+                               "num_frames below.",
+                }),
             },
             "optional": {
                 "target_latent": ("LATENT", {
@@ -1556,6 +1516,30 @@ class CCTechLTXReferenceConditioning:
                                "target temporally - equivalent to standard "
                                "i2v prior-context conditioning.",
                 }),
+                "start_frame": ("INT", {
+                    "default": 0, "min": 0, "max": 240, "step": 1,
+                    "tooltip": "For a batched IMAGE input: which frame to "
+                               "start the reference window at. Frames before "
+                               "this are discarded.",
+                }),
+                "num_frames": ("INT", {
+                    "default": 1, "min": 1, "max": 25, "step": 1,
+                    "tooltip": "How many frames from start_frame to use as "
+                               "reference. 1 (default) = single-image "
+                               "reference. 9 (1 + 8k matches LTX temporal "
+                               "compression) gives ~2 latent frames; 17, 25 "
+                               "add temporal context at higher cost.",
+                }),
+                "zero_ref_timesteps": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Mark reference tokens as sigma=0 (clean "
+                               "reference). Default OFF based on empirical "
+                               "testing - most LTX2.3 checkpoints produce "
+                               "better output when reference tokens share "
+                               "target's noise sigma. Enable only if a "
+                               "checkpoint was trained for clean-reference "
+                               "memory.",
+                }),
                 "verbose": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Print detailed per-call info to the console.",
@@ -1564,21 +1548,85 @@ class CCTechLTXReferenceConditioning:
         }
 
     def attach(self, model, vae, image, target_latent=None,
-               strength=1.0, position_mode="reference", verbose=False):
+               strength=1.0, position_mode="reference",
+               start_frame=0, num_frames=1,
+               zero_ref_timesteps=False, verbose=False):
+        global _VERBOSE
+        _VERBOSE = bool(verbose)
+
         if strength == 0.0:
             logger.info("[LTX Reference Conditioning] strength=0, bypassing "
                         "and clearing state.")
             return (_clear_reference_state(model),)
 
+        dm = _install_reference_patches(model)
+        dm._ltx_zero_ref_timesteps = bool(zero_ref_timesteps)
+
+        if image.dim() != 4:
+            raise ValueError(
+                f"[LTX Reference Conditioning] Expected IMAGE shape "
+                f"(B, H, W, C), got {tuple(image.shape)}")
+
         if image.shape[-1] > 3:
             image = image[..., :3]
 
-        image = _resize_to_target_latent_px(
-            image, target_latent, "LTX Reference Conditioning", verbose)
-        image = _pad_image_to_multiple(image, divisor=32)
+        # Frame window (the old Sequence node's semantics; the defaults
+        # 0/1 reproduce single-image behavior exactly).
+        total_frames = int(image.shape[0])
+        actual_start = max(0, min(start_frame, total_frames - 1))
+        actual_end = min(actual_start + num_frames, total_frames)
+        sequence = image[actual_start:actual_end]
+        actual_count = int(sequence.shape[0])
 
-        reference_latent = _encode_reference_image(
-            vae, image, "LTX Reference Conditioning")
+        if actual_count < 1:
+            raise ValueError(
+                f"[LTX Reference Conditioning] No frames after slicing "
+                f"(start={actual_start}, end={actual_end}, "
+                f"total_frames={total_frames})")
+
+        if verbose and total_frames > 1:
+            logger.info("[LTX Reference Conditioning] using frames [%d:%d] "
+                        "(%d frames) from input of %d total",
+                        actual_start, actual_end, actual_count, total_frames)
+
+        sequence = _resize_to_target_latent_px(
+            sequence, target_latent, "LTX Reference Conditioning", verbose)
+        sequence = _pad_image_to_multiple(sequence, divisor=32)
+
+        try:
+            encoded = vae.encode(sequence)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"[LTX Reference Conditioning] VAE encode failed: "
+                f"{type(e).__name__}: {e}. Image shape (B,H,W,C) = "
+                f"{tuple(sequence.shape)}. Ensure the VAE is the LTX video "
+                f"VAE.")
+
+        if isinstance(encoded, dict):
+            for k in ("samples", "latent", "x"):
+                if k in encoded:
+                    encoded = encoded[k]
+                    break
+        if not isinstance(encoded, torch.Tensor):
+            raise RuntimeError(
+                f"[LTX Reference Conditioning] VAE returned non-tensor: "
+                f"{type(encoded).__name__}")
+
+        if encoded.dim() == 5:
+            reference_latent = encoded.contiguous()
+        elif encoded.dim() == 4:
+            # N independent image latents -> stack along the F dim (for a
+            # single image this is identical to unsqueeze(2)).
+            reference_latent = encoded.unsqueeze(0).transpose(1, 2).contiguous()
+            if verbose and encoded.shape[0] > 1:
+                logger.info("[LTX Reference Conditioning] VAE returned 4D - "
+                            "stacking N=%d as F dim", encoded.shape[0])
+        else:
+            raise RuntimeError(
+                f"[LTX Reference Conditioning] unexpected VAE output "
+                f"dimensionality: {encoded.dim()}D, shape "
+                f"{tuple(encoded.shape)}")
+
         reference_latent = _normalize_reference_latent(
             model, reference_latent, "LTX Reference Conditioning", verbose)
 
@@ -1597,271 +1645,11 @@ class CCTechLTXReferenceConditioning:
                         tuple(reference_latent.shape), position_mode, strength)
         return (model,)
 
-
-class CCTechLTXReferenceSequenceConditioning:
-    """Encode a window of frames as a multi-frame reference latent."""
-
-    CATEGORY = LTX_REF_CATEGORY
-    TITLE = "\U0001f3ac LTX Reference Sequence \u26a1"
-    SEARCH_ALIASES = ['reference video', 'identity', 'multi frame reference']
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "attach"
-    DESCRIPTION = (
-        "Multi-frame variant of LTX Reference Conditioning. Takes a "
-        "frame-sequence IMAGE input and uses a chosen N-frame window as "
-        "reference. Multi-frame reference can capture motion and temporal "
-        "style that single-image reference can't.")
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "vae": ("VAE",),
-                "images": ("IMAGE", {
-                    "tooltip": "Multi-frame IMAGE input (a video frame "
-                               "sequence). Use a Load Video, image batch, or "
-                               "upstream frame producer.",
-                }),
-            },
-            "optional": {
-                "target_latent": ("LATENT", {
-                    "tooltip": "Optional. Wire the same LATENT going to your "
-                               "sampler. Frames will be resized in pixel "
-                               "space to match this latent's spatial dims "
-                               "before VAE encoding.",
-                }),
-                "start_frame": ("INT", {
-                    "default": 0, "min": 0, "max": 240, "step": 1,
-                    "tooltip": "Which frame in the input sequence to start "
-                               "the reference window at. Frames before this "
-                               "are discarded.",
-                }),
-                "num_frames": ("INT", {
-                    "default": 9, "min": 1, "max": 25, "step": 1,
-                    "tooltip": "How many frames from start_frame to use as "
-                               "reference. Default 9 (1 + 8k matches LTX "
-                               "temporal compression - gives ~2 latent "
-                               "frames). 17, 25 also valid for more temporal "
-                               "context at higher cost.",
-                }),
-                "strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Scales the reference latent magnitude. 0.0 "
-                               "bypasses and clears state.",
-                }),
-                "position_mode": (["reference", "prefix_continuous"], {
-                    "default": "reference",
-                    "tooltip": "'reference': memory positions overlap "
-                               "target's first frames. 'prefix_continuous': "
-                               "memory positions precede target temporally.",
-                }),
-                "verbose": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Print detailed per-call info to the console.",
-                }),
-            },
-        }
-
-    def attach(self, model, vae, images, target_latent=None,
-               start_frame=0, num_frames=9, strength=1.0,
-               position_mode="reference", verbose=False):
-        if strength == 0.0:
-            logger.info("[LTX Reference Sequence] strength=0, bypassing and "
-                        "clearing state.")
-            return (_clear_reference_state(model),)
-
-        if images.dim() != 4:
-            raise ValueError(
-                f"[LTX Reference Sequence] Expected IMAGE shape (B, H, W, C), "
-                f"got {tuple(images.shape)}")
-
-        if images.shape[-1] > 3:
-            images = images[..., :3]
-
-        total_frames = int(images.shape[0])
-        actual_start = max(0, min(start_frame, total_frames - 1))
-        actual_end = min(actual_start + num_frames, total_frames)
-        sequence = images[actual_start:actual_end]
-        actual_count = int(sequence.shape[0])
-
-        if actual_count < 1:
-            raise ValueError(
-                f"[LTX Reference Sequence] No frames after slicing "
-                f"(start={actual_start}, end={actual_end}, "
-                f"total_frames={total_frames})")
-
-        if verbose:
-            logger.info("[LTX Reference Sequence] using frames [%d:%d] "
-                        "(%d frames) from input of %d total",
-                        actual_start, actual_end, actual_count, total_frames)
-
-        sequence = _resize_to_target_latent_px(
-            sequence, target_latent, "LTX Reference Sequence", verbose)
-        sequence = _pad_image_to_multiple(sequence, divisor=32)
-
-        try:
-            encoded = vae.encode(sequence)
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(
-                f"[LTX Reference Sequence] VAE encode failed for sequence "
-                f"shape {tuple(sequence.shape)}: {type(e).__name__}: {e}")
-
-        if isinstance(encoded, dict):
-            encoded = encoded.get("samples", encoded)
-        if not isinstance(encoded, torch.Tensor):
-            raise RuntimeError(
-                f"[LTX Reference Sequence] VAE returned non-tensor: "
-                f"{type(encoded).__name__}")
-
-        if encoded.dim() == 5:
-            reference_latent = encoded.contiguous()
-        elif encoded.dim() == 4:
-            # N independent image latents -> stack along the F dim.
-            reference_latent = encoded.unsqueeze(0).transpose(1, 2).contiguous()
-            if verbose:
-                logger.info("[LTX Reference Sequence] VAE returned 4D - "
-                            "stacking N=%d as F dim", encoded.shape[0])
-        else:
-            raise RuntimeError(
-                f"[LTX Reference Sequence] VAE returned unexpected shape: "
-                f"{tuple(encoded.shape)}")
-
-        if verbose:
-            logger.info("[LTX Reference Sequence] encoded latent shape: %s "
-                        "(B, C, F, H, W)", tuple(reference_latent.shape))
-
-        reference_latent = _normalize_reference_latent(
-            model, reference_latent, "LTX Reference Sequence", verbose)
-
-        if strength != 1.0:
-            reference_latent = reference_latent * strength
-
-        model = _attach_reference(model, reference_latent, position_mode)
-        if verbose:
-            logger.info("[LTX Reference Sequence] attached: shape=%s, "
-                        "mode=%s, strength=%s",
-                        tuple(reference_latent.shape), position_mode, strength)
-        return (model,)
-
-
-class CCTechLTXReferenceProbe:
-    """Diagnostic - verify the reference-token wiring before sampling."""
-
-    CATEGORY = LTX_REF_CATEGORY
-    TITLE = "\U0001f50e LTX Reference Probe \u26a1"
-    SEARCH_ALIASES = ['reference probe', 'debug', 'inspect']
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "report")
-    FUNCTION = "probe"
-    DESCRIPTION = (
-        "Inspects a MODEL after LTX Reference Enable + Conditioning to "
-        "verify wiring. Reports patch status, reference latent presence "
-        "and shape, position mode. Use before the sampler to catch config "
-        "issues without running a generation.")
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"model": ("MODEL",)}}
-
-    def probe(self, model):
-        lines = []
-        lines.append("=" * 70)
-        lines.append("[CCTech] LTX Reference Probe")
-        lines.append("=" * 70)
-
-        # Instance state (this port patches per-instance, not the class).
-        try:
-            diffusion_model = model.model.diffusion_model
-            lines.append("\nDiffusion model:")
-            lines.append(f"  class: {type(diffusion_model).__name__}")
-            installed = bool(getattr(diffusion_model,
-                                     "_cctech_ltx_ref_installed", False))
-            lines.append(f"  instance patches installed: "
-                         f"{'yes' if installed else 'NO - run LTX Reference Enable'}")
-            patchifier = diffusion_model.patchifier
-            wrapped = getattr(patchifier, "_ltx_ref_wrapped", False)
-            lines.append(f"  patchifier.unpatchify wrapped: "
-                         f"{'yes' if wrapped else 'NO - Reference Enable not applied'}")
-            zero_flag = getattr(diffusion_model, "_ltx_zero_ref_timesteps", None)
-            lines.append(f"  zero_ref_timesteps: {bool(zero_flag)}")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"  couldn't inspect diffusion_model: {e}")
-
-        lines.append("\nmodel.model_options:")
-        if not hasattr(model, "model_options") or model.model_options is None:
-            lines.append("  not present")
-        else:
-            mo = model.model_options
-            if isinstance(mo, dict):
-                to = mo.get("transformer_options")
-                if to is None:
-                    lines.append("  'transformer_options' key missing")
-                else:
-                    lines.append(f"  transformer_options keys: "
-                                 f"{list(to.keys()) if isinstance(to, dict) else type(to)}")
-                    ref = to.get("reference_latent") if isinstance(to, dict) else None
-                    if ref is None and isinstance(to, dict):
-                        ref = to.get("memory_video")
-                    if ref is None:
-                        lines.append("  reference_latent (or memory_video) NOT set")
-                    else:
-                        mode = to.get("reference_position_mode",
-                                      to.get("memory_position_mode", "unknown"))
-                        lines.append(f"  reference_latent shape: {tuple(ref.shape)} "
-                                     f"dtype={ref.dtype} mode={mode}")
-
-        try:
-            attr = getattr(model.model.diffusion_model,
-                           "_ltx_reference_latent", None) \
-                or getattr(model.model.diffusion_model,
-                           "_echo_memory_video", None)
-            lines.append("\nAttribute side-channel:")
-            if attr is None:
-                lines.append("  diffusion_model._ltx_reference_latent: not set")
-            else:
-                lines.append(f"  shape: {tuple(attr.shape)}")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"  (couldn't check: {e})")
-
-        lines.append("=" * 70)
-        report = "\n".join(lines)
-        logger.info("%s", report)
-        return (model, report)
-
-
-class CCTechLTXReferenceBypass:
-    """Clear reference state from a MODEL - bypass memory injection."""
-
-    CATEGORY = LTX_REF_CATEGORY
-    TITLE = "\U0001f6ab LTX Reference Bypass \u26a1"
-    SEARCH_ALIASES = ['reference bypass', 'clear reference', 'disable memory']
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "bypass"
-    DESCRIPTION = (
-        "Clears any attached reference_latent from MODEL so downstream "
-        "samplers run without memory injection. Useful between passes - "
-        "e.g., apply Reference Conditioning for the primary generation "
-        "pass, then route through Bypass before an upscale/refine sampler "
-        "where memory isn't needed.")
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"model": ("MODEL",)}}
-
-    def bypass(self, model):
-        model = _clear_reference_state(model)
-        logger.info("[LTX Reference Bypass] cleared reference state from MODEL.")
-        return (model,)
-
-
 class CCTechLTXFaceIdentityReinforcer:
     """Drop-in identity reinforcer for LTX-Best-Face-ID LoRA workflows."""
 
     CATEGORY = LTX_REF_CATEGORY
-    TITLE = "\U0001f9d1 LTX Face Identity Reinforcer \u26a1"
+    TITLE = "LTX Face Identity Reinforcer \u26a1"
     SEARCH_ALIASES = ['face identity', 'best face id', 'identity reinforcer',
                       'face reference', 'source phase']
     RETURN_TYPES = ("MODEL",)
@@ -2120,19 +1908,11 @@ class CCTechLTXFaceIdentityReinforcer:
 
 
 NODE_CLASS_MAPPINGS = {
-    "CCTechLTXReferenceEnable": CCTechLTXReferenceEnable,
     "CCTechLTXReferenceConditioning": CCTechLTXReferenceConditioning,
-    "CCTechLTXReferenceSequenceConditioning": CCTechLTXReferenceSequenceConditioning,
-    "CCTechLTXReferenceProbe": CCTechLTXReferenceProbe,
-    "CCTechLTXReferenceBypass": CCTechLTXReferenceBypass,
     "CCTechLTXFaceIdentityReinforcer": CCTechLTXFaceIdentityReinforcer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "CCTechLTXReferenceEnable": CCTechLTXReferenceEnable.TITLE,
     "CCTechLTXReferenceConditioning": CCTechLTXReferenceConditioning.TITLE,
-    "CCTechLTXReferenceSequenceConditioning": CCTechLTXReferenceSequenceConditioning.TITLE,
-    "CCTechLTXReferenceProbe": CCTechLTXReferenceProbe.TITLE,
-    "CCTechLTXReferenceBypass": CCTechLTXReferenceBypass.TITLE,
     "CCTechLTXFaceIdentityReinforcer": CCTechLTXFaceIdentityReinforcer.TITLE,
 }

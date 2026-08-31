@@ -3769,3 +3769,16 @@ toward the reference; reinforcer + Best_FaceID_v1.0_LoRA @1.0 (downloaded,
 also staged into giga's ltxv_23 tree) = closest match. Author-recipe values
 confirmed from his own workflow JSON: lora 1.0, source_id 2, phase_scale 1,
 overlap layout.
+
+## 2026-08-31 (v2.16.0) - reference family consolidated 6 -> 2
+
+User review caught two convention breaks in v2.15.0: source-pack lead emoji
+in the titles, and plumbing exposed as nodes. Enable (patch-only, useless
+alone), Sequence (Conditioning + a frame window), Probe (diagnostic), and
+Bypass (= strength 0) are gone; LTX Reference Conditioning and LTX Face
+Identity Reinforcer install the forward patch themselves (idempotent shared
+helper), Conditioning gained start_frame/num_frames windowing (defaults
+reproduce single-image bit-for-bit). Ids unchanged (CCTech prefix - the 10s
+pack is still installed, bare ids would collide). GPU proof: the two-node
+graphs render BIT-IDENTICAL to the six-node family at the same seed (PSNR
+inf on both the conditioning A/B and the reinforcer+Best-Face-ID run).
