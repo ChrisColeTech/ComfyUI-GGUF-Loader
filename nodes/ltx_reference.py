@@ -70,7 +70,13 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-LTX_REF_CATEGORY = "\U0001F916 CCTech/LTX Reference"
+# The mechanism is version-agnostic (any ltxav model), but the pack's menus
+# are per-version and every title there is version-prefixed - so each node
+# registers twice, once under each family menu, sharing one implementation.
+# (A node id carries exactly one CATEGORY in comfy; the second listing is a
+# thin subclass with its own id, same precedent as the pack's other aliases.)
+LTX23_REF_CATEGORY = "\U0001F916 CCTech/LTX-2.3"
+LTX25_REF_CATEGORY = "\U0001F916 CCTech/LTX-2.5"
 
 # ── module state (mirrors the source's, minus the class-patch flags) ────────
 _ORIGINAL_PROCESS_INPUT = None
@@ -1456,8 +1462,8 @@ class CCTechLTXReferenceConditioning:
     node's output.
     """
 
-    CATEGORY = LTX_REF_CATEGORY
-    TITLE = "LTX Reference Conditioning ⚡"
+    CATEGORY = LTX23_REF_CATEGORY
+    TITLE = "LTX-2.3 Reference Conditioning ⚡"
     SEARCH_ALIASES = ['reference', 'identity', 'reference image', 'memory',
                       'prefix injection', 'best face id']
     RETURN_TYPES = ("MODEL",)
@@ -1648,8 +1654,8 @@ class CCTechLTXReferenceConditioning:
 class CCTechLTXFaceIdentityReinforcer:
     """Drop-in identity reinforcer for LTX-Best-Face-ID LoRA workflows."""
 
-    CATEGORY = LTX_REF_CATEGORY
-    TITLE = "LTX Face Identity Reinforcer \u26a1"
+    CATEGORY = LTX23_REF_CATEGORY
+    TITLE = "LTX-2.3 Face Identity Reinforcer \u26a1"
     SEARCH_ALIASES = ['face identity', 'best face id', 'identity reinforcer',
                       'face reference', 'source phase']
     RETURN_TYPES = ("MODEL",)
@@ -1907,12 +1913,34 @@ class CCTechLTXFaceIdentityReinforcer:
         return (m,)
 
 
+class CCTechLTX25ReferenceConditioning(CCTechLTXReferenceConditioning):
+    """The same node listed under the LTX-2.5 menu (identical behavior -
+    the mechanism reads every shape off the model at runtime)."""
+
+    CATEGORY = LTX25_REF_CATEGORY
+    TITLE = "LTX-2.5 Reference Conditioning ⚡"
+
+
+class CCTechLTX25FaceIdentityReinforcer(CCTechLTXFaceIdentityReinforcer):
+    """The same node listed under the LTX-2.5 menu. NOTE: the Best-Face-ID
+    LoRA the phase tag pairs with is 2.3-trained - loading it on a 2.5 model
+    is cross-version territory (the ID-LoRAs load cleanly there, but this
+    combination is unverified on 2.5)."""
+
+    CATEGORY = LTX25_REF_CATEGORY
+    TITLE = "LTX-2.5 Face Identity Reinforcer ⚡"
+
+
 NODE_CLASS_MAPPINGS = {
     "CCTechLTXReferenceConditioning": CCTechLTXReferenceConditioning,
     "CCTechLTXFaceIdentityReinforcer": CCTechLTXFaceIdentityReinforcer,
+    "CCTechLTX25ReferenceConditioning": CCTechLTX25ReferenceConditioning,
+    "CCTechLTX25FaceIdentityReinforcer": CCTechLTX25FaceIdentityReinforcer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CCTechLTXReferenceConditioning": CCTechLTXReferenceConditioning.TITLE,
     "CCTechLTXFaceIdentityReinforcer": CCTechLTXFaceIdentityReinforcer.TITLE,
+    "CCTechLTX25ReferenceConditioning": CCTechLTX25ReferenceConditioning.TITLE,
+    "CCTechLTX25FaceIdentityReinforcer": CCTechLTX25FaceIdentityReinforcer.TITLE,
 }

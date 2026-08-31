@@ -135,16 +135,28 @@ def test_input_types_pinned():
               "crop_zoom_factor", "spatial_gating", "placement_mode",
               "source_id", "phase_scale", "reference_image_2", "debug"]),
     }
+    # Two implementations, each listed under BOTH version menus (thin
+    # subclasses with their own ids - a comfy node id has one CATEGORY).
+    expect["CCTechLTX25ReferenceConditioning"] = expect["CCTechLTXReferenceConditioning"]
+    expect["CCTechLTX25FaceIdentityReinforcer"] = expect["CCTechLTXFaceIdentityReinforcer"]
     assert set(ltx_ref.NODE_CLASS_MAPPINGS) == set(expect), \
-        "exactly the two consolidated nodes are registered"
+        "the two nodes registered once per version menu, nothing else"
     for name, (req, opt) in expect.items():
         cls = ltx_ref.NODE_CLASS_MAPPINGS[name]
         it = cls.INPUT_TYPES()
         assert list(it["required"]) == req, (name, list(it["required"]))
         assert list(it.get("optional", {})) == opt, (name, list(it.get("optional", {})))
         title = ltx_ref.NODE_DISPLAY_NAME_MAPPINGS[name]
-        assert title.startswith("LTX") and title.endswith("⚡"), \
-            "plain 'Name ⚡' titles, no leading emoji"
+        assert title.startswith("LTX-2.") and title.endswith("⚡"), \
+            "version-prefixed 'LTX-2.x Name ⚡' titles, no leading emoji"
+        want = "LTX-2.5" if "LTX25" in name else "LTX-2.3"
+        assert cls.CATEGORY.endswith(want) and title.startswith(want), \
+            (name, cls.CATEGORY, title)
+    # the 2.5 listings are pure aliases - same behavior objects
+    assert issubclass(ltx_ref.CCTechLTX25ReferenceConditioning,
+                      ltx_ref.CCTechLTXReferenceConditioning)
+    assert issubclass(ltx_ref.CCTechLTX25FaceIdentityReinforcer,
+                      ltx_ref.CCTechLTXFaceIdentityReinforcer)
     # Source-pack defaults survive the port.
     it = ltx_ref.CCTechLTXFaceIdentityReinforcer.INPUT_TYPES()["optional"]
     assert it["source_id"][1]["default"] == 2.0
