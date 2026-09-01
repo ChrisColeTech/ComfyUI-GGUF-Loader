@@ -564,6 +564,17 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
         W_mem = int(reference_latent.shape[4])
 
         if (H_mem, W_mem) != (H_target, W_target):
+            # Almost always a two-stage refine pass sampling an upscaled grid.
+            # The resize keeps the geometry valid, but re-reading a full-frame
+            # face overlay while RE-NOISING nearly-finished content bleeds its
+            # colors into the output (verified live: red face-tone blotches on
+            # the subject at the x2 refine; clean when the refine runs on the
+            # pre-reference model). Identity belongs to the BASE pass - warn.
+            _log(f"reference grid {H_mem}x{W_mem} != sampled grid "
+                 f"{H_target}x{W_target} - resizing. If this is a refine/"
+                 f"second-stage sampler, wire its MODEL from BEFORE the "
+                 f"reference/reinforcer node instead: reference attention "
+                 f"during a re-noise pass smears face colors onto the video.")
             B, C, F_mem_dim, _, _ = reference_latent.shape
             flat = reference_latent.permute(0, 2, 1, 3, 4).reshape(
                 B * F_mem_dim, C, H_mem, W_mem)
