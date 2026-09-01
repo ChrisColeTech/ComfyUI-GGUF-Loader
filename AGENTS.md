@@ -3800,3 +3800,30 @@ seam = matmul-tiling float noise only (row count changed for norm/proj);
 the user's exact 2.5 graph now renders. Debug lesson repeated: a deploy
 without a server restart tests the OLD code - the first "verification" of
 this fix was meaningless for exactly that reason.
+
+## 2026-09-01 (v2.16.3) - audio-hold fixes + full ltx23/25 GPU matrix sweep
+
+User: "the original audio is missing" (two-stage graphs) and "lets find the
+remaining bugs". Three fixes: (1) _upsample_video_latent popped the whole
+noise_mask - audio mask now preserved, video mask reset to the family's
+(B,1,T,1,1) broadcast shape; (2) ROOT CAUSE: LTXV23KSampler popped
+noise_mask from its OUTPUT latent (LTXV25KSampler never did) so crop ->
+upscale -> refine chains lost the audio hold one node before the first fix
+could help - output keeps the mask now; (3) LTXV23RefineSampler chained
+base->upscale->refine with UNcropped conditioning - crashes on v2v with the
+keyframe token-count error - now crops internally via CropVideoGuide.
+Audio verified by SPECTRAL correlation vs source (raw-waveform corr is
+meaningless after the audio VAE's phase-scrambling roundtrip): held = 0.77
+(the VAE ceiling), destroyed = 0.46. Giga audited separately: immune by
+design (re-merges reference audio per pass; muxes source waveform; per-call
+prefix re-derivation; source-fps override) - one stage-2 re-hold test added
+there (246/246).
+GPU matrix (all passing): RefineSampler v2v, VidToVideo mode=v2v (t2v mode
++ connected guide is refused by the node's own guard), dmd card (9 steps),
+ImgToVideo with start image, reference_audio t2v (held 0.773),
+LTXV25ImgToVideo t2v, 2.5 two-stage i2v with LTXV25LatentUpscale images
+re-hold ("first frame re-held" logged), RemovePerson+MaskBlend (81 frames
+clean WITH the docstring's crop stage - without it the appended green-fill
+reference decodes as tail garbage, same class as the v2v tail bug; docs
+were already correct). ComfyUI 2.5 exposes no reference_audio input -
+that path is giga-only on 2.5.

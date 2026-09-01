@@ -1334,7 +1334,13 @@ class LTXV23KSampler:
         )
         latent = latent_image.copy()
         latent["samples"] = out
-        latent.pop("noise_mask", None)
+        # Keep noise_mask in the output (mirrors LTXV25KSampler): the AUDIO
+        # half's hold mask is what lets a downstream refine pass re-hold the
+        # original audio instead of re-noising it. Popping it here was the
+        # root of the two-stage original-audio loss (found live twice: the
+        # upscale-level fix was necessary but not sufficient - the mask died
+        # one node earlier, right here). Held content is baked into the
+        # samples, so keeping the mask is a no-op for single-pass graphs.
         return (latent,)
 
 
@@ -1368,7 +1374,22 @@ def _upsample_video_latent(latent, upscale_model, vae):
 
     out = latent.copy()
     out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
-    out.pop("noise_mask", None)  # the upsampled latent has no held frames left
+    # The VIDEO hold is void after a spatial upscale (guide frames are
+    # cropped, and the refine pass resamples every frame at the new grid) -
+    # but the AUDIO half is untouched by a spatial x2, and its hold mask is
+    # what keeps keep_original_audio's encoded waveform from being re-noised
+    # by the refine sampler. Popping the whole mask here silently destroyed
+    # the original audio in every two-stage graph (found live).
+    mask = out.pop("noise_mask", None)
+    if mask is not None and getattr(mask, "is_nested", False):
+        _vm, audio_mask = mask.unbind()
+        # Per-frame broadcast shape (B,1,T,1,1) - the mask convention every
+        # prep node in this family emits (a full-size mask is documented
+        # there as NOT interchangeable with it).
+        video_mask = torch.ones((video.shape[0], 1, video.shape[2], 1, 1),
+                                dtype=torch.float32, device=video.device)
+        out["noise_mask"] = comfy.nested_tensor.NestedTensor(
+            (video_mask, audio_mask.to(video.device)))
     return out
 
 
@@ -1421,6 +1442,17 @@ class LTXV23RefineSampler:
         base_latent, = sampler.sample(
             model, positive, negative, latent_image, seed, base_steps, cfg,
             sampler_name, base_schedule, denoise=1.0)
+
+        # Crop appended guide frames + keyframe conditioning BEFORE the
+        # upscale - the refine pass must see neither: stale keyframe coords
+        # trip the model's grid check after the x2 ("keyframe_idxs holds N
+        # tokens, which is not a whole number of ...-token latent frames",
+        # hit live on a manual two-stage chain missing its crop), and the
+        # guide frames themselves would be upscaled and re-sampled as
+        # content. Identical to wiring LTXV23CropVideoGuide between the
+        # stages by hand; a no-op when nothing was appended (t2v/i2v).
+        positive, negative, base_latent = LTXV23CropVideoGuide().crop(
+            positive, negative, base_latent)
 
         upscaled = _upsample_video_latent(base_latent, upscale_model, vae)
         logger.info("LTX-2.3 refine: base %s -> upscaled %s",

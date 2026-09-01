@@ -451,9 +451,12 @@ def _upscale_vae():
 def test_latent_upscale_doubles_video_and_passes_audio_through():
     video = torch.rand(1, 128, 16, 4, 7)
     audio = torch.rand(1, 8, 50, 16)
+    # A PATTERNED audio mask (a real hold), not all-ones - so the assertion
+    # below distinguishes "preserved" from "reset to ones".
+    audio_hold = (torch.rand_like(audio) > 0.5).float()
     latent = {"samples": comfy.nested_tensor.NestedTensor((video, audio)),
               "noise_mask": comfy.nested_tensor.NestedTensor(
-                  (torch.ones(1, 1, 16, 1, 1), torch.ones_like(audio))),
+                  (torch.ones(1, 1, 16, 1, 1), audio_hold)),
               "downscale_ratio_spacial": 32}
 
     orig_load = comfy.model_management.load_models_gpu
@@ -473,7 +476,7 @@ def test_latent_upscale_doubles_video_and_passes_audio_through():
     # audio (heard live as wrong audio on keep_original_audio).
     mask_v, mask_a = upscaled["noise_mask"].unbind()
     assert tuple(mask_v.shape) == (1, 1, 16, 1, 1)
-    assert torch.equal(mask_a, torch.ones_like(audio))
+    assert torch.equal(mask_a, audio_hold),         "audio hold mask preserved bit-for-bit (not reset)"
     print("[ok] LTXV25LatentUpscale: x2 on the video half only, audio passthrough, "
           "noise mask carried through so held audio/frames survive the refine pass")
 
