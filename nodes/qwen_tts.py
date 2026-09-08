@@ -55,15 +55,177 @@ either one's docs):
 import logging
 import os
 import shutil
+import sys
 
 import comfy.model_management
 import folder_paths
 import torch
 
+def _patch_check_model_inputs():
+    """qwen-tts 0.1.1 (latest on PyPI as of 2026-09) decorates with
+    ``@check_model_inputs()`` - the parenthesized factory form - while
+    transformers 5.x ships ``check_model_inputs(func)`` bare-only, so
+    importing qwen_tts under a current transformers dies with
+    ``TypeError: check_model_inputs() missing 1 required positional
+    argument: 'func'`` (which used to take this whole pack down with it,
+    since the error is a TypeError, not an ImportError). Teach the bare
+    form to also accept the no-argument call. Only patches when the
+    installed transformers actually needs it, so it is inert on any
+    version that already supports the factory form - and once qwen-tts
+    ships a release fixed for transformers 5.x.
+    """
+    import inspect
+
+    import transformers.utils.generic as _generic
+
+    original = _generic.check_model_inputs
+    try:
+        inspect.signature(original).bind()
+        return
+    except TypeError:
+        pass
+
+    def _compat(func=None, **_kwargs):
+        if func is None:
+            def _decorator(f):
+                return original(f)
+            return _decorator
+        return original(func)
+
+    _generic.check_model_inputs = _compat
+
+
+def _patch_rope_default_init():
+    """transformers 5.x removed both the ``"default"`` entry and the
+    ``_compute_default_rope_parameters`` function from
+    ``transformers.modeling_rope_utils`` - qwen-tts's four rotary embedding
+    classes look up ``ROPE_INIT_FUNCTIONS[self.rope_type]`` with
+    ``rope_type == "default"`` whenever a config has no rope_scaling, which
+    made model construction die with ``KeyError: 'default'``. Restore the
+    standard theta-based default (ported from transformers 4.x's
+    modeling_rope_utils, Apache-2.0) under the same registry key. Inert if
+    a future transformers ships its own ``"default"`` entry again.
+    """
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    if "default" in ROPE_INIT_FUNCTIONS:
+        return
+
+    def _compute_default_rope_parameters(config=None, device=None, **kwargs):
+        base = config.rope_theta
+        partial_rotary_factor = (getattr(config, "partial_rotary_factor", None)
+                                 or 1.0)
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64)
+                    .to(device=device, dtype=torch.float32) / dim))
+        return inv_freq, 1.0
+
+    ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+
+
+def _patch_masking_kwarg():
+    """transformers 5.x restructured ``create_causal_mask``/``create_sliding_
+    window_causal_mask``: the embedding kwarg was renamed ``input_embeds`` ->
+    ``inputs_embeds`` and ``cache_position`` was removed outright. qwen-tts
+    still calls the 4.x shape, which died mid-generation (first model
+    forward) with ``TypeError: ... unexpected keyword argument``. Wrap both
+    to rename the embedding kwarg and drop kwargs the installed signature no
+    longer accepts. Applied BEFORE importing qwen_tts because the package
+    binds these names with a module-level ``from ... import``. Inert on any
+    transformers that already accepts the 4.x call shape.
+    """
+    import inspect
+
+    import transformers.masking_utils as masking
+
+    for name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        original = getattr(masking, name, None)
+        if original is None:
+            continue
+        try:
+            params = inspect.signature(original).parameters
+        except (TypeError, ValueError):
+            continue
+        accepts_old = "input_embeds" in params
+        if accepts_old and any(p.kind == inspect.Parameter.VAR_KEYWORD
+                               for p in params.values()):
+            continue
+        accepted = {n for n, p in params.items()
+                    if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                  inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                  inspect.Parameter.KEYWORD_ONLY)}
+        has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                              for p in params.values())
+
+        def _make_wrapper(_original, _accepted, _has_var_keyword, _accepts_old):
+            def _wrapper(*args, **kwargs):
+                if not _accepts_old and "input_embeds" in kwargs:
+                    kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+                if not _has_var_keyword:
+                    kwargs = {k: v for k, v in kwargs.items()
+                              if k in _accepted}
+                return _original(*args, **kwargs)
+            return _wrapper
+
+        setattr(masking, name, _make_wrapper(original, accepted,
+                                             has_var_keyword, accepts_old))
+
+
+_patch_check_model_inputs()
+_patch_rope_default_init()
+_patch_masking_kwarg()
+
+
+def _patch_legacy_config_defaults():
+    """transformers 5.x stopped defaulting the legacy token-id attributes
+    (``pad_token_id`` & friends) to None on ``PretrainedConfig`` - they only
+    exist now when the checkpoint's config.json actually sets them. qwen-tts
+    reads e.g. ``config.pad_token_id`` unconditionally (written against the
+    transformers 4.x behavior), which made model construction die with
+    ``AttributeError: 'Qwen3TTSTalkerConfig' object has no attribute
+    'pad_token_id'``. Give every PretrainedConfig subclass the package
+    defines the old None defaults at CLASS level: instances that DO carry a
+    value from config.json still win (instance dict beats class attr), and
+    nothing outside qwen_tts is touched.
+    """
+    from transformers import PretrainedConfig
+
+    legacy = ("bos_token_id", "eos_token_id", "pad_token_id",
+              "decoder_start_token_id", "forced_bos_token_id",
+              "forced_eos_token_id")
+    patched = 0
+    for module in list(sys.modules.values()):
+        if not getattr(module, "__name__", "").startswith("qwen_tts"):
+            continue
+        for cls in list(vars(module).values()):
+            if (isinstance(cls, type) and issubclass(cls, PretrainedConfig)
+                    and cls.__module__.startswith("qwen_tts")):
+                for key in legacy:
+                    if not hasattr(cls, key):
+                        setattr(cls, key, None)
+                        patched += 1
+    return patched
+
+
 try:
     from qwen_tts import Qwen3TTSModel
-except ImportError:  # pragma: no cover - optional dependency, see requirements.txt
+    _patched = _patch_legacy_config_defaults()
+    if _patched:
+        logging.getLogger(__name__).info(
+            "Qwen3-TTS compat: restored %d legacy token-id config default(s) "
+            "that transformers 5.x no longer sets", _patched)
+except Exception:  # optional dependency - must never take the pack down
     Qwen3TTSModel = None
+    logging.getLogger(__name__).error(
+        "Qwen3-TTS nodes disabled: importing the 'qwen-tts' package failed "
+        "(it is either not installed, or version-incompatible with the "
+        "installed transformers). Every other node in this pack still "
+        "works. See the traceback below.", exc_info=True)
 
 logger = logging.getLogger(__name__)
 
@@ -213,8 +375,10 @@ class QwenTTSModelsLoader:
     def load(self, repo_id, source, precision, attention, local_model_path=""):
         if Qwen3TTSModel is None:
             raise RuntimeError(
-                "The 'qwen-tts' package is required for QwenTTSModelsLoader "
-                "but is not installed (pip install qwen-tts).")
+                "The 'qwen-tts' package is required for QwenTTSModelsLoader but "
+                "could not be imported (not installed, or version-incompatible "
+                "with the installed transformers - the reason is in the ComfyUI "
+                "startup log). Try: pip install qwen-tts")
 
         local_model_path = local_model_path.strip()
         if local_model_path:
