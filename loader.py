@@ -242,6 +242,14 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         # so it has to survive verbatim. Wrapping it in a GGMLTensor (or letting
         # the non-weight float32 branch below dequantize it) destroys the bytes.
         if sd_key == "tokenizer_json":
+            if torch_tensor.dtype != torch.uint8:
+                # Some writers store the blob as floats — one float per byte
+                # (merge-ui's quantizer did this to every 1-D tensor). Byte
+                # values 0-255 are exact in every float dtype, so casting back
+                # is lossless; an I8 read presents the same bytes as negative
+                # int8 values. Consumers do bytes(t.tolist()) / .tobytes() and
+                # need 0-255 integers either way.
+                torch_tensor = torch_tensor.to(torch.uint8)
             state_dict[sd_key] = torch_tensor.clone()
             qtype_dict["I8/blob"] = qtype_dict.get("I8/blob", 0) + 1
             continue

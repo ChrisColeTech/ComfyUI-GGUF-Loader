@@ -3801,6 +3801,21 @@ the user's exact 2.5 graph now renders. Debug lesson repeated: a deploy
 without a server restart tests the OLD code - the first "verification" of
 this fix was meaningless for exactly that reason.
 
+## 2026-09-08 (v2.16.7) - float-stored tokenizer_json blobs recovered
+
+User's LTX-2.5 workflow died in comfy's Gemma-4 tokenizer with
+"'float' object cannot be interpreted as an integer" (gemma4.py:1583
+bytes(t.tolist())). Root cause is upstream of comfy: merge-ui's GGUF writer
+(giga-images scripts/merge_ui/gguf_out.py) casts EVERY 1-D tensor to F32, so
+the tokenizer_json byte blob rode into the GGUF as one float per byte (4x
+bloat, 128 MB for a 32 MB JSON) - and the loader's I8/blob special case
+counted it by name without checking dtype, handing comfy a float tensor. Byte
+values 0-255 are exact in every float dtype, so gguf_sd_loader now casts the
+blob back to uint8 (lossless; also unwraps true-I8 reads that present as
+negative int8). The already-quantized 7 GB GGUF works as-is, no re-quant.
+Writer fixed on the merge-ui side too. Lesson: the qtype log line "I8/blob"
+was named-based, not type-based - it lied about this file.
+
 ## 2026-09-01 (v2.16.3) - audio-hold fixes + full ltx23/25 GPU matrix sweep
 
 User: "the original audio is missing" (two-stage graphs) and "lets find the

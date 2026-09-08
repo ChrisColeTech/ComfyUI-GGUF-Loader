@@ -89,6 +89,36 @@ def test_gemma4_sidecars_load_into_the_state_dict(tmp_path):
     assert float(sd["model.layers.0.layer_scalar"]) == 0.5
 
 
+def test_gemma4_float_stored_tokenizer_blob_is_recovered(tmp_path):
+    """A merge-ui quantized GGUF embeds the tokenizer_json byte blob as F32 —
+    one float per byte, because its writer cast every 1-D tensor to float32.
+    Comfy's Gemma-4 tokenizer does bytes(t.tolist()) on the tensor and dies
+    with "'float' object cannot be interpreted as an integer" unless the
+    loader hands back real uint8 bytes (the cast is lossless: byte values are
+    exact in float32). No sidecar involved — the blob is inside the GGUF."""
+    doc = json.dumps({"model": {"type": "BPE",
+                                "vocab": {t: i for i, t in enumerate(TOKENS)}},
+                      "added_tokens": []}).encode("utf-8")
+    gguf_path = tmp_path / "gemma4.gguf"
+    writer = gguf.GGUFWriter(str(gguf_path), "gemma4")
+    writer.add_tensor("tokenizer_json",
+                      np.frombuffer(doc, dtype=np.uint8).astype(np.float32),
+                      raw_dtype=gguf.GGMLQuantizationType.F32)
+    writer.add_tensor("model.layers.0.layer_scalar",
+                      np.full(1, 0.5, dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    sd = loader.gguf_clip_loader(str(gguf_path))
+
+    tok = sd["tokenizer_json"]
+    assert tok.dtype == torch.uint8
+    assert json.loads(bytes(tok.tolist()).decode("utf-8"))["model"]["vocab"] == \
+        {t: i for i, t in enumerate(TOKENS)}
+
+
 def test_translate_ltx_transformer_cfg_maps_ltx_names():
     out = nodes_mod._translate_ltx_transformer_cfg({
         "cross_attn_mod": True, "gated_attn": True, "rope_theta": 10000.0,
