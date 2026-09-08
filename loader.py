@@ -379,7 +379,12 @@ CLIP_VISION_QWEN3_MAP = {
     "mm.2": "model.visual.merger.linear_fc2",
     "v.post_ln": "model.visual.merger.norm",
     "v.patch_embd": "model.visual.patch_embed.proj",
-    "v.position_embd.weight": "visual.pos_embed.weight",
+    # comfy's Qwen35VisionModel (qwen35.py) really does own a learned
+    # pos_embed table, unlike the Qwen2-VL tower below - so this one is
+    # mapped, not dropped. It has to carry the "model." prefix its
+    # neighbours do: "visual.pos_embed.weight" loads as an unexpected key
+    # and leaves the table randomly initialised.
+    "v.position_embd.weight": "model.visual.pos_embed.weight",
     "v.deepstast.": "model.visual.deepstack_merger_list.",
 }
 

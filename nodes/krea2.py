@@ -701,7 +701,22 @@ class Krea2ModelLoader:
                 folder_paths.get_full_path_or_raise("unet", unet_name))
 
         if clip_name.lower().endswith(".gguf"):
-            clip, = CLIPLoaderGGUF().load_clip(clip_name, type="krea2")
+            # Krea2's text encoder goes through the exact-table converter in
+            # gguf_qwen3_te.py rather than CLIPLoaderGGUF's generic
+            # string-replace path: it hard-errors on any tensor it cannot
+            # place, computes the DeepStack merger ordinals from the file
+            # instead of a hardcoded layer-id set, re-fuses split q/k/v in the
+            # vision tower, and warns when the file's own metadata identity
+            # says it is not really a Qwen3-VL model (the Z-Image TE has been
+            # seen in the wild mislabelled as Qwen3-VL-4B: same shapes,
+            # different weights, silently wrong conditioning).
+            from .gguf_qwen3_te import load_qwen3_te_sd
+            clip_path = CLIPLoaderGGUF._resolve_clip_path(clip_name)
+            if clip_path is None:
+                raise ValueError(f"Text encoder '{clip_name}' not found in models/text_encoders (clip).")
+            sd = load_qwen3_te_sd(clip_path, expect_vl=True, expect_label="Krea2")
+            clip = CLIPLoaderGGUF().load_patcher(
+                [clip_path], comfy.sd.CLIPType.KREA2, [sd])
         else:
             clip = comfy.sd.load_clip(
                 ckpt_paths=[folder_paths.get_full_path_or_raise("clip", clip_name)],
