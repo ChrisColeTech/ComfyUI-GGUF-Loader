@@ -170,8 +170,8 @@ class QwenImageModelLoader:
                 embedding_directory=folder_paths.get_folder_paths("embeddings"),
                 clip_type=comfy.sd.CLIPType.QWEN_IMAGE)
 
-        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-        vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(vae_path))
+        from .vae_load import load_vae
+        vae = load_vae(vae_name)
         return (model, clip, vae)
 
 
