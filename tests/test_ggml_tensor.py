@@ -30,3 +30,25 @@ def test_clone_of_quantized_tensor_stays_shared():
         tensor_shape=torch.Size([2, 64]))
     assert dequant.is_quantized(tensor)
     assert tensor.clone() is tensor
+
+
+def test_quantized_embedding_emits_compute_dtype_not_float32():
+    """SenseNova prefix is embed_tokens(Q4_K). Reporting dtype=bf16 made the
+    Embedding path wipe out_dtype and dequant to float32, which then mixed
+    with the bf16 image stream in attention."""
+    import numpy as np
+    gguf = dequant.gguf
+    table = np.random.randn(256, 256).astype(np.float32)
+    packed = gguf.quants.quantize(table, gguf.GGMLQuantizationType.Q8_0)
+    weight = ops.GGMLTensor(
+        torch.from_numpy(np.array(packed)),
+        tensor_type=gguf.GGMLQuantizationType.Q8_0,
+        tensor_shape=torch.Size([256, 256]),
+    )
+    assert weight.dtype == torch.bfloat16
+    emb = ops.GGMLOps.Embedding(256, 256)
+    object.__setattr__(emb, "weight", weight)
+    out = emb.forward_ggml_cast_weights(torch.tensor([[0, 1, 2]]))
+    assert out.dtype == torch.bfloat16, out.dtype
+    assert tuple(out.shape) == (1, 3, 256)
+    assert torch.isfinite(out.float()).all()

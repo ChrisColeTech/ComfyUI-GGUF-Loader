@@ -244,7 +244,7 @@ class GGMLLayer(torch.nn.Module):
 
         bias = None
         non_blocking = comfy.model_management.device_supports_non_blocking(device)
-        if s.bias is not None:
+        if getattr(s, "bias", None) is not None:
             bias = s.get_weight(s.bias.to(device), dtype)
             bias = comfy.ops.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=False)
 
@@ -292,13 +292,22 @@ class GGMLOps(comfy.ops.manual_cast):
 
     class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
         def forward_ggml_cast_weights(self, input, out_dtype=None):
-            output_dtype = out_dtype
-            if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
-                out_dtype = None
-            weight, _bias = self.cast_bias_weight(self, device=input.device, dtype=out_dtype)
+            # Token ids have no compute dtype. GGMLTensor.dtype for Q4_K reports
+            # bfloat16, so the old "already a float, wipe out_dtype" branch
+            # dequantized to float32 (getattr(self, "dtype")). SenseNova's
+            # language_model.embed_tokens prefix was then fp32 while the image
+            # stream is bf16 — attention mixed them and samples melted.
+            if out_dtype is None:
+                if is_quantized(self.weight):
+                    out_dtype = self.weight.dtype
+                elif self.weight.dtype in (torch.float16, torch.bfloat16):
+                    out_dtype = self.weight.dtype
+                else:
+                    out_dtype = torch.float32
+            weight, _bias = self.cast_bias_weight(device=input.device, dtype=out_dtype)
             return torch.nn.functional.embedding(
                 input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse
-            ).to(dtype=output_dtype)
+            ).to(dtype=out_dtype)
 
     class LayerNorm(GGMLLayer, comfy.ops.manual_cast.LayerNorm):
         def forward_ggml_cast_weights(self, input):

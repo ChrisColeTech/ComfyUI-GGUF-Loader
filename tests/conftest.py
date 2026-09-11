@@ -23,8 +23,14 @@ def _stub_comfy():
         sys.modules.setdefault(mod, types.ModuleType(mod))
     for attr in ("ops", "lora", "model_management"):
         setattr(sys.modules["comfy"], attr, sys.modules[f"comfy.{attr}"])
-    if not hasattr(sys.modules["comfy.ops"], "manual_cast"):
-        sys.modules["comfy.ops"].manual_cast = type("manual_cast", (), {
+    mm = sys.modules["comfy.model_management"]
+    if not hasattr(mm, "device_supports_non_blocking"):
+        mm.device_supports_non_blocking = lambda *_a, **_k: False
+    ops_mod = sys.modules["comfy.ops"]
+    if not hasattr(ops_mod, "cast_to"):
+        ops_mod.cast_to = lambda w, dtype, device, **_k: w.to(device=device, dtype=dtype)
+    if not hasattr(ops_mod, "manual_cast"):
+        ops_mod.manual_cast = type("manual_cast", (), {
             "Linear": torch.nn.Linear, "Conv2d": torch.nn.Conv2d,
             "Embedding": torch.nn.Embedding, "LayerNorm": torch.nn.LayerNorm,
             "GroupNorm": torch.nn.GroupNorm})
