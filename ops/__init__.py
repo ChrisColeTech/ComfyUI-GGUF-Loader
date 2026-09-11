@@ -137,12 +137,20 @@ class GGMLLayer(torch.nn.Module):
             weight = self.weight
         if bias is None:
             bias = self.bias
-        return is_quantized(weight) or is_quantized(bias)
+        # Packed K-quants *and* any leftover GGMLTensor (F16 convs when the
+        # loader still wrapped them). Native conv/linear will not cast that
+        # subclass to the activation dtype.
+        return (
+            is_quantized(weight) or is_quantized(bias)
+            or isinstance(weight, GGMLTensor) or isinstance(bias, GGMLTensor)
+        )
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         weight, bias = state_dict.get(f"{prefix}weight"), state_dict.get(f"{prefix}bias")
         # NOTE: using modified load for linear due to not initializing on creation, see GGMLOps todo
         if self.is_ggml_quantized(weight=weight, bias=bias) or isinstance(self, torch.nn.Linear):
+            return self.ggml_load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        if isinstance(self, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)) and isinstance(weight, GGMLTensor):
             return self.ggml_load_from_state_dict(state_dict, prefix, *args, **kwargs)
         # Not strictly required, but fixes embedding shape mismatch. Threshold set in loader.py
         if isinstance(self, torch.nn.Embedding) and self.weight.shape[0] >= (64 * 1024):

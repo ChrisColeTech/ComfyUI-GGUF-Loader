@@ -278,7 +278,16 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
 
         # add to state dict
         if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
-            torch_tensor = torch_tensor.view(*shape)
+            # Already floats. GGMLTensor is for packed K-quants; Conv2d/RMSNorm
+            # never dequant that subclass, so SenseNova's leftover F16 convs
+            # (fm_head, vision patch embeds) ran as static. Keep a real tensor.
+            torch_tensor = torch_tensor.view(*shape).contiguous().clone()
+            if not sd_key.endswith((".weight", ".bias")) and torch_tensor.dtype != torch.float32:
+                torch_tensor = torch_tensor.float()
+            state_dict[sd_key] = torch_tensor
+            tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
+            qtype_dict[tensor_type_str] = qtype_dict.get(tensor_type_str, 0) + 1
+            continue
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
         # 1D tensors shouldn't be quantized, this is a fix for BF16
