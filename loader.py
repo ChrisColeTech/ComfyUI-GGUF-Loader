@@ -23,6 +23,7 @@ IMG_ARCH_LIST = {
     "flux2",       # Flux2 conversion scripts (alias; some files also use "flux")
     "flux1",       # Flux1 VAE / older flux tags seen in the wild
     "krea2",       # Krea-2 (some builds; files may also use qwen_image)
+    "sensenova_u15",  # SenseNova U1.5 MoT (Comfy image_model id; keep original keys)
     "minimax_music3",  # MiniMax Music 3 DiT (same tag on the TE, see below)
     "diffusion_model",  # generic fallback used by agnostic convert scripts
 }

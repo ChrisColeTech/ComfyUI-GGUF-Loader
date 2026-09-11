@@ -314,6 +314,91 @@ def _unet_metadata_sidecar(unet_path, extra_metadata, sd=None):
                 logging.info("LTX: forced %s from the weights", ", ".join(changed))
     return metadata
 
+def _checkpoint_names():
+    """Checkpoints folder first, then GGUF UNET files under diffusion_models."""
+    names, seen = [], set()
+    for key in ("checkpoints", "unet_gguf"):
+        try:
+            for name in folder_paths.get_filename_list(key):
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        except Exception:
+            continue
+    return names
+
+
+def _resolve_checkpoint(name):
+    for key in ("checkpoints", "unet", "diffusion_models"):
+        path = folder_paths.get_full_path(key, name)
+        if path:
+            return path
+    return folder_paths.get_full_path_or_raise("checkpoints", name)
+
+
+class CheckpointLoaderGGUF:
+    """Stock Load Checkpoint, but the file can be a GGUF.
+
+    UnetLoaderGGUF only returns MODEL. SenseNova U1.5 (and other all-in-one
+    checkpoints) also need CLIP and VAE from the same state dict: the TE is a
+    tokenizer over the language_model weights, the VAE is a pixel-space dummy.
+    This node calls comfy.sd.load_state_dict_guess_config so detection, CLIP
+    and VAE match CheckpointLoaderSimple.
+    """
+
+    CATEGORY = "🤖 CCTech/GGUF"
+    TITLE = "Checkpoint Loader (GGUF) ⚡"
+    SEARCH_ALIASES = ['load checkpoint', 'checkpoint loader', 'ckpt', 'load model',
+                       'gguf checkpoint', 'sensenova']
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
+    FUNCTION = "load_checkpoint"
+    DESCRIPTION = ("Load a checkpoint as MODEL + CLIP + VAE. Accepts safetensors "
+                   "from models/checkpoints and GGUF from models/diffusion_models. "
+                   "GGUF stays quantized.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ckpt_name": (_checkpoint_names(), {
+                    "tooltip": "A .safetensors checkpoint or a UNET GGUF. "
+                               "SenseNova U1.5 is one file: CLIP/VAE come from it, "
+                               "not from separate loaders."}),
+            }
+        }
+
+    def load_checkpoint(self, ckpt_name):
+        path = _resolve_checkpoint(ckpt_name)
+        embeddings = folder_paths.get_folder_paths("embeddings")
+        if path.lower().endswith(".gguf"):
+            ops = GGMLOps()
+            sd, extra = gguf_sd_loader(path)
+            kwargs = {}
+            valid_params = inspect.signature(comfy.sd.load_state_dict_guess_config).parameters
+            if "metadata" in valid_params:
+                kwargs["metadata"] = _unet_metadata_sidecar(
+                    path, extra.get("metadata", {}), sd)
+            out = comfy.sd.load_state_dict_guess_config(
+                sd,
+                output_vae=True,
+                output_clip=True,
+                output_clipvision=False,
+                embedding_directory=embeddings,
+                model_options={"custom_operations": ops},
+                **kwargs,
+            )
+            if out is None or out[0] is None:
+                raise RuntimeError(
+                    "ERROR: Could not detect model type of: {}".format(path))
+            model, clip, vae = out[0], out[1], out[2]
+            model = GGUFModelPatcher.clone(model)
+            return (model, clip, vae)
+        out = comfy.sd.load_checkpoint_guess_config(
+            path, output_vae=True, output_clip=True, embedding_directory=embeddings)
+        return out[:3]
+
+
 class UnetLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
@@ -605,6 +690,7 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
 
 # Stable class keys (workflow-safe). Display titles come from each node's TITLE.
 NODE_CLASS_MAPPINGS = {
+    "CheckpointLoaderGGUF": CheckpointLoaderGGUF,
     "UnetLoaderGGUF": UnetLoaderGGUF,
     "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
     "CLIPLoaderGGUF": CLIPLoaderGGUF,
@@ -614,6 +700,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "CheckpointLoaderGGUF": CheckpointLoaderGGUF.TITLE,
     "UnetLoaderGGUF": UnetLoaderGGUF.TITLE,
     "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced.TITLE,
     "CLIPLoaderGGUF": CLIPLoaderGGUF.TITLE,
