@@ -33,6 +33,9 @@ def update_folder_names_and_paths(key, targets=[]):
 # Add a custom keys for files ending in .gguf
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
+# Comfy's "checkpoints" key only lists safetensors/ckpt. GGUF all-in-one
+# files (SenseNova turbo, etc.) live in models/checkpoints too.
+update_folder_names_and_paths("checkpoints_gguf", ["checkpoints"])
 
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
@@ -315,9 +318,9 @@ def _unet_metadata_sidecar(unet_path, extra_metadata, sd=None):
     return metadata
 
 def _checkpoint_names():
-    """Checkpoints folder first, then GGUF UNET files under diffusion_models."""
+    """Checkpoints (safetensors + GGUF) first, then GGUF UNETs under diffusion_models."""
     names, seen = [], set()
-    for key in ("checkpoints", "unet_gguf"):
+    for key in ("checkpoints", "checkpoints_gguf", "unet_gguf"):
         try:
             for name in folder_paths.get_filename_list(key):
                 if name not in seen:
@@ -329,7 +332,7 @@ def _checkpoint_names():
 
 
 def _resolve_checkpoint(name):
-    for key in ("checkpoints", "unet", "diffusion_models"):
+    for key in ("checkpoints", "checkpoints_gguf", "unet", "diffusion_models"):
         path = folder_paths.get_full_path(key, name)
         if path:
             return path
@@ -354,15 +357,16 @@ class CheckpointLoaderGGUF:
     RETURN_NAMES = ("model", "clip", "vae")
     FUNCTION = "load_checkpoint"
     DESCRIPTION = ("Load a checkpoint as MODEL + CLIP + VAE. Accepts safetensors "
-                   "from models/checkpoints and GGUF from models/diffusion_models. "
-                   "GGUF stays quantized.")
+                   "and GGUF from models/checkpoints, plus GGUF under "
+                   "models/diffusion_models. GGUF stays quantized.")
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "ckpt_name": (_checkpoint_names(), {
-                    "tooltip": "A .safetensors checkpoint or a UNET GGUF. "
+                    "tooltip": "A .safetensors or .gguf checkpoint from "
+                               "models/checkpoints, or a UNET GGUF. "
                                "SenseNova U1.5 is one file: CLIP/VAE come from it, "
                                "not from separate loaders."}),
             }
