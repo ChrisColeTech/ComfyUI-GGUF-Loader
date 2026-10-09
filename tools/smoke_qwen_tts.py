@@ -60,6 +60,9 @@ def _fake_generate_custom_voice(**kwargs):
 
 
 _fake_model_instance.generate_custom_voice.side_effect = _fake_generate_custom_voice
+_fake_model_instance.generate_voice_clone.side_effect = _fake_generate_custom_voice
+_fake_model_instance.generate_voice_design.side_effect = _fake_generate_custom_voice
+_fake_model_instance.create_voice_clone_prompt.return_value = ["PROMPT_ITEMS"]
 
 _qwen_tts_module = types.ModuleType("qwen_tts")
 _qwen_tts_module.Qwen3TTSModel = MagicMock()
@@ -325,6 +328,167 @@ def test_rope_default_init_resolves_theta_from_all_config_shapes():
           "rope_parameters dict, and the 4.x default")
 
 
+def _bundle(family=None):
+    """A QWEN_TTS_MODEL bundle pointing at the fake model, named for the
+    family the generate nodes family-check against (None = unclassifiable
+    local/fine-tuned checkpoint name)."""
+    name = f"/models/Qwen3-TTS/fake-12Hz-1.7B-{family}" if family else "/fine-tune/my-voice-lora"
+    return {"model": _fake_model_instance, "key": ("k",), "name": name}
+
+
+def _fake_audio_dict(stereo=False, samples=4410, sr=24000):
+    c = 2 if stereo else 1
+    return {"waveform": torch.randn(1, c, samples), "sample_rate": sr}
+
+
+def test_voice_clone_family_check():
+    node = qt.QwenTTSVoiceCloneGenerate()
+    try:
+        node.generate(_bundle("CustomVoice"), "hi", "Auto", 0, 2048, 1.0, 50,
+                      0.9, 1.05, ref_audio=_fake_audio_dict())
+    except ValueError as e:
+        assert "Base" in str(e)
+        print("[ok] voice clone: CustomVoice bundle rejected with a family error")
+    else:
+        raise AssertionError("expected ValueError")
+    # unclassifiable (local/fine-tuned) names pass through unchecked
+    node.generate(_bundle(None), "hi", "Auto", 0, 2048, 1.0, 50, 0.9, 1.05,
+                  ref_audio=_fake_audio_dict())
+    print("[ok] voice clone: unknown-family (local path) bundles pass through")
+
+
+def test_voice_clone_requires_ref_audio_or_prompt():
+    node = qt.QwenTTSVoiceCloneGenerate()
+    try:
+        node.generate(_bundle("Base"), "hi", "Auto", 0, 2048, 1.0, 50, 0.9, 1.05)
+    except ValueError as e:
+        assert "ref_audio" in str(e)
+        print("[ok] voice clone: neither ref_audio nor prompt raises a clear error")
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_voice_clone_converts_comfyui_audio_and_kwargs():
+    node = qt.QwenTTSVoiceCloneGenerate()
+    (audio,) = node.generate(_bundle("Base"), "hello", "English", 7, 512,
+                             1.0, 50, 0.9, 1.05,
+                             ref_audio=_fake_audio_dict(stereo=True),
+                             ref_text="  ", x_vector_only=True, instruct=" calm ")
+    kw = _fake_model_instance.generate_voice_clone.call_args.kwargs
+    wav, sr = kw["ref_audio"]
+    assert isinstance(wav, np.ndarray) and wav.ndim == 1 and wav.dtype == np.float32
+    assert sr == 24000
+    assert kw["ref_text"] is None          # blank -> None (upstream contract)
+    assert kw["instruct"] == "calm"        # stripped, blank would be None
+    assert kw["x_vector_only_mode"] is True
+    assert kw["language"] == "English"     # non-Auto passes through
+    assert audio["waveform"].shape == (1, 1, 4000) and audio["sample_rate"] == 24000
+    print("[ok] voice clone: stereo AUDIO dict -> mono 1-D tuple, kwargs match upstream")
+
+
+def test_voice_clone_prompt_wins_over_ref_audio():
+    node = qt.QwenTTSVoiceCloneGenerate()
+    node.generate(_bundle("Base"), "hi", "Auto", 0, 512, 1.0, 50, 0.9, 1.05,
+                  ref_audio=_fake_audio_dict(),
+                  voice_clone_prompt=["PROMPT_ITEMS"])
+    kw = _fake_model_instance.generate_voice_clone.call_args.kwargs
+    assert kw["voice_clone_prompt"] == ["PROMPT_ITEMS"] and kw["ref_audio"] is None
+    print("[ok] voice clone: a connected prompt takes precedence over ref_audio")
+
+
+def test_voice_clone_short_reference_is_padded():
+    node = qt.QwenTTSVoiceCloneGenerate()
+    node.generate(_bundle("Base"), "hi", "Auto", 0, 512, 1.0, 50, 0.9, 1.05,
+                  ref_audio=_fake_audio_dict(samples=100))
+    wav, _sr = _fake_model_instance.generate_voice_clone.call_args.kwargs["ref_audio"]
+    assert wav.shape[0] == 1024  # upstream's own minimum
+    print("[ok] voice clone: sub-1024-sample references are zero-padded")
+
+
+def test_voice_clone_prompt_node_passes_through():
+    node = qt.QwenTTSVoiceClonePrompt()
+    (prompt,) = node.create_prompt(_bundle("Base"), _fake_audio_dict(), "the transcript")
+    kw = _fake_model_instance.create_voice_clone_prompt.call_args.kwargs
+    assert kw["ref_text"] == "the transcript" and kw["x_vector_only_mode"] is False
+    assert prompt == ["PROMPT_ITEMS"]
+    print("[ok] voice clone prompt: extraction kwargs + passthrough return")
+
+
+def test_voice_design_requires_instruct_and_family():
+    node = qt.QwenTTSVoiceDesignGenerate()
+    for kwargs, why in (
+        (dict(qwen_tts_model=_bundle("VoiceDesign"), text="hi", instruct="  "),
+         "blank instruct"),
+        (dict(qwen_tts_model=_bundle("CustomVoice"), text="hi", instruct="a voice"),
+         "wrong family"),
+    ):
+        try:
+            node.generate(unload_model_after_generate=False, seed=0,
+                          language="Auto", max_new_tokens=512, top_p=1.0,
+                          top_k=50, temperature=0.9, repetition_penalty=1.05,
+                          **kwargs)
+        except ValueError:
+            print(f"[ok] voice design: rejects {why}")
+            continue
+        raise AssertionError(f"expected ValueError for {why}")
+    (audio,) = node.generate(_bundle("VoiceDesign"), "hello there",
+                             "a deep calm male voice", "Auto", 3, 512,
+                             1.0, 50, 0.9, 1.05)
+    kw = _fake_model_instance.generate_voice_design.call_args.kwargs
+    assert kw["instruct"] == "a deep calm male voice" and kw["language"] is None
+    assert audio["waveform"].shape == (1, 1, 4000)
+    print("[ok] voice design: valid call forwards instruct + Auto->None language")
+
+
+def test_role_bank_collects_named_prompts_and_skips_empty():
+    node = qt.QwenTTSRoleBank()
+    (bank,) = node.create_bank(
+        role_name_1="Narrator", prompt_1=["p1"],
+        role_name_2="  ",           # blank name -> skipped even with a prompt
+        role_name_3="Role3",        # comfy fills the widget default when unwired
+        prompt_3=["p3"],
+        role_name_5="Ghost",        # name, no prompt -> skipped
+    )
+    assert bank == {"Narrator": ["p1"], "Role3": ["p3"]}
+    print("[ok] role bank: named prompts collected, blank/empty slots skipped")
+
+
+def test_save_and_load_speaker_roundtrip():
+    import json as _json
+    # a real picklable prompt (MagicMock is not torch.save-able)
+    prompt = [{"emb": torch.zeros(4)}, "meta"]
+    audio = _fake_audio_dict(samples=2000)
+    save = qt.QwenTTSSaveVoice()
+    save.save(prompt, "..\\evil name.qvp", audio=audio, ref_text="the transcript")
+    voices = qt._voices_dir()
+    stem = "evil name"  # basename + extension strip - no traversal
+    assert os.path.isfile(os.path.join(voices, stem + ".qvp"))
+    assert os.path.isfile(os.path.join(voices, stem + ".json"))
+    assert os.path.isfile(os.path.join(voices, stem + ".wav"))  # stdlib fallback wrote it
+    with open(os.path.join(voices, stem + ".json"), encoding="utf-8") as f:
+        assert _json.load(f)["ref_text"] == "the transcript"
+    assert stem + ".wav" in qt.QwenTTSLoadSpeaker.INPUT_TYPES()["required"]["filename"][0]
+
+    (loaded_prompt, loaded_audio, ref_text) = qt.QwenTTSLoadSpeaker().load_speaker(stem + ".wav")
+    assert loaded_prompt[1] == "meta"                          # .qvp fast-load round-trips
+    assert torch.equal(loaded_prompt[0]["emb"], torch.zeros(4))
+    assert ref_text == "the transcript"       # .json transcript restored
+    assert loaded_audio["waveform"].shape[0] == 1 and loaded_audio["waveform"].shape[1] == 1
+    assert loaded_audio["waveform"].shape[2] == 2000 and loaded_audio["sample_rate"] == 24000
+    print("[ok] save/load speaker: qvp+json+wav written (no audio backend needed), "
+          "prompt/transcript/audio round-trip")
+
+    # missing .qvp -> prompt None, audio still usable via ref_audio
+    os.remove(os.path.join(voices, stem + ".qvp"))
+    (p2, a2, t2) = qt.QwenTTSLoadSpeaker().load_speaker(stem + ".wav")
+    assert p2 is None and t2 == "the transcript" and a2["waveform"].shape[-1] == 2000
+    print("[ok] load speaker: no cached .qvp -> prompt None, audio+transcript intact")
+    import contextlib
+    for ext in (".qvp", ".json", ".wav"):  # .qvp may already be gone (sub-test above)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(voices, stem + ext))
+
+
 if __name__ == "__main__":
     assert qt.Qwen3TTSModel is not None, "qwen_tts stub failed to install"
     test_folder_registered_under_models_dir()
@@ -342,4 +506,13 @@ if __name__ == "__main__":
     test_generate_wrong_model_type_error_is_remapped()
     test_instruct_drop_warning_fires_for_06b_size_string()
     test_rope_default_init_resolves_theta_from_all_config_shapes()
+    test_voice_clone_family_check()
+    test_voice_clone_requires_ref_audio_or_prompt()
+    test_voice_clone_converts_comfyui_audio_and_kwargs()
+    test_voice_clone_prompt_wins_over_ref_audio()
+    test_voice_clone_short_reference_is_padded()
+    test_voice_clone_prompt_node_passes_through()
+    test_voice_design_requires_instruct_and_family()
+    test_role_bank_collects_named_prompts_and_skips_empty()
+    test_save_and_load_speaker_roundtrip()
     print("[ok] all nodes_qwen_tts smoke tests passed")

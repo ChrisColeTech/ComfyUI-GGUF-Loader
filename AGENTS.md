@@ -3936,3 +3936,57 @@ plus a real-weights CPU E2E on the portable: `QwenTTSModelsLoader.load` ->
 audio (peak 0.48). pytest 127/128 unchanged. Scratch scripts for the E2E:
 `%TEMP%\opencode\check_qwen_tts_e2e.py` (node-level) and
 `check_qwen_tts_load2.py` (package-level).
+## 2026-10-09 (v2.18.0) - Qwen3-TTS: 6 more nodes ported from the newer flybirdxx pack
+
+User pointed at `D:\Projects\ComfyUI\ComfyUI-Qwen-TTS` (a NEWER flybirdxx
+revision than the one `FB_Qwen3TTSCustomVoice` came from - it now vendors its
+own qwen_tts with a `_transformers5_fixup.py`, a 25hz tokenizer, finetuning,
+and 9 nodes) and asked what to port. Easy tier chosen: VoiceClone,
+VoiceDesign, VoiceClonePrompt, RoleBank, SaveVoice, LoadSpeaker (NOT ported:
+DialogueInference - moderate, pure local orchestration with punctuation-aware
+pauses + batching, a future follow-up; Train - real training loop, its own
+dep set, different beast).
+
+Ported into `nodes/qwen_tts.py` on OUR architecture, not theirs:
+- all six take the existing `QWEN_TTS_MODEL` bundle from
+  `QwenTTSModelsLoader` (which gained a `"name"` key = the actually-loaded
+  folder, so local_model_path loads carry their own name) - NOT their
+  per-node `load_qwen_model("Base"|"VoiceDesign", model_choice, device, ...)`.
+- family enforcement replaces their hard-coded model loading:
+  `_model_family(bundle)` reads the CustomVoice/VoiceDesign/Base token out of
+  the loaded folder name, `_require_family()` raises a clear error on a known
+  mismatch (clone needs *-Base, design needs *-VoiceDesign). Unrecognizable
+  names (local_model_path / fine-tunes) pass through unchecked - same
+  honesty as the existing wrong-model-type ValueError remap. Upstream binds
+  each generation mode to one checkpoint family deliberately; we enforce the
+  same pairing without a second loader node.
+- `_ref_audio_to_tuple()` is a clean ComfyUI-AUDIO-only version of their
+  9-format `_audio_tensor_to_tuple` (mono downmix, float32 1-D numpy,
+  zero-pad to their own 1024-sample minimum).
+- SaveVoice/LoadSpeaker store under `models/Qwen3-TTS/voices/` (our tree;
+  upstream used lowercase `models/qwen-tts/voices`). Filenames are sanitized
+  (basename + extension strip - no traversal). The wav write/read prefers
+  torchaudio -> soundfile and falls back to a STDLIB `wave` 16-bit PCM path
+  so the round-trip needs no audio backend at all (the dev box has none -
+  torchaudio/soundfile absent, scipy broken against numpy 1.26 - and the
+  portable's torchaudio 2.11 imports fine but `save` fails without a
+  backend, so every fallback stage catches Exception, not just ImportError).
+  `.qvp` load uses weights_only=False (holds VoiceClonePromptItem objects);
+  documented as only-ever-load-your-own-files.
+- RoleBank: 8 optional (name, prompt) slots; blank name or missing prompt
+  skips the slot - upstream behavior verbatim. No consumer in-pack yet
+  (that is DialogueInference, the deferred moderate node) - ported because
+  the user listed it.
+
+Verification, per the standing real-E2E rule: offline smoke grew 9 tests
+(family checks, ref-audio conversion incl. stereo->mono + padding, prompt
+precedence over ref_audio, upstream kwarg contract incl. blank->None
+ref_text/instruct, role-bank slot skipping, save/load round-trip WITHOUT any
+audio backend) - green on both dev (no backends) and portable. Real-weights
+CPU E2E on the portable (scratch:
+`%TEMP%\opencode\check_qwen_tts_port_e2e.py`): CustomVoice reference speech
+-> VoiceClonePrompt (Base 0.6B, auto-downloaded by the loader) -> SaveVoice
+-> LoadSpeaker round-trip -> VoiceClone of NEW text from the SAVED prompt ->
+RoleBank (2 roles) -> VoiceDesign (VoiceDesign 1.7B, auto-downloaded) - all
+finite, audible, first-run pass. 80 nodes registered total (74 -> 80).
+pytest 127/128 unchanged.

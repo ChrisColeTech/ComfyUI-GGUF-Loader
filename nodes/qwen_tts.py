@@ -436,7 +436,10 @@ class QwenTTSModelsLoader:
                     model_path, device, precision, attn_impl)
 
         _MODEL_CACHE.clear()
-        bundle = {"model": model, "key": key}
+        # "name" carries the actually-loaded folder so the generate nodes can
+        # family-check (CustomVoice/VoiceDesign/Base) from it; local_model_path
+        # loads carry their own folder name instead of the repo_id widget.
+        bundle = {"model": model, "key": key, "name": model_path}
         _MODEL_CACHE[key] = bundle
         return (bundle,)
 
@@ -538,12 +541,504 @@ class QwenTTSCustomVoiceGenerate:
         return (audio,)
 
 
+def _model_family(qwen_tts_model):
+    """Family token in the loaded model's name (CustomVoice/VoiceDesign/Base).
+
+    None for names carrying no known family token - a local_model_path or
+    fine-tuned checkpoint we cannot classify by name.
+    """
+    name = (qwen_tts_model.get("name") or "").lower()
+    for family in ("customvoice", "voicedesign", "base"):
+        if family in name:
+            return family
+    return None
+
+
+def _require_family(qwen_tts_model, wanted, action):
+    """The upstream package deliberately binds each generation mode to one
+    checkpoint family (clone -> Base, design -> VoiceDesign, built-in
+    speakers -> CustomVoice). Enforce the same pairing up front with a clear
+    error instead of failing somewhere inside the model. Unrecognizable names
+    (local_model_path/fine-tunes) pass through unchecked.
+    """
+    family = _model_family(qwen_tts_model)
+    if family is not None and family != wanted:
+        raise ValueError(
+            f"{action} needs a *-{wanted.capitalize()} checkpoint, but the "
+            f"models loader has {qwen_tts_model.get('name')!r} (family "
+            f"{family!r}). Point Qwen3-TTS Models Loader at a *-"
+            f"{wanted.capitalize()} repo.")
+
+
+def _ref_audio_to_tuple(audio):
+    """ComfyUI AUDIO dict -> the (1-D float32 numpy, sample_rate) tuple the
+    qwen-tts package's reference-audio argument expects: mono downmix, float
+    1-D, padded to at least 1024 samples (upstream's own minimum).
+    """
+    if not isinstance(audio, dict) or "waveform" not in audio:
+        raise ValueError(
+            "ref_audio must be a ComfyUI AUDIO connection "
+            "({'waveform': [B,C,T] tensor, 'sample_rate': int}).")
+    wave = audio["waveform"]
+    sr = int(audio.get("sample_rate") or 0)
+    if sr <= 0:
+        raise ValueError("ref_audio carries no sample_rate.")
+    if isinstance(wave, torch.Tensor):
+        if wave.dim() > 1:  # [B, C, T] -> mono
+            wave = wave.squeeze()
+            if wave.dim() > 1:
+                wave = wave.mean(dim=0)
+        wave = wave.detach().cpu().numpy()
+    import numpy as np
+    wave = np.asarray(wave, dtype=np.float32).reshape(-1)
+    if wave.size == 0:
+        raise ValueError("ref_audio waveform is empty.")
+    if wave.size < 1024:
+        wave = np.concatenate([wave, np.zeros(1024 - wave.size, np.float32)])
+    return wave, sr
+
+
+def _wavs_to_audio(wavs, sample_rate):
+    """Package output (list of 1-D numpy wavs, sr) -> ComfyUI AUDIO dict."""
+    if not wavs:
+        raise RuntimeError("Qwen3-TTS generated no audio.")
+    waveform = torch.from_numpy(wavs[0]).float()[None, None, :]
+    return {"waveform": waveform, "sample_rate": int(sample_rate)}
+
+
+class QwenTTSVoiceCloneGenerate:
+    """Clone a reference voice (AUDIO or a cached prompt) onto target text."""
+
+    CATEGORY = QWEN_TTS_CATEGORY
+    TITLE = "Qwen3-TTS Voice Clone ⚡"
+    SEARCH_ALIASES = ['voice clone', 'clone voice', 'reference audio', 'tts', 'speech']
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "generate"
+    DESCRIPTION = ("Clone a voice from reference audio (or a reusable "
+                   "voice-clone prompt) and speak the target text. Needs a "
+                   "*-Base checkpoint in the models loader.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "qwen_tts_model": ("QWEN_TTS_MODEL",),
+                "text": ("STRING", {"multiline": True, "default": "Hello world"}),
+                "language": (CUSTOM_VOICE_LANGUAGES, {"default": "Auto"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                 "control_after_generate": True}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
+                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 50, "min": 0, "max": 500}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 0.5, "max": 5.0, "step": 0.01}),
+            },
+            "optional": {
+                "ref_audio": ("AUDIO", {"tooltip": "Reference audio to clone "
+                    "from. Ignored when voice_clone_prompt is connected."}),
+                "ref_text": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Transcript of the reference audio (optional, "
+                               "improves clone quality)."}),
+                "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip":
+                    "Reusable prompt from Qwen3-TTS Voice Clone Prompt (or "
+                    "Qwen3-TTS Load Speaker). Takes precedence over ref_audio."}),
+                "x_vector_only": ("BOOLEAN", {"default": False, "tooltip":
+                    "Only use the speaker embedding (ref_text not needed)."}),
+                "instruct": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Optional style/emotion instruction."}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def generate(self, qwen_tts_model, text, language, seed, max_new_tokens,
+                 top_p, top_k, temperature, repetition_penalty,
+                 ref_audio=None, ref_text="", voice_clone_prompt=None,
+                 x_vector_only=False, instruct="", unload_model_after_generate=False):
+        _require_family(qwen_tts_model, "base", "Voice cloning")
+        model = qwen_tts_model["model"]
+
+        prompt_param = None
+        ref_tuple = None
+        if voice_clone_prompt is not None:
+            prompt_param = voice_clone_prompt
+        elif ref_audio is not None:
+            ref_tuple = _ref_audio_to_tuple(ref_audio)
+        else:
+            raise ValueError(
+                "Connect either ref_audio or voice_clone_prompt - voice "
+                "cloning needs a voice to clone from.")
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        wavs, sample_rate = model.generate_voice_clone(
+            text=text,
+            language=None if language == "Auto" else language,
+            ref_audio=ref_tuple,
+            ref_text=ref_text.strip() or None,
+            voice_clone_prompt=prompt_param,
+            x_vector_only_mode=x_vector_only,
+            instruct=instruct.strip() or None,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p, top_k=top_k, temperature=temperature,
+            repetition_penalty=repetition_penalty,
+        )
+        audio = _wavs_to_audio(wavs, sample_rate)
+        logger.info("Qwen3-TTS: voice-clone generated %s @ %d Hz",
+                    tuple(audio["waveform"].shape), sample_rate)
+
+        if unload_model_after_generate:
+            _MODEL_CACHE.pop(qwen_tts_model["key"], None)
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return (audio,)
+
+
+class QwenTTSVoiceDesignGenerate:
+    """Describe a voice in text (instruct) and speak the target text with it."""
+
+    CATEGORY = QWEN_TTS_CATEGORY
+    TITLE = "Qwen3-TTS Voice Design ⚡"
+    SEARCH_ALIASES = ['voice design', 'describe voice', 'tts', 'speech', 'generate audio']
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "generate"
+    DESCRIPTION = ("Design a voice from a text description (instruct, e.g. "
+                   "'a deep male voice with a calm tone') and speak the text "
+                   "with it. Needs a *-VoiceDesign checkpoint.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "qwen_tts_model": ("QWEN_TTS_MODEL",),
+                "text": ("STRING", {"multiline": True, "default": "Hello world"}),
+                "instruct": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Voice description, e.g. 'a warm female voice "
+                               "with an energetic tone'. Required for voice "
+                               "design."}),
+                "language": (CUSTOM_VOICE_LANGUAGES, {"default": "Auto"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                 "control_after_generate": True}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
+                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 50, "min": 0, "max": 500}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 0.5, "max": 5.0, "step": 0.01}),
+            },
+            "optional": {
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def generate(self, qwen_tts_model, text, instruct, language, seed,
+                 max_new_tokens, top_p, top_k, temperature, repetition_penalty,
+                 unload_model_after_generate=False):
+        _require_family(qwen_tts_model, "voicedesign", "Voice designing")
+        model = qwen_tts_model["model"]
+
+        if not text.strip() or not instruct.strip():
+            raise ValueError("Voice design needs both text and instruct.")
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+        wavs, sample_rate = model.generate_voice_design(
+            text=text,
+            language=None if language == "Auto" else language,
+            instruct=instruct,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p, top_k=top_k, temperature=temperature,
+            repetition_penalty=repetition_penalty,
+        )
+        audio = _wavs_to_audio(wavs, sample_rate)
+        logger.info("Qwen3-TTS: voice-design generated %s @ %d Hz",
+                    tuple(audio["waveform"].shape), sample_rate)
+
+        if unload_model_after_generate:
+            _MODEL_CACHE.pop(qwen_tts_model["key"], None)
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return (audio,)
+
+
+class QwenTTSVoiceClonePrompt:
+    """Extract reusable voice features from reference audio."""
+
+    CATEGORY = QWEN_TTS_CATEGORY
+    TITLE = "Qwen3-TTS Voice Clone Prompt ⚡"
+    SEARCH_ALIASES = ['voice prompt', 'speaker embedding', 'clone prompt', 'tts']
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
+    RETURN_NAMES = ("voice_clone_prompt",)
+    FUNCTION = "create_prompt"
+    DESCRIPTION = ("Extract voice features from reference audio once and "
+                   "reuse them in Voice Clone / Role Bank / Save Voice. Needs "
+                   "a *-Base checkpoint (same family Voice Clone uses).")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "qwen_tts_model": ("QWEN_TTS_MODEL",),
+                "ref_audio": ("AUDIO",),
+                "ref_text": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Transcript of the reference audio (optional, "
+                               "improves quality)."}),
+            },
+            "optional": {
+                "x_vector_only": ("BOOLEAN", {"default": False, "tooltip":
+                    "Only extract the speaker embedding (ref_text unused)."}),
+            },
+        }
+
+    def create_prompt(self, qwen_tts_model, ref_audio, ref_text,
+                      x_vector_only=False):
+        _require_family(qwen_tts_model, "base", "Voice-clone prompt extraction")
+        model = qwen_tts_model["model"]
+        ref_tuple = _ref_audio_to_tuple(ref_audio)
+
+        prompt_items = model.create_voice_clone_prompt(
+            ref_audio=ref_tuple,
+            ref_text=ref_text.strip() or None,
+            x_vector_only_mode=x_vector_only,
+        )
+        logger.info("Qwen3-TTS: extracted voice-clone prompt (%s)",
+                    type(prompt_items).__name__)
+        return (prompt_items,)
+
+
+class QwenTTSRoleBank:
+    """Collect up to 8 named voice prompts for multi-role workflows."""
+
+    CATEGORY = QWEN_TTS_CATEGORY
+    TITLE = "Qwen3-TTS Role Bank ⚡"
+    SEARCH_ALIASES = ['role bank', 'multi character', 'dialogue', 'voices', 'tts']
+    RETURN_TYPES = ("QWEN3_ROLE_BANK",)
+    RETURN_NAMES = ("role_bank",)
+    FUNCTION = "create_bank"
+    DESCRIPTION = ("Collect up to 8 named voice-clone prompts into one bank "
+                   "for multi-role dialogue workflows. Roles with no prompt "
+                   "connected are skipped.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        inputs = {"required": {}, "optional": {}}
+        for i in range(1, 9):
+            inputs["optional"][f"role_name_{i}"] = ("STRING", {"default": f"Role{i}"})
+            inputs["optional"][f"prompt_{i}"] = ("VOICE_CLONE_PROMPT",)
+        return inputs
+
+    def create_bank(self, **kwargs):
+        bank = {}
+        for i in range(1, 9):
+            name = (kwargs.get(f"role_name_{i}") or "").strip()
+            prompt = kwargs.get(f"prompt_{i}")
+            if name and prompt is not None:
+                bank[name] = prompt
+        return (bank,)
+
+
+def _voices_dir():
+    path = os.path.join(QWEN3_TTS_MODELS_DIR, "voices")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _write_wav_preview(path, audio):
+    """Best-effort .wav preview write - never fails the save. Prefers
+    torchaudio/soundfile when installed, falls back to a stdlib `wave`
+    16-bit PCM write so the node works on minimal installs too."""
+    try:
+        import numpy as np
+        import wave as wavmod
+        wave2d = audio["waveform"].detach().cpu()
+        sr = int(audio["sample_rate"])
+        if wave2d.dim() == 3:  # [B, C, T] -> [C, T]
+            wave2d = wave2d[0]
+        if wave2d.dim() == 1:
+            wave2d = wave2d[None]
+        try:
+            import torchaudio
+            torchaudio.save(path, wave2d.T.contiguous(), sr)
+        except Exception:  # no audio backend installed -> next fallback
+            try:
+                import soundfile as sf
+                sf.write(path, wave2d.T.numpy(), sr)
+            except Exception:  # not installed either -> stdlib 16-bit PCM
+                data = np.clip(wave2d.numpy(), -1.0, 1.0)
+                pcm = (data * 32767.0).astype("<i2")
+                with wavmod.open(path, "wb") as w:
+                    w.setnchannels(pcm.shape[0])
+                    w.setsampwidth(2)
+                    w.setframerate(sr)
+                    w.writeframes(pcm.T.tobytes())
+    except Exception as e:
+        logger.warning("Qwen3-TTS: could not write voice preview wav: %s", e)
+
+
+def _load_audio_file(path):
+    """Read a saved voice file into ([C, T] float tensor, sr). torchaudio /
+    soundfile cover every format; the stdlib fallback covers the .wav
+    previews this pack writes itself on backend-less installs."""
+    try:
+        import torchaudio
+        wave2d, sr = torchaudio.load(path)
+        return wave2d.float(), int(sr)
+    except Exception:
+        pass
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path, always_2d=True)
+        return torch.from_numpy(data.T).float(), int(sr)
+    except Exception:
+        pass
+    if path.lower().endswith(".wav"):
+        import numpy as np
+        import wave as wavmod
+        with wavmod.open(path, "rb") as w:
+            sr, ch = w.getframerate(), w.getnchannels()
+            raw = w.readframes(w.getnframes())
+        pcm = np.frombuffer(raw, dtype="<i2").reshape(-1, ch)
+        return torch.from_numpy(pcm.T.astype(np.float32) / 32768.0), int(sr)
+    raise RuntimeError(
+        f"Reading {os.path.basename(path)} needs torchaudio or soundfile "
+        f"installed (only .wav previews are readable without them).")
+
+
+class QwenTTSSaveVoice:
+    """Persist a voice-clone prompt (+ optional preview audio) to disk."""
+
+    CATEGORY = QWEN_TTS_CATEGORY
+    TITLE = "Qwen3-TTS Save Voice ⚡"
+    SEARCH_ALIASES = ['save voice', 'persist voice', 'voice bank', 'tts']
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    DESCRIPTION = ("Save a voice-clone prompt under models/Qwen3-TTS/voices/ "
+                   "as <name>.qvp (+ .json metadata and an optional .wav "
+                   "preview), for reuse with Qwen3-TTS Load Speaker.")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "voice_clone_prompt": ("VOICE_CLONE_PROMPT",),
+                "filename": ("STRING", {"default": "my_voice"}),
+            },
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Reference audio to save as a "
+                    ".wav preview alongside the prompt."}),
+                "ref_text": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Transcript stored in the .json metadata and "
+                               "restored by Load Speaker."}),
+            },
+        }
+
+    def save(self, voice_clone_prompt, filename, audio=None, ref_text=""):
+        import json
+        stem = os.path.splitext(os.path.basename(filename.strip()))[0]
+        if not stem:
+            raise ValueError("filename must not be empty.")
+        out_dir = _voices_dir()
+
+        qvp_path = os.path.join(out_dir, stem + ".qvp")
+        torch.save(voice_clone_prompt, qvp_path)
+
+        with open(os.path.join(out_dir, stem + ".json"), "w", encoding="utf-8") as f:
+            json.dump({"ref_text": ref_text.strip(), "source": "QwenTTSSaveVoice"},
+                      f, ensure_ascii=False, indent=2)
+
+        if audio is not None:
+            _write_wav_preview(os.path.join(out_dir, stem + ".wav"), audio)
+
+        logger.info("Qwen3-TTS: saved voice %r to %s", stem, out_dir)
+        return {}
+
+
+class QwenTTSLoadSpeaker:
+    """Load a saved voice (.wav preview + cached .qvp prompt) back."""
+
+    CATEGORY = QWEN_TTS_CATEGORY
+    TITLE = "Qwen3-TTS Load Speaker ⚡"
+    SEARCH_ALIASES = ['load voice', 'load speaker', 'voice bank', 'tts']
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT", "AUDIO", "STRING")
+    RETURN_NAMES = ("voice_clone_prompt", "audio", "ref_text")
+    FUNCTION = "load_speaker"
+    DESCRIPTION = ("Load a saved voice from models/Qwen3-TTS/voices/. "
+                   "Fast-loads the cached .qvp prompt and .json transcript "
+                   "when they exist; otherwise wire audio -> Voice Clone's "
+                   "ref_audio (the prompt output is then None).")
+
+    @classmethod
+    def INPUT_TYPES(s):
+        files = sorted(f for f in os.listdir(_voices_dir())
+                       if f.lower().endswith((".wav", ".mp3", ".flac")))
+        return {"required": {"filename": (files or ["<no saved voices>"],)}}
+
+    def load_speaker(self, filename):
+        import json
+        if filename.startswith("<"):
+            raise ValueError("No saved voices found under models/Qwen3-TTS/voices/.")
+
+        voices = _voices_dir()
+        stem = os.path.splitext(filename)[0]
+        wav_path = os.path.join(voices, filename)
+        if not os.path.isfile(wav_path):
+            raise ValueError(f"Saved voice {filename!r} not found.")
+
+        wave2d, sr = _load_audio_file(wav_path)
+        audio = {"waveform": wave2d[None], "sample_rate": sr}
+
+        ref_text = ""
+        json_path = os.path.join(voices, stem + ".json")
+        if os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    ref_text = (json.load(f) or {}).get("ref_text", "")
+            except Exception as e:
+                logger.warning("Qwen3-TTS: could not read %s.json: %s", stem, e)
+
+        prompt_items = None
+        qvp_path = os.path.join(voices, stem + ".qvp")
+        if os.path.isfile(qvp_path):
+            try:
+                # weights_only=False is required: the .qvp holds
+                # qwen_tts.VoiceClonePromptItem objects, not plain tensors.
+                # Only ever load .qvp files you saved yourself.
+                prompt_items = torch.load(qvp_path, map_location="cpu",
+                                          weights_only=False)
+            except Exception as e:
+                logger.warning("Qwen3-TTS: could not fast-load %s.qvp (%s) - "
+                               "the prompt output stays None", stem, e)
+
+        logger.info("Qwen3-TTS: loaded saved voice %r (prompt=%s)",
+                    filename, "yes" if prompt_items is not None else "no")
+        return (prompt_items, audio, ref_text)
+
+
 NODE_CLASS_MAPPINGS = {
     "QwenTTSModelsLoader": QwenTTSModelsLoader,
     "QwenTTSCustomVoiceGenerate": QwenTTSCustomVoiceGenerate,
+    "QwenTTSVoiceCloneGenerate": QwenTTSVoiceCloneGenerate,
+    "QwenTTSVoiceDesignGenerate": QwenTTSVoiceDesignGenerate,
+    "QwenTTSVoiceClonePrompt": QwenTTSVoiceClonePrompt,
+    "QwenTTSRoleBank": QwenTTSRoleBank,
+    "QwenTTSSaveVoice": QwenTTSSaveVoice,
+    "QwenTTSLoadSpeaker": QwenTTSLoadSpeaker,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenTTSModelsLoader": QwenTTSModelsLoader.TITLE,
     "QwenTTSCustomVoiceGenerate": QwenTTSCustomVoiceGenerate.TITLE,
+    "QwenTTSVoiceCloneGenerate": QwenTTSVoiceCloneGenerate.TITLE,
+    "QwenTTSVoiceDesignGenerate": QwenTTSVoiceDesignGenerate.TITLE,
+    "QwenTTSVoiceClonePrompt": QwenTTSVoiceClonePrompt.TITLE,
+    "QwenTTSRoleBank": QwenTTSRoleBank.TITLE,
+    "QwenTTSSaveVoice": QwenTTSSaveVoice.TITLE,
+    "QwenTTSLoadSpeaker": QwenTTSLoadSpeaker.TITLE,
 }

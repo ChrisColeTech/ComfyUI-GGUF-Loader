@@ -329,7 +329,15 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ComfyU
 
 The loader always loads with `local_files_only=True` — no network access once the files are on disk. `speaker` is a built-in named voice baked into the checkpoint (e.g. `"Dylan"`); an unknown name raises an error listing every valid one. `instruct` is real model-native conditioning on the 1.7B checkpoint, but the 0.6B checkpoint silently drops it upstream — this node logs a warning instead of reproducing that silence. Needs the optional `qwen-tts` dependency (already in `requirements.txt`).
 
-`tools/smoke_qwen_tts.py` stubs `folder_paths` and `qwen_tts.Qwen3TTSModel` and validates path discovery, loader kwargs/caching, and the generate node's seeding/AUDIO-dict/unload logic — no GPU or real weights required.
+Six more nodes ported from the same pack's newer revision round out the family (all sharing the one **Qwen3-TTS Models Loader** — each generation mode is bound to a checkpoint family, and the nodes enforce that pairing up front with a clear error: clone → `*-Base`, design → `*-VoiceDesign`, built-in speakers → `*-CustomVoice`):
+
+- **Qwen3-TTS Voice Clone** — clone a reference voice onto new text. Connect `ref_audio` (any Comfy `AUDIO`, stereo is downmixed, sub-1024-sample clips zero-padded) *or* a reusable `voice_clone_prompt`; the prompt wins when both are connected. Optional `instruct` styling and `x_vector_only`.
+- **Qwen3-TTS Voice Clone Prompt** — extract the reusable `VOICE_CLONE_PROMPT` features from reference audio once, then reuse them across any number of generations without re-encoding the audio.
+- **Qwen3-TTS Voice Design** — describe a voice in text (`instruct`, e.g. *"a deep male voice with a calm tone"*) and speak the target text with it.
+- **Qwen3-TTS Role Bank** — collect up to 8 named `VOICE_CLONE_PROMPT`s into one bank for multi-role dialogue workflows (slots without a connected prompt are skipped).
+- **Qwen3-TTS Save Voice** / **Qwen3-TTS Load Speaker** — persist a prompt under `models/Qwen3-TTS/voices/` as `<name>.qvp` + `.json` (transcript) + `.wav` preview, and load it back (fast-loading the cached `.qvp` and restoring the transcript; the audio output works standalone as a Voice Clone `ref_audio` when no `.qvp` exists). The wav write/read prefers torchaudio/soundfile and falls back to a stdlib 16-bit PCM path, so the round-trip needs no audio backend installed.
+
+`tools/smoke_qwen_tts.py` stubs `folder_paths` and `qwen_tts.Qwen3TTSModel` and validates path discovery, loader kwargs/caching, the generate node's seeding/AUDIO-dict/unload logic, the new nodes' family checks/audio conversion/kwargs, and the save/load round-trip — no GPU or real weights required. The full chain (CustomVoice reference speech → prompt extraction → save/load → clone from the *saved* prompt → role bank → voice design) is verified end-to-end against real checkpoints on every port.
 
 ### MiniMax Music 3
 
