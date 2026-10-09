@@ -14,14 +14,24 @@ else:
         "Quantized and caffeinated!",
     ]
 
-    print(
+    def _banner(*lines):
+        # A piped/cp1252 stdout cannot encode the emoji; a failed print here
+        # would take the entire pack's import down with it. Fall back to an
+        # ASCII banner instead of crashing node registration.
+        try:
+            for line in lines:
+                print(line)
+        except UnicodeEncodeError:
+            import re
+            for line in lines:
+                print(re.sub(r"[^\x20-\x7e]", "", line))
+
+    _banner(
         f"\033[1;34m[CCTech Suite]: 🤖🤖🤖 \033[96m\033[3m"
-        f"{random.choice(tech_rambling)}\033[0m 🤖🤖🤖"
-    )
-    print(
+        f"{random.choice(tech_rambling)}\033[0m 🤖🤖🤖",
         f"\033[1;34m[CCTech Suite]:\033[0m Activated "
         f"\033[96m{len(NODE_CLASS_MAPPINGS)}\033[0m GGUF loader nodes "
-        f"(🤖 CCTech/GGUF)."
+        f"(🤖 CCTech/GGUF).",
     )
 
     WEB_DIRECTORY = "./web"

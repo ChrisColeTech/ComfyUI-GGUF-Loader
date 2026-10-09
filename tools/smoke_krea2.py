@@ -105,6 +105,40 @@ latent_preview_mod.prepare_callback = lambda model, steps: None
 
 comfy_utils.PROGRESS_BAR_ENABLED = False
 
+# nodes/krea2.py imports comfy.conds for the Ostris reference-latent
+# conditioning (CONDList); stub the same surface the real conds.py has.
+comfy_conds = types.ModuleType("comfy.conds")
+
+
+class _FakeCONDList:
+    def __init__(self, cond):
+        self.cond = cond
+
+
+comfy_conds.CONDList = _FakeCONDList
+
+# Ostris-port imports: comfy.ldm.flux.math.apply_rope and
+# comfy.ldm.modules.attention.optimized_attention_masked.
+comfy_ldm_flux_math = types.ModuleType("comfy.ldm.flux.math")
+
+
+def _fake_apply_rope(q, k, pe, *args, **kwargs):
+    return q, k
+
+
+comfy_ldm_flux_math.apply_rope = _fake_apply_rope
+
+comfy_ldm_modules = types.ModuleType("comfy.ldm.modules")
+comfy_ldm_modules_attention = types.ModuleType("comfy.ldm.modules.attention")
+comfy_ldm_modules_attention.optimized_attention_masked = lambda *a, **k: a[0]
+
+comfy_text_encoders = types.ModuleType("comfy.text_encoders")
+comfy_text_encoders_krea2 = types.ModuleType("comfy.text_encoders.krea2")
+comfy_text_encoders_krea2.KREA2_TEMPLATE = ""
+
+
+
+
 # node_helpers imports `from comfy.cli_args import args` at module level in
 # the real ComfyUI, too heavy to import directly offline - stub with a 1:1
 # reimplementation of the real conditioning_set_values (node_helpers.py).
@@ -129,10 +163,16 @@ def _conditioning_set_values(conditioning, values={}, append=False):
 node_helpers.conditioning_set_values = _conditioning_set_values
 
 sys.modules["comfy"] = comfy
+sys.modules["comfy.conds"] = comfy_conds
 sys.modules["comfy.ldm"] = comfy_ldm
 sys.modules["comfy.ldm.common_dit"] = comfy_ldm_common_dit
 sys.modules["comfy.ldm.flux"] = comfy_ldm_flux
 sys.modules["comfy.ldm.flux.layers"] = comfy_ldm_flux_layers
+sys.modules["comfy.ldm.flux.math"] = comfy_ldm_flux_math
+sys.modules["comfy.ldm.modules"] = comfy_ldm_modules
+sys.modules["comfy.ldm.modules.attention"] = comfy_ldm_modules_attention
+sys.modules["comfy.text_encoders"] = comfy_text_encoders
+sys.modules["comfy.text_encoders.krea2"] = comfy_text_encoders_krea2
 sys.modules["comfy.model_management"] = comfy_model_management
 sys.modules["comfy.patcher_extension"] = comfy_patcher_extension
 sys.modules["comfy.sd"] = comfy_sd

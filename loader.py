@@ -489,17 +489,25 @@ def gguf_mmproj_loader(path):
     tenc = os.path.splitext(tenc_fname)[0].lower()
     tenc = strip_quant_suffix(tenc)
 
-    # try and find matching mmproj
+    # try and find matching mmproj - same folder first, then one directory up
+    # (a "family/text_encoders/TE.gguf" + "family/mmproj.gguf" split layout
+    # must still auto-merge; only ONE level up so an unrelated family's
+    # mmproj in the models root can never match)
     target = []
     root = os.path.dirname(path)
-    for fname in os.listdir(root):
-        name, ext = os.path.splitext(fname)
-        if ext.lower() != ".gguf":
+    for root_dir in (root, os.path.dirname(root)):
+        if not root_dir or not os.path.isdir(root_dir):
             continue
-        if "mmproj" not in name.lower():
-            continue
-        if squash_name(tenc) in squash_name(name):
-            target.append(fname)
+        for fname in os.listdir(root_dir):
+            name, ext = os.path.splitext(fname)
+            if ext.lower() != ".gguf":
+                continue
+            if "mmproj" not in name.lower():
+                continue
+            if squash_name(tenc) in squash_name(name):
+                target.append(os.path.join(root_dir, fname))
+        if target:
+            break
 
     if len(target) == 0:
         logging.warning(f"Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}'); vision path will not work.")
@@ -507,8 +515,8 @@ def gguf_mmproj_loader(path):
     if len(target) > 1:
         logging.info(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
 
-    logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
-    return load_mmproj_sd(os.path.join(root, target[0]))
+    logging.info(f"Using mmproj '{os.path.basename(target[0])}' for text encoder '{tenc_fname}'.")
+    return load_mmproj_sd(target[0])
 
 def load_mmproj_sd(path):
     """Map an mmproj GGUF to the vision-tower keys comfy's VL TEs expect.

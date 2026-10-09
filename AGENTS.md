@@ -60,7 +60,8 @@ nodes` (unqualified, no dot) anywhere in the codebase means ComfyUI core's own g
 package despite the name collision.
 
 Reference ComfyUI checkout used for verification: `D:\Projects\ComfyUI\upstream\ComfyUI`
-(rev 155 / v0.32.0 era). Weights: `D:\models\image-models\scenema-audio` (the
+(2026-10-09: 08ff3c11 / v0.39.0 — same commit the N: portable runs, with
+transformers 5.17.0 + torch 2.14.0+cu130). Weights: `D:\models\image-models\scenema-audio` (the
 sidecar layout, `split/` subdirs). The original node pack lives at
 `D:\Projects\ComfyUI\ComfyUI-ScenemaAudio` (MIT, ScenemaAI); the pure-torch
 sidecar port at `D:\Projects\giga-videos\src\sidecar\vendor\pipelines\scenema_audio`.
@@ -3842,3 +3843,61 @@ clean WITH the docstring's crop stage - without it the appended green-fill
 reference decodes as tail garbage, same class as the v2v tail bug; docs
 were already correct). ComfyUI 2.5 exposes no reference_audio input -
 that path is giga-only on 2.5.
+
+## 2026-10-09 (v2.17.4) - verified against latest comfy upstream (v0.39.0) + transformers 5.17
+
+Pulled upstream to 08ff3c11 (v0.39.0, 344 commits new; includes the big
+comfy/ops.py Linear-forward consolidation, llama/gemma4 text-encoder
+rework, comfy-compiler, native LoRA stack nodes). The N: portable already
+runs this exact commit (its ComfyUI root is a git checkout), with
+transformers 5.17.0 + torch 2.14.0+cu130, so it doubles as the test target.
+
+Verification matrix (all against the real new comfy, CPU):
+- pack imports via comfy's own async `init_extra_nodes`: 74 nodes registered
+- pytest 127/128 (1 pre-existing skip); all 9 offline smokes; the 3
+  real-comfy smokes (smoke_ltx25, smoke_ltx23_vid2vid, smoke_ltx_reference)
+- real GGUF unet (Z-Image-Q6_K) through UnetLoaderGGUF: weights stay
+  quantized, single-layer forward is BIT-EXACT vs manual dequant - the
+  GGMLOps cast_bias_weight method-override surface still matches the new
+  comfy/ops.py internals (the module-level cast_bias_weight() was heavily
+  reworked upstream, but CastWeightBiasContext/manual_cast dispatch and the
+  forward_comfy_cast_weights hook are unchanged, so the pack's override
+  chain still lands)
+- real GGUF TE (krea2 Qwen3-VL-4B Q4_K_M) through CLIPLoaderGGUF:
+  encode_from_tokens -> (1, 11, 30720), the 12-layer stack Krea2 needs,
+  through the new llama.py forward with GGML dequant layers
+- real checkpoint GGUF (SenseNova-turbo-Q4_K_M) through
+  CheckpointLoaderGGUF: MODEL+CLIP+VAE all load, CLIP encode finite,
+  dequant forward exact
+
+Fixes:
+1. `__init__.py` banner: the emoji `print()` crashed the ENTIRE pack import
+   with UnicodeEncodeError whenever stdout is not UTF-8 (piped output,
+   cp1252 console - e.g. a server launched with redirected logs; the
+   portable's run_nvidia_gpu.bat sets no PYTHONUTF8). Banner now falls back
+   to an ASCII strip on encode failure. Found by running the pack import
+   through a pipe - it worked for the user only because a real console
+   window is UTF-8 on modern Python.
+2. `loader.py` gguf_mmproj_loader: the sibling-mmproj search only scanned
+   the TE's own directory; the real on-disk layout has the TE nested in
+   `krea2/text_encoders/` while the mmproj sits in `krea2/` - so the merge
+   silently never happened, comfy misdetect QWEN3_4B, and conditioning came
+   out 2560-wide (exact symptom of the 2026-08-26 arch-tag bug, different
+   cause). Now searches one directory up (ONLY one - an unrelated family's
+   mmproj in the models root can never match). Regression test added
+   (`test_mmproj_sibling_match_searches_parent_directory`, incl. the
+   two-levels-up must-NOT-match cap).
+3. `tools/smoke_krea2.py`: pre-existing harness gap (not upstream drift) -
+   the 2026-08-29 Ostris port added `comfy.conds`, `comfy.ldm.flux.math`,
+   `comfy.ldm.modules.attention`, and `comfy.text_encoders.krea2` imports
+   to nodes/krea2.py but this offline stub file was never updated, so it
+   had been failing since 08-29. All four stubs added; suite green again.
+
+Not touched (verified unchanged/intact upstream): transformers surface -
+`bytes_to_unicode` import in loader.py and every nodes/qwen_tts.py shim
+(check_model_inputs, ROPE_INIT_FUNCTIONS default, masking kwarg rename,
+legacy config defaults) still apply cleanly against 5.17.0; they are
+introspection-gated and inert when unneeded.
+
+Deployed to the N: portable by direct copy of __init__.py + loader.py
+(matches repo v2.17.4). Left uncommitted for review.

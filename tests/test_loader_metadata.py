@@ -204,6 +204,33 @@ def test_gguf_clip_loader_merges_mmproj_even_when_te_arch_is_the_base_llm_tag(tm
         "sibling mmproj file")
 
 
+def test_mmproj_sibling_match_searches_parent_directory(tmp_path):
+    # Real-world layout on the portable install: the TE sits in a nested
+    # "text_encoders" subfolder while the mmproj lives one directory up
+    # (krea2/text_encoders/Qwen3-VL-4B-Q4_K_M.gguf next to
+    # krea2/Qwen3-VL-4B-Instruct-mmproj-BF16.gguf). The matcher used to only
+    # scan the TE's own directory, so the merge silently never happened and
+    # comfy misdetected QWEN3_4B -> 2560-wide conditioning (the exact symptom
+    # of the arch-tag bug above, from a different cause). One level up only -
+    # an unrelated family's mmproj in the models root must never match.
+    te_dir = tmp_path / "text_encoders"
+    te_dir.mkdir()
+    te = te_dir / "Qwen3-VL-4B-Q4_K_M.gguf"
+    _write_te_gguf(te, "qwen3")
+    _write_qwen2vl_mmproj(tmp_path / "Qwen3-VL-4B-Instruct-mmproj-BF16.gguf")
+
+    vsd = loader.gguf_mmproj_loader(str(te))
+    assert vsd, "mmproj in the parent directory was not found"
+    assert any(k.startswith("visual.") for k in vsd)
+
+    # and the one-level cap: with the mmproj TWO directories up it must NOT match
+    deep = tmp_path / "a" / "text_encoders"
+    deep.mkdir(parents=True)
+    te2 = deep / "Qwen3-VL-4B-Q4_K_M.gguf"
+    _write_te_gguf(te2, "qwen3")
+    assert loader.gguf_mmproj_loader(str(te2)) == {}
+
+
 def test_squash_name_does_not_match_a_different_model(tmp_path):
     # Punctuation-insensitive must not become model-insensitive.
     te = tmp_path / "qwen3vl_4b_Q4_K_M.gguf"
