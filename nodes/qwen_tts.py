@@ -261,6 +261,13 @@ QWEN3_TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS")
 os.makedirs(QWEN3_TTS_MODELS_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("Qwen3-TTS", QWEN3_TTS_MODELS_DIR)
 
+# The other Qwen3-TTS node pack's model tree - searched first so models
+# downloaded by that pack are reused instead of re-downloaded, and registered
+# so extra_model_paths.yaml entries under the same key resolve too.
+_QTTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "qwen-tts")
+os.makedirs(_QTTS_MODELS_DIR, exist_ok=True)
+folder_paths.add_model_folder_path("qwen-tts", _QTTS_MODELS_DIR)
+
 # Known repo_id -> local folder name. Matches DarioFT/ComfyUI-Qwen3-TTS's
 # mapping so a folder downloaded by either pack is interchangeable.
 QWEN3_TTS_MODELS = {
@@ -541,33 +548,229 @@ class QwenTTSCustomVoiceGenerate:
         return (audio,)
 
 
-def _model_family(qwen_tts_model):
-    """Family token in the loaded model's name (CustomVoice/VoiceDesign/Base).
+# ─────────────────────────────────────────────────────────────────────────────
+# Faithful ports of flybirdxx/ComfyUI-Qwen-TTS's self-contained nodes. Each
+# model-using node loads its own checkpoint family (Base / VoiceDesign) via
+# `model_choice` + `device` + `precision` + `attention` widgets, exactly like
+# the source pack; the download / HF-cache-migration / transformers-5 shims
+# underneath are this pack's own (E2E-proven) plumbing.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    None for names carrying no known family token - a local_model_path or
-    fine-tuned checkpoint we cannot classify by name.
-    """
-    name = (qwen_tts_model.get("name") or "").lower()
-    for family in ("customvoice", "voicedesign", "base"):
-        if family in name:
-            return family
-    return None
+# flybirdxx's UI language list, in their exact order.
+_DEMO_LANGUAGES = ["Auto", "Chinese", "English", "Japanese", "Korean",
+                   "French", "German", "Spanish", "Portuguese", "Russian",
+                   "Italian"]
+
+_LANGUAGE_MAP = {name: name.lower() for name in _DEMO_LANGUAGES if name != "Auto"}
+
+_ATTENTION_OPTIONS = ["auto", "sage_attn", "flash_attn", "sdpa", "eager"]
+
+_QWEN_HF_MODEL_MAP = {
+    ("Base", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    ("Base", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    ("VoiceDesign", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    ("CustomVoice", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    ("CustomVoice", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+}
 
 
-def _require_family(qwen_tts_model, wanted, action):
-    """The upstream package deliberately binds each generation mode to one
-    checkpoint family (clone -> Base, design -> VoiceDesign, built-in
-    speakers -> CustomVoice). Enforce the same pairing up front with a clear
-    error instead of failing somewhere inside the model. Unrecognizable names
-    (local_model_path/fine-tunes) pass through unchecked.
-    """
-    family = _model_family(qwen_tts_model)
-    if family is not None and family != wanted:
-        raise ValueError(
-            f"{action} needs a *-{wanted.capitalize()} checkpoint, but the "
-            f"models loader has {qwen_tts_model.get('name')!r} (family "
-            f"{family!r}). Point Qwen3-TTS Models Loader at a *-"
-            f"{wanted.capitalize()} repo.")
+def _available_attentions():
+    available = []
+    try:
+        from sageattention import sageattn  # noqa: F401
+        available.append("sage_attn")
+    except ImportError:
+        pass
+    try:
+        import flash_attn  # noqa: F401
+        available.append("flash_attn")
+    except ImportError:
+        pass
+    available.append("sdpa")
+    available.append("eager")
+    return available
+
+
+def _resolve_attention_choice(selection, device):
+    """flybirdxx's attention resolution: auto picks by priority, a requested
+    implementation falls back to sdpa when not installed, and pre-Ampere
+    CUDA is forced to eager (kernel availability)."""
+    if device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
+        return "eager"
+    available = _available_attentions()
+    if selection == "auto":
+        for attn in ("sage_attn", "flash_attn", "sdpa", "eager"):
+            if attn in available:
+                return attn
+        return "eager"
+    if selection in available:
+        return selection
+    logger.warning("Qwen3-TTS: requested attention %r is not available, "
+                   "falling back to sdpa", selection)
+    return "sdpa" if "sdpa" in available else "eager"
+
+
+def _load_qwen_model(model_type, model_choice, device, precision, attention,
+                     custom_model_path=None):
+    """flybirdxx's load_qwen_model behavior on this pack's plumbing: device
+    auto-resolution, pre-Ampere bf16 fallback, local-model search across both
+    pack trees (models/qwen-tts first), HF snapshot download when missing,
+    single-slot model cache, and the sage-attention module patch."""
+    if model_type == "VoiceDesign" and model_choice == "0.6B":
+        raise RuntimeError("VoiceDesign only supports 1.7B models!")
+
+    if device == "auto":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+    if device == "cuda" and precision == "bf16" and torch.cuda.get_device_capability()[0] < 8:
+        logger.warning("Qwen3-TTS: native bf16 unavailable on this GPU; using fp32")
+        precision = "fp32"
+    attn_impl = _resolve_attention_choice(attention, device)
+
+    if device == "mps":
+        dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    else:
+        dtype = torch.bfloat16 if precision == "bf16" else torch.float32
+
+    if device == "cuda":
+        device_map = "cuda"
+    elif device == "xpu":
+        device_map = {"": "xpu:0"}
+    elif device == "mps":
+        device_map = "mps"
+    else:
+        device_map = "cpu"
+
+    cache_key = (model_type, model_choice, device, precision, attn_impl,
+                 custom_model_path)
+    if cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]["model"]
+
+    if device == "cuda":  # fail on a broken CUDA setup before weights load
+        try:
+            torch.zeros(1, device="cuda", dtype=torch.float32).add_(1)
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            major, minor = torch.cuda.get_device_capability()
+            raise RuntimeError(
+                f"CUDA kernels cannot run on {torch.cuda.get_device_name()} "
+                f"(compute capability {major}.{minor}). Use device='cpu', "
+                f"precision='fp32', attention='eager' instead. "
+                f"Original error: {e}") from e
+
+    source = None
+    custom_model_path = (custom_model_path or "").strip()
+    if custom_model_path:
+        if os.path.isdir(custom_model_path):
+            if not os.path.isdir(os.path.join(custom_model_path, "speech_tokenizer")):
+                raise ValueError(
+                    f"custom_model_path {custom_model_path!r} has no "
+                    f"speech_tokenizer/ subfolder - it is not a full Qwen3-TTS "
+                    f"model folder.")
+            source = custom_model_path
+        else:
+            logger.warning("Qwen3-TTS: custom model path not found or "
+                           "invalid: %s", custom_model_path)
+
+    if source is None:
+        # search the flybirdxx tree first, then ours (both folder layouts hold
+        # the same <size>-<family> folder names)
+        for root in (_QTTS_MODELS_DIR, QWEN3_TTS_MODELS_DIR):
+            for d in os.listdir(root) if os.path.isdir(root) else []:
+                cand = os.path.join(root, d)
+                if os.path.isdir(cand) and model_choice in d and model_type.lower() in d.lower():
+                    source = cand
+                    break
+            if source:
+                break
+    if source is None:
+        repo_id = _QWEN_HF_MODEL_MAP.get((model_type, model_choice))
+        if repo_id is None:
+            raise ValueError(
+                f"No local {model_type} {model_choice} model found and no "
+                f"HuggingFace repo is known for that combination.")
+        source = _get_local_model_path(repo_id)
+        if not (os.path.isdir(source) and os.listdir(source)):
+            source = _download_model(repo_id, "HuggingFace")
+
+    attn_param = {"flash_attn": "flash_attention_2", "sdpa": "sdpa",
+                  "eager": "eager"}.get(attn_impl)
+
+    try:
+        if attn_impl == "sage_attn":
+            from sageattention import sageattn
+            model = Qwen3TTSModel.from_pretrained(source, device_map=device_map,
+                                                  dtype=dtype)
+            patched = 0
+            for name, module in model.model.named_modules():
+                if "Attention" in type(module).__name__ or "attn" in name.lower():
+                    try:
+                        original_forward = module.forward
+
+                        def make_sage_forward(orig_forward, *args, **kwargs):
+                            def sage_forward(*a, **kw):
+                                if len(a) >= 3:
+                                    return sageattn(a[0], a[1], a[2],
+                                                    is_causal=False,
+                                                    attn_mask=kw.get("attention_mask"))
+                                return orig_forward(*a, **kw)
+                            return sage_forward
+
+                        module.forward = make_sage_forward(original_forward)
+                        patched += 1
+                    except Exception:
+                        pass
+            logger.info("Qwen3-TTS: patched %d attention modules with "
+                        "sage_attn", patched)
+        elif attn_param:
+            model = Qwen3TTSModel.from_pretrained(
+                source, device_map=device_map, dtype=dtype,
+                attn_implementation=attn_param)
+        else:
+            model = Qwen3TTSModel.from_pretrained(
+                source, device_map=device_map, dtype=dtype)
+    except Exception as e:
+        if attn_impl == "eager":
+            raise
+        logger.warning("Qwen3-TTS: %s failed (%s); reloading with eager "
+                       "attention", attn_impl, e)
+        model = Qwen3TTSModel.from_pretrained(
+            source, device_map=device_map, dtype=dtype,
+            attn_implementation="eager")
+
+    logger.info("Qwen3-TTS: loaded %s (%s, %s, %s, attn=%s)",
+                os.path.basename(source), model_type, model_choice, device,
+                attn_impl)
+    _MODEL_CACHE.clear()  # single-slot, like the source pack
+    bundle = {"model": model, "key": cache_key, "name": source}
+    _MODEL_CACHE[cache_key] = bundle
+    return model
+
+
+def _seed_everything(seed):
+    torch.manual_seed(seed)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    import numpy as np
+    np.random.seed(seed % (2 ** 32))
+
+
+def _mapped_language(language):
+    # flybirdxx passes their map's lowercase strings ("auto" for Auto); the
+    # pip package's proven contract for "no preference" is None, so Auto ->
+    # None and everything else keeps the mapped lowercase string.
+    if language == "Auto" or language is None:
+        return None
+    return _LANGUAGE_MAP.get(language, language.lower())
 
 
 def _ref_audio_to_tuple(audio):
@@ -607,7 +810,12 @@ def _wavs_to_audio(wavs, sample_rate):
 
 
 class QwenTTSVoiceCloneGenerate:
-    """Clone a reference voice (AUDIO or a cached prompt) onto target text."""
+    """Clone a reference voice (AUDIO or a cached prompt) onto target text.
+
+    Faithful port of flybirdxx's VoiceCloneNode: the node loads its own
+    *-Base checkpoint from `model_choice` + `device` + `precision` +
+    `attention`, so there is no upstream model wiring to get wrong.
+    """
 
     CATEGORY = QWEN_TTS_CATEGORY
     TITLE = "Qwen3-TTS Voice Clone ⚡"
@@ -615,81 +823,91 @@ class QwenTTSVoiceCloneGenerate:
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     DESCRIPTION = ("Clone a voice from reference audio (or a reusable "
-                   "voice-clone prompt) and speak the target text. Needs a "
-                   "*-Base checkpoint in the models loader.")
+                   "voice-clone prompt) and speak the target text. Uses a "
+                   "*-Base checkpoint, loaded in-node.")
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "qwen_tts_model": ("QWEN_TTS_MODEL",),
-                "text": ("STRING", {"multiline": True, "default": "Hello world"}),
-                "language": (CUSTOM_VOICE_LANGUAGES, {"default": "Auto"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
-                                 "control_after_generate": True}),
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
-                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "top_k": ("INT", {"default": 50, "min": 0, "max": 500}),
-                "temperature": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 0.5, "max": 5.0, "step": 0.01}),
+                "target_text": ("STRING", {"multiline": True, "default":
+                    "Good one. Okay, fine, I'm just gonna leave this sock "
+                    "monkey here. Goodbye."}),
+                "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "language": (_DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
-                "ref_audio": ("AUDIO", {"tooltip": "Reference audio to clone "
-                    "from. Ignored when voice_clone_prompt is connected."}),
+                "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "",
-                    "tooltip": "Transcript of the reference audio (optional, "
-                               "improves clone quality)."}),
+                    "placeholder": "Reference audio text (optional)"}),
                 "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip":
-                    "Reusable prompt from Qwen3-TTS Voice Clone Prompt (or "
-                    "Qwen3-TTS Load Speaker). Takes precedence over ref_audio."}),
+                    "Reusable voice clone prompt from Qwen3-TTS Voice Clone "
+                    "Prompt (or Load Speaker). Takes precedence over ref_audio."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                 "control_after_generate": True}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                    "tooltip": "Nucleus sampling probability"}),
+                "top_k": ("INT", {"default": 50, "min": 0, "max": 100, "step": 1,
+                                  "tooltip": "Top-k sampling parameter"}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05,
+                                                 "tooltip": "Penalty for repetition"}),
                 "x_vector_only": ("BOOLEAN", {"default": False, "tooltip":
-                    "Only use the speaker embedding (ref_text not needed)."}),
+                    "If True, only the speaker embedding is used (ref_text not needed)."}),
                 "instruct": ("STRING", {"multiline": True, "default": "",
-                    "tooltip": "Optional style/emotion instruction."}),
-                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
+                    "placeholder": "Optional style/emotion, e.g. 'say it angrily'"}),
+                "attention": (_ATTENTION_OPTIONS, {"default": "auto",
+                                                   "tooltip": "Attention implementation"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Unload model from memory after generation"}),
+                "custom_model_path": ("STRING", {"default": "",
+                    "placeholder": "Absolute path to local fine-tuned model"}),
             },
         }
 
-    def generate(self, qwen_tts_model, text, language, seed, max_new_tokens,
-                 top_p, top_k, temperature, repetition_penalty,
-                 ref_audio=None, ref_text="", voice_clone_prompt=None,
-                 x_vector_only=False, instruct="", unload_model_after_generate=False):
-        _require_family(qwen_tts_model, "base", "Voice cloning")
-        model = qwen_tts_model["model"]
+    def generate(self, target_text, model_choice, device, precision, language,
+                 ref_audio=None, ref_text="", voice_clone_prompt=None, seed=0,
+                 max_new_tokens=2048, top_p=1.0, top_k=50, temperature=0.9,
+                 repetition_penalty=1.05, x_vector_only=False, instruct="",
+                 attention="auto", unload_model_after_generate=False,
+                 custom_model_path=""):
+        if ref_audio is None and voice_clone_prompt is None:
+            raise RuntimeError("Either reference audio or voice clone prompt is required")
 
-        prompt_param = None
+        model = _load_qwen_model("Base", model_choice, device, precision,
+                                 attention, custom_model_path)
+
+        _seed_everything(seed)
+
         ref_tuple = None
-        if voice_clone_prompt is not None:
-            prompt_param = voice_clone_prompt
-        elif ref_audio is not None:
+        if voice_clone_prompt is None and ref_audio is not None:
             ref_tuple = _ref_audio_to_tuple(ref_audio)
-        else:
-            raise ValueError(
-                "Connect either ref_audio or voice_clone_prompt - voice "
-                "cloning needs a voice to clone from.")
 
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        try:
+            wavs, sample_rate = model.generate_voice_clone(
+                text=target_text,
+                language=_mapped_language(language),
+                ref_audio=ref_tuple,
+                ref_text=ref_text if ref_text and ref_text.strip() else None,
+                voice_clone_prompt=voice_clone_prompt,
+                x_vector_only_mode=x_vector_only,
+                instruct=instruct if instruct and instruct.strip() else None,
+                max_new_tokens=max_new_tokens,
+                top_p=top_p, top_k=top_k, temperature=temperature,
+                repetition_penalty=repetition_penalty,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Generation failed: {e}") from e
 
-        wavs, sample_rate = model.generate_voice_clone(
-            text=text,
-            language=None if language == "Auto" else language,
-            ref_audio=ref_tuple,
-            ref_text=ref_text.strip() or None,
-            voice_clone_prompt=prompt_param,
-            x_vector_only_mode=x_vector_only,
-            instruct=instruct.strip() or None,
-            max_new_tokens=max_new_tokens,
-            top_p=top_p, top_k=top_k, temperature=temperature,
-            repetition_penalty=repetition_penalty,
-        )
         audio = _wavs_to_audio(wavs, sample_rate)
         logger.info("Qwen3-TTS: voice-clone generated %s @ %d Hz",
                     tuple(audio["waveform"].shape), sample_rate)
 
         if unload_model_after_generate:
-            _MODEL_CACHE.pop(qwen_tts_model["key"], None)
+            _MODEL_CACHE.clear()
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -698,57 +916,69 @@ class QwenTTSVoiceCloneGenerate:
 
 
 class QwenTTSVoiceDesignGenerate:
-    """Describe a voice in text (instruct) and speak the target text with it."""
+    """Describe a voice in text (instruct) and speak the target text with it.
+
+    Faithful port of flybirdxx's VoiceDesignNode - loads its own
+    *-VoiceDesign checkpoint (1.7B only) in-node.
+    """
 
     CATEGORY = QWEN_TTS_CATEGORY
     TITLE = "Qwen3-TTS Voice Design ⚡"
     SEARCH_ALIASES = ['voice design', 'describe voice', 'tts', 'speech', 'generate audio']
     RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
     FUNCTION = "generate"
-    DESCRIPTION = ("Design a voice from a text description (instruct, e.g. "
-                   "'a deep male voice with a calm tone') and speak the text "
-                   "with it. Needs a *-VoiceDesign checkpoint.")
+    DESCRIPTION = ("Generate a voice from a text description (instruct) and "
+                   "speak the text with it. Uses the *-VoiceDesign 1.7B "
+                   "checkpoint, loaded in-node.")
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "qwen_tts_model": ("QWEN_TTS_MODEL",),
-                "text": ("STRING", {"multiline": True, "default": "Hello world"}),
+                "text": ("STRING", {"multiline": True, "default": "Hello world",
+                                    "placeholder": "Enter text to synthesize"}),
                 "instruct": ("STRING", {"multiline": True, "default": "",
-                    "tooltip": "Voice description, e.g. 'a warm female voice "
-                               "with an energetic tone'. Required for voice "
-                               "design."}),
-                "language": (CUSTOM_VOICE_LANGUAGES, {"default": "Auto"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
-                                 "control_after_generate": True}),
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
-                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "top_k": ("INT", {"default": 50, "min": 0, "max": 500}),
-                "temperature": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 0.5, "max": 5.0, "step": 0.01}),
+                    "placeholder": "Style instruction (required for VoiceDesign)"}),
+                "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "language": (_DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
-                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                                 "control_after_generate": True}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                    "tooltip": "Nucleus sampling probability"}),
+                "top_k": ("INT", {"default": 50, "min": 0, "max": 100, "step": 1,
+                                  "tooltip": "Top-k sampling parameter"}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.1, "max": 2.0, "step": 0.1,
+                                          "tooltip": "Sampling temperature"}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05,
+                                                 "tooltip": "Penalty for repetition"}),
+                "attention": (_ATTENTION_OPTIONS, {"default": "auto",
+                                                   "tooltip": "Attention implementation"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Unload model from memory after generation"}),
             },
         }
 
-    def generate(self, qwen_tts_model, text, instruct, language, seed,
-                 max_new_tokens, top_p, top_k, temperature, repetition_penalty,
+    def generate(self, text, instruct, model_choice, device, precision,
+                 language, seed=0, max_new_tokens=2048, top_p=1.0, top_k=50,
+                 temperature=0.9, repetition_penalty=1.05, attention="auto",
                  unload_model_after_generate=False):
-        _require_family(qwen_tts_model, "voicedesign", "Voice designing")
-        model = qwen_tts_model["model"]
+        if not text or not instruct:
+            raise RuntimeError("Text and instruction description are required")
 
-        if not text.strip() or not instruct.strip():
-            raise ValueError("Voice design needs both text and instruct.")
+        model = _load_qwen_model("VoiceDesign", model_choice, device,
+                                 precision, attention)
 
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        _seed_everything(seed)
 
         wavs, sample_rate = model.generate_voice_design(
             text=text,
-            language=None if language == "Auto" else language,
+            language=_mapped_language(language),
             instruct=instruct,
             max_new_tokens=max_new_tokens,
             top_p=top_p, top_k=top_k, temperature=temperature,
@@ -759,7 +989,7 @@ class QwenTTSVoiceDesignGenerate:
                     tuple(audio["waveform"].shape), sample_rate)
 
         if unload_model_after_generate:
-            _MODEL_CACHE.pop(qwen_tts_model["key"], None)
+            _MODEL_CACHE.clear()
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -768,7 +998,11 @@ class QwenTTSVoiceDesignGenerate:
 
 
 class QwenTTSVoiceClonePrompt:
-    """Extract reusable voice features from reference audio."""
+    """Extract reusable voice features from reference audio.
+
+    Faithful port of flybirdxx's VoiceClonePromptNode - loads its own
+    *-Base checkpoint in-node, same family Voice Clone uses.
+    """
 
     CATEGORY = QWEN_TTS_CATEGORY
     TITLE = "Qwen3-TTS Voice Clone Prompt ⚡"
@@ -776,39 +1010,55 @@ class QwenTTSVoiceClonePrompt:
     RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
     RETURN_NAMES = ("voice_clone_prompt",)
     FUNCTION = "create_prompt"
-    DESCRIPTION = ("Extract voice features from reference audio once and "
-                   "reuse them in Voice Clone / Role Bank / Save Voice. Needs "
-                   "a *-Base checkpoint (same family Voice Clone uses).")
+    DESCRIPTION = ("Extract and cache voice features from reference audio "
+                   "for reuse in the Voice Clone node. Uses a *-Base "
+                   "checkpoint, loaded in-node.")
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "qwen_tts_model": ("QWEN_TTS_MODEL",),
-                "ref_audio": ("AUDIO",),
+                "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "",
-                    "tooltip": "Transcript of the reference audio (optional, "
-                               "improves quality)."}),
+                    "placeholder": "Reference audio text (highly recommended for better quality)"}),
+                "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "attention": (_ATTENTION_OPTIONS, {"default": "auto",
+                                                   "tooltip": "Attention implementation"}),
             },
             "optional": {
                 "x_vector_only": ("BOOLEAN", {"default": False, "tooltip":
-                    "Only extract the speaker embedding (ref_text unused)."}),
+                    "If True, only speaker embedding is extracted (ref_text not needed)"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False,
+                    "tooltip": "Unload model from memory after generation"}),
             },
         }
 
-    def create_prompt(self, qwen_tts_model, ref_audio, ref_text,
-                      x_vector_only=False):
-        _require_family(qwen_tts_model, "base", "Voice-clone prompt extraction")
-        model = qwen_tts_model["model"]
+    def create_prompt(self, ref_audio, ref_text, model_choice, device,
+                      precision, attention, x_vector_only=False,
+                      unload_model_after_generate=False):
+        if ref_audio is None:
+            raise RuntimeError("Reference audio is required")
+
+        model = _load_qwen_model("Base", model_choice, device, precision,
+                                 attention)
         ref_tuple = _ref_audio_to_tuple(ref_audio)
 
         prompt_items = model.create_voice_clone_prompt(
             ref_audio=ref_tuple,
-            ref_text=ref_text.strip() or None,
+            ref_text=ref_text if ref_text and ref_text.strip() else None,
             x_vector_only_mode=x_vector_only,
         )
         logger.info("Qwen3-TTS: extracted voice-clone prompt (%s)",
                     type(prompt_items).__name__)
+
+        if unload_model_after_generate:
+            _MODEL_CACHE.clear()
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         return (prompt_items,)
 
 
@@ -844,7 +1094,9 @@ class QwenTTSRoleBank:
 
 
 def _voices_dir():
-    path = os.path.join(QWEN3_TTS_MODELS_DIR, "voices")
+    # flybirdxx's layout (models/qwen-tts/voices), so saved voices are
+    # interchangeable with the source pack's SaveVoice/LoadSpeaker nodes.
+    path = os.path.join(_QTTS_MODELS_DIR, "voices")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -919,7 +1171,7 @@ class QwenTTSSaveVoice:
     RETURN_TYPES = ()
     FUNCTION = "save"
     OUTPUT_NODE = True
-    DESCRIPTION = ("Save a voice-clone prompt under models/Qwen3-TTS/voices/ "
+    DESCRIPTION = ("Save a voice-clone prompt under models/qwen-tts/voices/ "
                    "as <name>.qvp (+ .json metadata and an optional .wav "
                    "preview), for reuse with Qwen3-TTS Load Speaker.")
 
@@ -969,7 +1221,7 @@ class QwenTTSLoadSpeaker:
     RETURN_TYPES = ("VOICE_CLONE_PROMPT", "AUDIO", "STRING")
     RETURN_NAMES = ("voice_clone_prompt", "audio", "ref_text")
     FUNCTION = "load_speaker"
-    DESCRIPTION = ("Load a saved voice from models/Qwen3-TTS/voices/. "
+    DESCRIPTION = ("Load a saved voice from models/qwen-tts/voices/. "
                    "Fast-loads the cached .qvp prompt and .json transcript "
                    "when they exist; otherwise wire audio -> Voice Clone's "
                    "ref_audio (the prompt output is then None).")

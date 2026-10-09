@@ -3990,3 +3990,65 @@ CPU E2E on the portable (scratch:
 RoleBank (2 roles) -> VoiceDesign (VoiceDesign 1.7B, auto-downloaded) - all
 finite, audible, first-run pass. 80 nodes registered total (74 -> 80).
 pytest 127/128 unchanged.
+## 2026-10-09 (v2.18.1) - Qwen3-TTS: faithful surfaces, replacing the bundle-based redesign
+
+User verdict on v2.18.0, delivered twice: "im confused, this isnt a faithful
+port. you completely changed the interfaces and options" and then a live
+workflow error - they wired the CustomVoice loader into Voice Clone (the
+model they had loaded) and my `_require_family` gate hard-blocked it
+("Voice cloning needs a *-Base checkpoint"). In flybirdxx''s design that
+failure MODE cannot exist: each node loads its own family checkpoint
+in-node. The v2.18.0 loader-bundle + family-gate design was mine, unasked -
+"port those nodes" meant the interfaces too, same standard as the original
+FB_Qwen3TTSCustomVoice port which kept flybirdxx''s surface verbatim.
+
+Reworked the three model nodes to flybirdxx''s exact INPUT_TYPES (widget
+names, defaults, min/max/step, placeholders, tooltips, option order):
+- Voice Clone: target_text/model_choice/device/precision/language required +
+  ref_audio/ref_text/voice_clone_prompt/seed/max_new_tokens/top_p/top_k/
+  temperature/repetition_penalty/x_vector_only/instruct/attention/
+  unload_model_after_generate/custom_model_path optional.
+- Voice Design: text/instruct/model_choice/device/precision/language +
+  sampling/attention/unload; their DEMO_LANGUAGES order and their
+  truthiness-based "Text and instruction description are required" guard;
+  0.6B rejected (their "VoiceDesign only supports 1.7B" rule).
+- Voice Clone Prompt: ref_audio/ref_text/model_choice/device/precision/
+  attention + x_vector_only/unload.
+- ATTENTION_OPTIONS includes sage_attn (their module-patch approach ported;
+  falls back to eager like theirs), flash_attn maps to flash_attention_2.
+
+`_load_qwen_model()` reproduces their loader behavior on our plumbing:
+device auto-resolution (xpu>cuda>mps>cpu), pre-Ampere bf16->fp32 and
+forced-eager, mps dtype quirk, CUDA-kernel sanity check with their plain
+error text, VoiceDesign/0.6B rejection, single-slot cache keyed on
+(family, size, device, precision, attn, custom path), local search across
+models/qwen-tts (their tree - now also registered for extra_model_paths)
+then models/Qwen3-TTS (ours - reuses what earlier E2Es already downloaded),
+HF snapshot download when found in neither, custom_model_path validated for
+speech_tokenizer/ (our addition - the pip package needs it and fails deep
+otherwise). Language: their lowercase map; "Auto" -> None because that is
+the pip package''s proven no-preference contract (their vendored package
+took the string "auto").
+
+Removed: `_require_family`/family gating (no longer reachable - the node
+cannot be given the wrong model), the `qwen_tts_model` input on all six.
+Voices dir moved to flybirdxx''s `models/qwen-tts/voices` (interops with
+the source pack''s Save/Load). `QwenTTSModelsLoader` +
+`QwenTTSCustomVoiceGenerate` unchanged (user-confirmed working, saved
+workflows depend on them); the loader''s bundle still carries a "name" key.
+
+Verification: offline smoke rewritten for the new surfaces (in-node model
+resolution: local search/cache reuse/single-slot eviction/attention
+fallback to sdpa; kwargs incl. instruct-verbatim and lowercase language;
+0.6B-design rejection; prompt precedence; padding; save/load in the new
+dir) - green on dev AND portable; pytest 127/128. Real-weights E2E on the
+portable (scratch: `%TEMP%\opencode\check_qwen_tts_faithful_e2e.py`): same
+chain as v2.18.0 through the NEW surfaces, byte-identical audio at the
+same seeds (clone 78720 samples peak 0.397, design 61440 peak 0.564) -
+the in-node loading found the already-downloaded checkpoints, no re-fetch.
+80 nodes unchanged.
+
+Lesson recorded (third occurrence of this shape: repo_id dropdown 08-24,
+EditAnything node-vs-toggle 08-28, now this): when the user says "port X
+from pack Y", the default is pack Y''s SURFACE plus our verified internals
+- never an interface redesign, however well-reasoned, without asking.

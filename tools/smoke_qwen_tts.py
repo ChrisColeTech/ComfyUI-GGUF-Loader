@@ -328,12 +328,23 @@ def test_rope_default_init_resolves_theta_from_all_config_shapes():
           "rope_parameters dict, and the 4.x default")
 
 
-def _bundle(family=None):
-    """A QWEN_TTS_MODEL bundle pointing at the fake model, named for the
-    family the generate nodes family-check against (None = unclassifiable
-    local/fine-tuned checkpoint name)."""
-    name = f"/models/Qwen3-TTS/fake-12Hz-1.7B-{family}" if family else "/fine-tune/my-voice-lora"
-    return {"model": _fake_model_instance, "key": ("k",), "name": name}
+def _populate_local_model(family, size="0.6B"):
+    """Pretend the flybirdxx-tree model folder exists (models/qwen-tts/...) so
+    `_load_qwen_model`'s local search finds it and never downloads."""
+    path = os.path.join(qt._QTTS_MODELS_DIR, f"Qwen3-TTS-12Hz-{size}-{family}")
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "config.json"), "w") as f:
+        f.write("{}")
+    return path
+
+
+def _clear_local_models():
+    import shutil
+    qt._MODEL_CACHE.clear()
+    if os.path.isdir(qt._QTTS_MODELS_DIR):
+        for d in os.listdir(qt._QTTS_MODELS_DIR):
+            if d != "voices":
+                shutil.rmtree(os.path.join(qt._QTTS_MODELS_DIR, d), ignore_errors=True)
 
 
 def _fake_audio_dict(stereo=False, samples=4410, sr=24000):
@@ -341,103 +352,139 @@ def _fake_audio_dict(stereo=False, samples=4410, sr=24000):
     return {"waveform": torch.randn(1, c, samples), "sample_rate": sr}
 
 
-def test_voice_clone_family_check():
+def test_model_loader_local_search_and_cache():
+    qt._MODEL_CACHE.clear()
+    _populate_local_model("Base")
     node = qt.QwenTTSVoiceCloneGenerate()
+    node.generate("hi", "0.6B", "cpu", "fp32", "Auto",
+                  ref_audio=_fake_audio_dict(samples=1200))
+    call = _qwen_tts_module.Qwen3TTSModel.from_pretrained.call_args
+    assert call.args[0].endswith("Qwen3-TTS-12Hz-0.6B-Base")
+    assert call.kwargs["attn_implementation"] == "sdpa"  # auto on a backend-less box
+    assert call.kwargs["dtype"] is torch.float32
+
+    calls_before = _qwen_tts_module.Qwen3TTSModel.from_pretrained.call_count
+    node.generate("hi again", "0.6B", "cpu", "fp32", "Auto",
+                  ref_audio=_fake_audio_dict(samples=1200))
+    assert _qwen_tts_module.Qwen3TTSModel.from_pretrained.call_count == calls_before
+    print("[ok] loader: local qwen-tts tree found, kwargs correct, cache reused")
+
+    # a different config evicts the single-slot cache (their unload semantics)
+    _populate_local_model("Base", "1.7B")
+    node.generate("hi", "1.7B", "cpu", "fp32", "Auto",
+                  ref_audio=_fake_audio_dict(samples=1200))
+    assert _qwen_tts_module.Qwen3TTSModel.from_pretrained.call_count == calls_before + 1
+    print("[ok] loader: changed model config reloads (single-slot cache)")
+    _clear_local_models()
+
+
+def test_voice_design_06b_is_rejected():
     try:
-        node.generate(_bundle("CustomVoice"), "hi", "Auto", 0, 2048, 1.0, 50,
-                      0.9, 1.05, ref_audio=_fake_audio_dict())
-    except ValueError as e:
-        assert "Base" in str(e)
-        print("[ok] voice clone: CustomVoice bundle rejected with a family error")
-    else:
-        raise AssertionError("expected ValueError")
-    # unclassifiable (local/fine-tuned) names pass through unchecked
-    node.generate(_bundle(None), "hi", "Auto", 0, 2048, 1.0, 50, 0.9, 1.05,
-                  ref_audio=_fake_audio_dict())
-    print("[ok] voice clone: unknown-family (local path) bundles pass through")
+        qt.QwenTTSVoiceDesignGenerate().generate(
+            "hi", "a voice", "0.6B", "cpu", "fp32", "Auto")
+    except RuntimeError as e:
+        assert "1.7B" in str(e)
+        print("[ok] voice design: 0.6B rejected (upstream: VoiceDesign is 1.7B only)")
+        return
+    raise AssertionError("expected RuntimeError")
 
 
 def test_voice_clone_requires_ref_audio_or_prompt():
-    node = qt.QwenTTSVoiceCloneGenerate()
+    _populate_local_model("Base")
     try:
-        node.generate(_bundle("Base"), "hi", "Auto", 0, 2048, 1.0, 50, 0.9, 1.05)
-    except ValueError as e:
-        assert "ref_audio" in str(e)
+        qt.QwenTTSVoiceCloneGenerate().generate(
+            "hi", "0.6B", "cpu", "fp32", "Auto")
+    except RuntimeError as e:
+        assert "reference audio or voice clone prompt" in str(e)
         print("[ok] voice clone: neither ref_audio nor prompt raises a clear error")
+        _clear_local_models()
         return
-    raise AssertionError("expected ValueError")
+    raise AssertionError("expected RuntimeError")
 
 
 def test_voice_clone_converts_comfyui_audio_and_kwargs():
+    qt._MODEL_CACHE.clear()
+    _populate_local_model("Base")
     node = qt.QwenTTSVoiceCloneGenerate()
-    (audio,) = node.generate(_bundle("Base"), "hello", "English", 7, 512,
-                             1.0, 50, 0.9, 1.05,
-                             ref_audio=_fake_audio_dict(stereo=True),
-                             ref_text="  ", x_vector_only=True, instruct=" calm ")
+    with patch.object(torch, "manual_seed") as seed_fn:
+        (audio,) = node.generate("hello", "0.6B", "cpu", "fp32", "English",
+                                 seed=7, max_new_tokens=512,
+                                 ref_audio=_fake_audio_dict(stereo=True),
+                                 ref_text="  ", x_vector_only=True,
+                                 instruct=" calm ")
+        seed_fn.assert_called_once_with(7)
     kw = _fake_model_instance.generate_voice_clone.call_args.kwargs
     wav, sr = kw["ref_audio"]
     assert isinstance(wav, np.ndarray) and wav.ndim == 1 and wav.dtype == np.float32
     assert sr == 24000
     assert kw["ref_text"] is None          # blank -> None (upstream contract)
-    assert kw["instruct"] == "calm"        # stripped, blank would be None
+    assert kw["instruct"] == " calm "      # kept verbatim, blank would be None
     assert kw["x_vector_only_mode"] is True
-    assert kw["language"] == "English"     # non-Auto passes through
+    assert kw["language"] == "english"     # flybirdxx's map lowercases
     assert audio["waveform"].shape == (1, 1, 4000) and audio["sample_rate"] == 24000
     print("[ok] voice clone: stereo AUDIO dict -> mono 1-D tuple, kwargs match upstream")
+    _clear_local_models()
 
 
 def test_voice_clone_prompt_wins_over_ref_audio():
+    qt._MODEL_CACHE.clear()
+    _populate_local_model("Base")
     node = qt.QwenTTSVoiceCloneGenerate()
-    node.generate(_bundle("Base"), "hi", "Auto", 0, 512, 1.0, 50, 0.9, 1.05,
+    node.generate("hi", "0.6B", "cpu", "fp32", "Auto",
                   ref_audio=_fake_audio_dict(),
                   voice_clone_prompt=["PROMPT_ITEMS"])
     kw = _fake_model_instance.generate_voice_clone.call_args.kwargs
     assert kw["voice_clone_prompt"] == ["PROMPT_ITEMS"] and kw["ref_audio"] is None
     print("[ok] voice clone: a connected prompt takes precedence over ref_audio")
+    _clear_local_models()
 
 
 def test_voice_clone_short_reference_is_padded():
+    qt._MODEL_CACHE.clear()
+    _populate_local_model("Base")
     node = qt.QwenTTSVoiceCloneGenerate()
-    node.generate(_bundle("Base"), "hi", "Auto", 0, 512, 1.0, 50, 0.9, 1.05,
+    node.generate("hi", "0.6B", "cpu", "fp32", "Auto",
                   ref_audio=_fake_audio_dict(samples=100))
     wav, _sr = _fake_model_instance.generate_voice_clone.call_args.kwargs["ref_audio"]
     assert wav.shape[0] == 1024  # upstream's own minimum
     print("[ok] voice clone: sub-1024-sample references are zero-padded")
+    _clear_local_models()
 
 
 def test_voice_clone_prompt_node_passes_through():
+    qt._MODEL_CACHE.clear()
+    _populate_local_model("Base")
     node = qt.QwenTTSVoiceClonePrompt()
-    (prompt,) = node.create_prompt(_bundle("Base"), _fake_audio_dict(), "the transcript")
+    (prompt,) = node.create_prompt(_fake_audio_dict(), "the transcript",
+                                   "0.6B", "cpu", "fp32", "auto")
     kw = _fake_model_instance.create_voice_clone_prompt.call_args.kwargs
     assert kw["ref_text"] == "the transcript" and kw["x_vector_only_mode"] is False
     assert prompt == ["PROMPT_ITEMS"]
     print("[ok] voice clone prompt: extraction kwargs + passthrough return")
+    _clear_local_models()
 
 
-def test_voice_design_requires_instruct_and_family():
+def test_voice_design_requires_instruct_and_generates():
+    qt._MODEL_CACHE.clear()
+    _populate_local_model("VoiceDesign", "1.7B")
     node = qt.QwenTTSVoiceDesignGenerate()
-    for kwargs, why in (
-        (dict(qwen_tts_model=_bundle("VoiceDesign"), text="hi", instruct="  "),
-         "blank instruct"),
-        (dict(qwen_tts_model=_bundle("CustomVoice"), text="hi", instruct="a voice"),
-         "wrong family"),
-    ):
-        try:
-            node.generate(unload_model_after_generate=False, seed=0,
-                          language="Auto", max_new_tokens=512, top_p=1.0,
-                          top_k=50, temperature=0.9, repetition_penalty=1.05,
-                          **kwargs)
-        except ValueError:
-            print(f"[ok] voice design: rejects {why}")
-            continue
-        raise AssertionError(f"expected ValueError for {why}")
-    (audio,) = node.generate(_bundle("VoiceDesign"), "hello there",
-                             "a deep calm male voice", "Auto", 3, 512,
+    try:
+        node.generate("hi", "", "1.7B", "cpu", "fp32", "Auto")
+    except RuntimeError as e:
+        assert "required" in str(e)
+        print("[ok] voice design: blank instruct rejected")
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    (audio,) = node.generate("hello there", "a deep calm male voice",
+                             "1.7B", "cpu", "fp32", "English", 3, 512,
                              1.0, 50, 0.9, 1.05)
     kw = _fake_model_instance.generate_voice_design.call_args.kwargs
-    assert kw["instruct"] == "a deep calm male voice" and kw["language"] is None
+    assert kw["instruct"] == "a deep calm male voice"
+    assert kw["language"] == "english"      # mapped lowercase; Auto would be None
     assert audio["waveform"].shape == (1, 1, 4000)
-    print("[ok] voice design: valid call forwards instruct + Auto->None language")
+    print("[ok] voice design: valid call forwards instruct + mapped language")
+    _clear_local_models()
 
 
 def test_role_bank_collects_named_prompts_and_skips_empty():
@@ -506,13 +553,14 @@ if __name__ == "__main__":
     test_generate_wrong_model_type_error_is_remapped()
     test_instruct_drop_warning_fires_for_06b_size_string()
     test_rope_default_init_resolves_theta_from_all_config_shapes()
-    test_voice_clone_family_check()
+    test_model_loader_local_search_and_cache()
+    test_voice_design_06b_is_rejected()
     test_voice_clone_requires_ref_audio_or_prompt()
     test_voice_clone_converts_comfyui_audio_and_kwargs()
     test_voice_clone_prompt_wins_over_ref_audio()
     test_voice_clone_short_reference_is_padded()
     test_voice_clone_prompt_node_passes_through()
-    test_voice_design_requires_instruct_and_family()
+    test_voice_design_requires_instruct_and_generates()
     test_role_bank_collects_named_prompts_and_skips_empty()
     test_save_and_load_speaker_roundtrip()
     print("[ok] all nodes_qwen_tts smoke tests passed")
