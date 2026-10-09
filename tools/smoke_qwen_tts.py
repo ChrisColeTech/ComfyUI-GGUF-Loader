@@ -283,6 +283,48 @@ def test_instruct_drop_warning_fires_for_06b_size_string():
           "check, never raises on a missing attribute")
 
 
+def test_rope_default_init_resolves_theta_from_all_config_shapes():
+    # The restored ROPE_INIT_FUNCTIONS["default"] shim must resolve the base
+    # frequency from a flat rope_theta (qwen-tts's own configs), a
+    # rope_parameters dict (transformers' Mimi codec config - the speech
+    # tokenizer's AutoModel pulls it in and its weight init routes through
+    # this entry; a bare config.rope_theta read crashed from_pretrained with
+    # AttributeError: 'MimiConfig' object has no attribute 'rope_theta'), and
+    # neither (transformers 4.x's 10000.0 default).
+    import math
+
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    fn = ROPE_INIT_FUNCTIONS.get("default")
+    assert fn is not None
+
+    def _invfreq_for_base(base, head_dim=8):
+        dim = head_dim
+        expo = torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float32) / dim
+        return 1.0 / (base ** expo)
+
+    # 1. flat rope_theta (qwen-tts's own config style)
+    cfg = types.SimpleNamespace(rope_theta=200.0, head_dim=8)
+    inv, scale = fn(config=cfg, device=None)
+    assert torch.allclose(inv, _invfreq_for_base(200.0)) and scale == 1.0
+
+    # 2. Mimi style: NO flat attribute, dict instead
+    cfg = types.SimpleNamespace(rope_parameters={"rope_theta": 500.0}, head_dim=8)
+    inv, _ = fn(config=cfg, device=None)
+    assert torch.allclose(inv, _invfreq_for_base(500.0))
+
+    # 3. neither -> transformers 4.x default
+    cfg = types.SimpleNamespace(head_dim=8)
+    inv, _ = fn(config=cfg, device=None)
+    assert torch.allclose(inv, _invfreq_for_base(10000.0))
+
+    # 4. head_dim fallback via hidden_size // num_attention_heads
+    cfg = types.SimpleNamespace(rope_theta=100.0, hidden_size=16, num_attention_heads=2)
+    inv, _ = fn(config=cfg, device=None)
+    assert torch.allclose(inv, _invfreq_for_base(100.0, head_dim=8))
+    print("[ok] rope default-init: theta resolved from flat attr, "
+          "rope_parameters dict, and the 4.x default")
+
+
 if __name__ == "__main__":
     assert qt.Qwen3TTSModel is not None, "qwen_tts stub failed to install"
     test_folder_registered_under_models_dir()
@@ -299,4 +341,5 @@ if __name__ == "__main__":
     test_generate_unload_clears_cache()
     test_generate_wrong_model_type_error_is_remapped()
     test_instruct_drop_warning_fires_for_06b_size_string()
+    test_rope_default_init_resolves_theta_from_all_config_shapes()
     print("[ok] all nodes_qwen_tts smoke tests passed")

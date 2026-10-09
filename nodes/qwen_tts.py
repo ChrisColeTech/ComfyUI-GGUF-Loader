@@ -103,16 +103,32 @@ def _patch_rope_default_init():
     ``rope_type == "default"`` whenever a config has no rope_scaling, which
     made model construction die with ``KeyError: 'default'``. Restore the
     standard theta-based default (ported from transformers 4.x's
-    modeling_rope_utils, Apache-2.0) under the same registry key. Inert if
-    a future transformers ships its own ``"default"`` entry again.
+    modeling_rope_utils, Apache-2.0) under the same registry key.
+
+    Later 5.x point releases restored their own ``"default"`` - but with a
+    bare ``config.rope_theta`` read that crashes on configs which keep the
+    base frequency elsewhere (transformers' own Mimi codec config stores it
+    in the ``rope_parameters`` dict; its weight init routes through this
+    entry during ``from_pretrained`` -> ``AttributeError: 'MimiConfig'
+    object has no attribute 'rope_theta'``). So a present-but-fragile entry
+    is probed and replaced too; inert once transformers ships a "default"
+    that handles those config shapes.
     """
+    import types as _types
+
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    if "default" in ROPE_INIT_FUNCTIONS:
-        return
-
     def _compute_default_rope_parameters(config=None, device=None, **kwargs):
-        base = config.rope_theta
+        # Resolve the base frequency wherever the config family keeps it:
+        # flat ``rope_theta`` (qwen-tts's own configs), the
+        # ``rope_parameters`` dict (Mimi), or the 4.x default.
+        base = getattr(config, "rope_theta", None)
+        if base is None:
+            params = getattr(config, "rope_parameters", None)
+            if isinstance(params, dict):
+                base = params.get("rope_theta")
+        if base is None:
+            base = 10000.0
         partial_rotary_factor = (getattr(config, "partial_rotary_factor", None)
                                  or 1.0)
         head_dim = getattr(config, "head_dim", None)
@@ -124,6 +140,16 @@ def _patch_rope_default_init():
             base ** (torch.arange(0, dim, 2, dtype=torch.int64)
                     .to(device=device, dtype=torch.float32) / dim))
         return inv_freq, 1.0
+
+    existing = ROPE_INIT_FUNCTIONS.get("default", None)
+    if existing is not None:
+        try:
+            # probe with a Mimi-shaped config: no flat rope_theta, no
+            # rope_parameters -> must fall back, never raise
+            existing(config=_types.SimpleNamespace(head_dim=8), device=None)
+            return  # handles every shape we know about - leave it alone
+        except Exception:
+            pass  # fragile (e.g. 5.17's bare config.rope_theta read)
 
     ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
 

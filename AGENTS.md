@@ -3901,3 +3901,38 @@ introspection-gated and inert when unneeded.
 
 Deployed to the N: portable by direct copy of __init__.py + loader.py
 (matches repo v2.17.4). Left uncommitted for review.
+## 2026-10-09 (v2.17.5) - Qwen3-TTS: real E2E against transformers 5.17 found the Mimi rope crash
+
+User hit `AttributeError: ''MimiConfig'' object has no attribute ''rope_theta''`
+from `QwenTTSModelsLoader` on the live server (transformers 5.17.0) - a path
+the v2.17.4 matrix never exercised for real: it checked the qwen_tts shims
+APPLY cleanly and the offline smoke passes, but never ran an actual
+`Qwen3TTSModel.from_pretrained` + generation against 5.17. Lesson repeated
+from every GPU-only arc in this file: import-clean is not load-clean;
+optional-dependency nodes need a real-weights E2E run against the CURRENT
+env, not the env they were written for.
+
+Mechanism, measured not guessed: during `from_pretrained`, transformers''
+Mimi codec (the speech tokenizer' AutoModel) initializes rotary modules via
+`ROPE_INIT_FUNCTIONS["default"]`. 5.15-era transformers REMOVED the entry
+(our shim filled it - the original bug surface); 5.17 RESTORED it with a
+bare `config.rope_theta` read, and `MimiConfig` keeps the base frequency in
+its `rope_parameters` DICT instead (modeling_mimi.py:541). So BOTH our old
+shim and stock 5.17 crash on Mimi configs - same AttributeError, two
+different owners. Fixed in `_patch_rope_default_init` (nodes/qwen_tts.py):
+- the restored `_compute_default_rope_parameters` resolves theta from flat
+  `rope_theta` (qwen-tts configs), the `rope_parameters` dict (Mimi), or
+  the 4.x 10000.0 default;
+- a present-but-fragile `"default"` entry is PROBED with a Mimi-shaped
+  synthetic config and replaced when it raises (5.17), not just a missing
+  one filled (5.15). Introspection-gated, inert once transformers ships a
+  default that handles all shapes.
+
+Verified for real this time: `tools/smoke_qwen_tts.py` gained
+`test_rope_default_init_resolves_theta_from_all_config_shapes` (flat/dict/
+default/head_dim-fallback math, run on BOTH dev 5.15 and portable 5.17),
+plus a real-weights CPU E2E on the portable: `QwenTTSModelsLoader.load` ->
+`QwenTTSCustomVoiceGenerate.generate` -> 1.84 s of finite, audible 24 kHz
+audio (peak 0.48). pytest 127/128 unchanged. Scratch scripts for the E2E:
+`%TEMP%\opencode\check_qwen_tts_e2e.py` (node-level) and
+`check_qwen_tts_load2.py` (package-level).
