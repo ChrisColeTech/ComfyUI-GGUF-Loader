@@ -270,6 +270,8 @@ class GGMLLayer(torch.nn.Module):
 # Comfy Kitchen with a packed-fp16 GEMM that outruns the device's fp32 one (gfx90c, gfx1010).
 _CK = (comfy.quant_ops.ck if getattr(comfy.quant_ops, "_CK_AVAILABLE", False)
        and hasattr(comfy.quant_ops.ck, "fp16_packed_linear_is_accelerated") else None)
+# GGUF weight types Kitchen's packed GEMM reads as stored, and its op for each.
+_CK_NATIVE_OPS = {gguf.GGMLQuantizationType.Q8_0: "q8_0_linear", gguf.GGMLQuantizationType.Q4_K: "q4_k_linear"}
 
 
 class GGMLOps(comfy.ops.manual_cast):
@@ -292,14 +294,14 @@ class GGMLOps(comfy.ops.manual_cast):
             if (input.dtype in (torch.float32, torch.float16) and _CK is not None
                     and _CK.fp16_packed_linear_is_accelerated(input.device)):
                 x = comfy.ops._eager_input_act(input, input_act, act_weight, act_eps)
-                if (getattr(self.weight, "tensor_type", None) == gguf.GGMLQuantizationType.Q8_0
-                        and not getattr(self.weight, "patches", []) and hasattr(_CK, "q8_0_linear")):
-                    # Kitchen reads the Q8_0 codes in its packed GEMM and applies each block's
-                    # scale there: no fp16 copy of the weight, and half the weight bytes per
-                    # product (on gfx1010 the int8 ConvRot path's speed, 1.15-1.2x the fp16 one)
+                native = _CK_NATIVE_OPS.get(getattr(self.weight, "tensor_type", None))
+                if native is not None and not getattr(self.weight, "patches", []) and hasattr(_CK, native):
+                    # Kitchen reads the Q8_0 or Q4_K codes in its packed GEMM and applies each
+                    # block's scale (and Q4_K's offset) there: no fp16 copy of the weight, and
+                    # fewer weight bytes per product (on gfx1010 1.15-1.2x the fp16 GEMM)
                     bias = None if self.bias is None else self.get_weight(self.bias.to(input.device), torch.float32)
                     raw = self.weight.to(input.device).as_subclass(torch.Tensor)
-                    out = _CK.q8_0_linear(x, raw, self.weight.tensor_shape[0], bias, out_dtype=input.dtype)
+                    out = getattr(_CK, native)(x, raw, self.weight.tensor_shape[0], bias, out_dtype=input.dtype)
                     return comfy.ops._linear_residual(out, residual, residual_scale)
                 # Dequantize to fp16 and run Kitchen's packed-fp16 GEMM (fp32 accumulation every
                 # 32 products) instead of the device's fp32 or fp16 GEMM: on gfx1010 ~6 TFLOPS
