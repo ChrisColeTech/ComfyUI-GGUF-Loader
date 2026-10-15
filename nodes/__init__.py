@@ -101,7 +101,7 @@ NODE_DISPLAY_NAME_MAPPINGS.update(_LTX_REF_NAMES)
 # for the core MESH / FILE_3D types) costs only these nodes, never the pack.
 import logging as _logging
 
-for _family in ("triposg", "unirig"):
+for _family in ("triposg", "unirig", "trellis2"):
     try:
         _module = __import__(f"{__name__}.{_family}", fromlist=["NODE_CLASS_MAPPINGS"])
     except Exception:

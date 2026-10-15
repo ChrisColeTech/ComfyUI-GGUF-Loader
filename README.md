@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; LTX-2.5 A/V under `🤖 CCTech/LTX-2.5`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`; TripoSG image-to-3D under `🤖 CCTech/TripoSG`; UniRig auto-rigging under `🤖 CCTech/UniRig`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; LTX-2.5 A/V under `🤖 CCTech/LTX-2.5`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`; TripoSG image-to-3D under `🤖 CCTech/TripoSG`; UniRig auto-rigging under `🤖 CCTech/UniRig`; TRELLIS.2 / Pixal3D per-stage loaders under `🤖 CCTech/TRELLIS.2`.
 
 | Node | Purpose |
 |---|---|
@@ -383,6 +383,35 @@ Place `skeleton.safetensors` (1.4 GB) and `skin.safetensors` (1.5 GB) from [Chri
 
 `tools/smoke_unirig.py` (real ComfyUI modules, CPU) checks registration, MESH batch slicing, the sparse convolution against a dense `conv3d`, the GLB writer round trip through core `Get3DComponents`, and both real loaders; `--rig mesh.obj` runs the whole chain on CPU. Example graphs (API format) are in `example_workflows/`: image → TripoSG → SaveGLB, saved GLB → UniRig → rigged GLB, and the two chained.
 
+### TRELLIS.2 and Pixal3D (image → PBR-textured mesh, per-stage files)
+
+ComfyUI core runs [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) and [Pixal3D](https://github.com/TencentARC/Pixal3D) natively in pure PyTorch (Trellis2/Pixal3D Conditioning, Shape/Upsample/Texture stages, the TRELLIS VAE decoders and the 3d/texturing nodes), but its loaders take Comfy-Org's merged single files. These nodes, under `🤖 CCTech/TRELLIS.2`, load the **per-stage** checkpoints as the owner publishes them — safetensors or GGUF (GGUF stays quantized through this pack's ops) — into core's own MODEL / VAE / CLIP_VISION / BACKGROUND_REMOVAL / MOGE_MODEL objects, so everything downstream is core. The tensors are identical; only the key prefixes differ (every file was checked key-for-key against core's modules). No CUDA extension wheels (flex_gemm, o_voxel, cumesh, flash-attn) are needed.
+
+| Node | What it does |
+|---|---|
+| **TRELLIS.2 / Pixal3D Model Loader (per-stage)** | sparse-structure, shape-512, shape-1024 and (optional) texture-1024 flow DiTs → one core MODEL. TRELLIS.2 vs Pixal3D is read from the weights (Pixal3D's projection heads); mixing the two is refused |
+| **TRELLIS.2 / Pixal3D VAE Loader (per-stage)** | structure + shape decoders → shape VAE; texture decoder → texture VAE |
+| **TRELLIS.2 / Pixal3D DINOv3 Loader** | `dinov3-vitl16` (Hugging Face format) → CLIP_VISION; add the NAF upsampler file for Pixal3D |
+| **TRELLIS.2 / Pixal3D BiRefNet Loader** | the extras `birefnet` → core **Remove Background** |
+| **Pixal3D MoGe-2 Loader** | `moge-2-vitl/model.pt` → core **MoGe Inference** → **MoGe Geometry To FOV** (Pixal3D's camera) |
+| **TRELLIS.2 / Pixal3D Prepare Image** | the owner's sidecar preprocessing: 1024 cap, alpha > 0.8 box, centred square crop (TRELLIS.2 1.0×, Pixal3D 1.1×), subject on black |
+| **TRELLIS.2 Sparse Structure Cleanup** | the sidecar's structure post-pass (fill enclosed holes, keep the shell), between VAE Decode Structure and Shape Stage |
+
+`example_workflows/trellis2_image_to_textured_glb_api.json` and `pixal3d_image_to_textured_glb_api.json` are the owner's sidecar runs rebuilt from these loaders and core's stages: 1024 cascade, 12 steps per stage, guidance 7.5 / rescale 0.7 / shift 5 for the structure, 7.5 / 0.5 for shape, 1.0 for texture (each with its guidance interval), then fill holes → narrow-band remesh at 1024 → decimate (TRELLIS.2 500k / Pixal3D 400k faces) → UV unwrap → bake base colour, metallic and roughness from the voxel field (2048 / 4096 px) → SaveGLB.
+
+Files (folders `models/trellis2/` and `models/pixal3d/`, registered for `extra_model_paths.yaml` under the same keys; dropdowns show `trellis2/…` and `pixal3d/…` paths):
+
+| From | Put under | Used by |
+|---|---|---|
+| [ChrisColeTech/TRELLIS.2-4B-FP16](https://huggingface.co/ChrisColeTech/TRELLIS.2-4B-FP16) `fp16/` (`ss_flow_img_dit_1_3B_64`, `slat_flow_img2shape_dit_1_3B_512/1024`, `slat_flow_imgshape2tex_dit_1_3B_1024`, `shape_dec_next_dc_f16c32`, `tex_dec_next_dc_f16c32`), `microsoft/ckpts/ss_dec_conv3d_16l8_fp16`, `facebook/` (DINOv3) | `models/trellis2/` (any sub-folders) | TRELLIS.2 |
+| [ChrisColeTech/Pixal3D](https://huggingface.co/ChrisColeTech/Pixal3D) `ckpts/` (safetensors) or [ChrisColeTech/Pixal3D-GGUF](https://huggingface.co/ChrisColeTech/Pixal3D-GGUF) `split/{Sparse,shape,texture,decoder}` | `models/pixal3d/` | Pixal3D |
+| either repo's `extras/{birefnet,dinov3-vitl16,moge-2-vitl}` | `models/pixal3d/extras/` | both (BiRefNet), Pixal3D (DINOv3, MoGe) |
+| `naf_release.pth` ([valeoai/NAF](https://github.com/valeoai/NAF); torch hub caches it in `~/.cache/torch/hub/checkpoints/`) | `models/pixal3d/naf/` | Pixal3D Conditioning |
+
+Pixal3D needs the NAF upsampler; without it the DINOv3 loader still works for TRELLIS.2. `tex_512` checkpoints are not offered (both pipelines run the 1024 cascade). Shape encoders (`*_enc_*`) are not used.
+
+`tools/smoke_trellis2.py` (real ComfyUI modules, CPU) checks the nodes, the two vendored stages, and every per-stage file against core's modules key by key from the headers alone; `--full` loads all of it for real through the nodes and runs BiRefNet, `--forward` adds a GGUF DiT forward.
+
 ### MiniMax Music 3
 
 The two-node convenience pipeline composes ComfyUI's native MiniMax Music 3 implementation; no model code is vendored. Download `Comfy-Org/MiniMax-Music-3` and place its split files as follows:
@@ -403,6 +432,6 @@ The loader returns standard comfy **MODEL / CLIP / VAE** objects. Native ConvRot
 
 Fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (Apache-2.0) — the loader, the quantization tooling and the custom ops are theirs; the backported PRs are their authors', listed in [PR_BACKPORT.md](PR_BACKPORT.md). Report bugs in this fork here, not upstream.
 
-`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT). TripoSG (`vendor/triposg`) is a pure-PyTorch port of [VAST-AI-Research/TripoSG](https://github.com/VAST-AI-Research/TripoSG) (MIT), with the RMBG-1.4 architecture from [briaai/RMBG-1.4](https://huggingface.co/briaai/RMBG-1.4) (its weights carry Bria's own licence). `vendor/unirig` is [PozzettiAndrea/ComfyUI-UniRig](https://github.com/PozzettiAndrea/ComfyUI-UniRig)'s inference package and stays **GPL-3.0** ([its LICENSE](vendor/unirig/LICENSE)); UniRig itself is [VAST-AI-Research/UniRig](https://github.com/VAST-AI-Research/UniRig) (MIT). SeedVC inference is adapted from [billwuhao/ComfyUI_Seed-VC](https://github.com/billwuhao/ComfyUI_Seed-VC) and [Plachtaa/seed-vc](https://github.com/Plachtaa/seed-vc) (Apache-2.0).
+`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT). TripoSG (`vendor/triposg`) is a pure-PyTorch port of [VAST-AI-Research/TripoSG](https://github.com/VAST-AI-Research/TripoSG) (MIT), with the RMBG-1.4 architecture from [briaai/RMBG-1.4](https://huggingface.co/briaai/RMBG-1.4) (its weights carry Bria's own licence). `vendor/unirig` is [PozzettiAndrea/ComfyUI-UniRig](https://github.com/PozzettiAndrea/ComfyUI-UniRig)'s inference package and stays **GPL-3.0** ([its LICENSE](vendor/unirig/LICENSE)); UniRig itself is [VAST-AI-Research/UniRig](https://github.com/VAST-AI-Research/UniRig) (MIT). `vendor/trellis2` carries two stages from the owner's sidecar ports of [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) and [TencentARC/Pixal3D](https://github.com/TencentARC/Pixal3D) (both MIT); the networks themselves are ComfyUI core's. SeedVC inference is adapted from [billwuhao/ComfyUI_Seed-VC](https://github.com/billwuhao/ComfyUI_Seed-VC) and [Plachtaa/seed-vc](https://github.com/Plachtaa/seed-vc) (Apache-2.0).
 
 Model weights stay under their own licences — MiniMax-H3's is a custom one, worth reading before any use.

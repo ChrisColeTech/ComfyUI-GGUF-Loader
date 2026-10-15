@@ -32,8 +32,9 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
     package instead - see the 2026-08-25 dated entries below for why.
   - `nodes/{flux_klein,krea2,lmstudio,ltx23,ltx25,minimax_h3,minimax_music,qwen_image,
     qwen_tts,stems,zimage}.py` — the rest of the node families, one file each.
-  - `nodes/{triposg,unirig}.py` — the 3D families (image -> mesh, mesh -> rig); imported
-    last in `nodes/__init__.py` inside a try/except so a failure costs only them.
+  - `nodes/{triposg,unirig,trellis2}.py` — the 3D families (image -> mesh, mesh -> rig,
+    TRELLIS.2/Pixal3D per-stage loaders); imported last in `nodes/__init__.py` inside a
+    try/except so a failure costs only them.
     `flux_klein.py` only holds the 5 genuinely Klein-specific nodes - 9
     architecturally-generic Flux-family reference-conditioning nodes moved to
     the standalone https://github.com/ChrisColeTech/ComfyUI-Flux-Reference-Tools
@@ -45,8 +46,9 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
   project it was ported from: `clipproj.py`, `depth_anything_v2.py` (the only
   preprocessor architecture kept here - see 2026-08-25 dated entries),
   `melband_arch.py`, `seedvc.py`, `seedvc_arch.py`, `seedvc_utils.py`,
-  `LICENSE-ClipProj`; and two packages: `triposg/` (MIT, pure-PyTorch TripoSG) and
-  `unirig/` (GPL-3.0, ComfyUI-UniRig inference code + pure-torch sparse conv) - each
+  `LICENSE-ClipProj`; and three packages: `triposg/` (MIT, pure-PyTorch TripoSG),
+  `unirig/` (GPL-3.0, ComfyUI-UniRig inference code + pure-torch sparse conv) and
+  `trellis2/` (MIT, the owner's sidecar preprocess + structure cleanup, stage-file glue) - each
   package's `__init__.py` docstring lists file-by-file provenance and every local edit.
 - `loader.py` — GGUF → fake-quantized state dict (`gguf_sd_loader`), text-encoder
   post-processing (`gguf_clip_loader`: key remaps, Gemma-3 norm `+1` un-bake,
@@ -4187,3 +4189,69 @@ ComfyUI's `bpe_tokenizer.py` by path and skips without one). pytest 149 passed, 
 2 failed pre-existing and unrelated (`test_triposg::test_merge_vertices_matches_trimesh_process`,
 `test_unirig::test_normalization_sampling_and_mesh_preparation`: trimesh vs NumPy 2 in the
 system Python - "Tester was removed in NumPy 1.25").
+## 2026-10-15 (v2.20.0) - TRELLIS.2 + Pixal3D from the owner's per-stage files
+
+Owner: "lets go ahead and add custom nodes for these models also" (image -> PBR mesh,
+TRELLIS.2 and Pixal3D). ComfyUI 0.39 runs both natively, but its loaders take
+Comfy-Org's merged single files; the owner's weights are per stage (HF
+`ChrisColeTech/TRELLIS.2-4B-FP16` `fp16/` + `microsoft/ckpts/ss_dec_conv3d_16l8_fp16` +
+`facebook/`, `ChrisColeTech/Pixal3D` `ckpts/`, `ChrisColeTech/Pixal3D-GGUF` `split/`,
+extras birefnet / dinov3-vitl16 / moge-2-vitl).
+
+Design decision (worth the owner's eye - it departs from "vendor the sidecar"):
+the sidecar's model code (`giga-models .../pipelines/trellis2_v1`, `pixal3d_v1`)
+needs flex_gemm (triton) sparse conv, o_voxel + cumesh mesh ops and flash_attn /
+xformers sparse attention for TRELLIS.2 - none installable in the portable (torch
+2.14 cu130, no triton). ComfyUI core already ships the same networks in pure torch,
+and the owner's files load into them KEY FOR KEY. Measured (headers vs core modules
+built on meta, `tools/smoke_trellis2.py`): TRELLIS.2 DiTs 640/640 tensors each
+(prefixes `structure_model.` / `img2shape_512.` / `img2shape.` / `shape2txt.`),
+Pixal3D GGUF DiTs 700/700 incl. `cross_attn.proj_linear` heads (detected ->
+image_attn_mode proj on all three stages), decoders 74 + 292 + 284
+(`struct_dec.` / `shape_dec.` / `txt_dec.`), DINOv3 HF file loads through
+`load_clipvision_from_sd` as-is, naf_release.pth 37/37 under `naf.`, BiRefNet and
+MoGe-2 (`model.pt['model']`) through core's own builders. The one extra tensor:
+Pixal3D's SS GGUF `rope_phases`, which core recomputes - dropped. So the nodes are
+LOADERS into core types, and only what core lacks is vendored from the sidecar:
+- `vendor/trellis2/preprocess.py` - both pipelines' `preprocess_image` (1024 cap,
+  alpha > 0.8 bbox, square crop x1.0 / x1.1, premultiplied on black, each with its
+  own uint8 conversion);
+- `vendor/trellis2/structure.py` - the `fill_holes` branch of
+  `sample_sparse_structure`, which the sidecar's TRELLIS.2 engine runs
+  (remove_small_holes, structure 1, 1 iteration, keep_only_shell). Pixal3D's engine
+  does not, so its example workflow skips the node.
+Seven nodes, `🤖 CCTech/TRELLIS.2`, CCTech-prefixed ids: ModelLoader (4 DiTs,
+safetensors or GGUF - GGUF through GGMLOps + GGUFModelPatcher exactly like
+UnetLoaderGGUF; TRELLIS.2/Pixal3D mix refused), VAELoader (shape + texture VAE),
+DINOv3Loader (+ NAF), BiRefNetLoader, MoGeLoader, PrepareImage, StructureCleanup.
+Folders `models/trellis2`, `models/pixal3d` (recursive; names `trellis2/...`,
+`pixal3d/...`). No new dependencies (scipy/scikit-image already present).
+
+Example workflows rebuild the sidecar runs from core stages: steps 12 everywhere
+(core's template uses 20 for shape-512; the sidecar overrides all stages to 12),
+pipeline.json guidance (SS 7.5 / rescale 0.7 / rescale_t 5 -> ModelSamplingSD3 5;
+shape 7.5 / 0.5 / 3; tex 1.0), guidance intervals via CFGOverride with core
+template's percent values (0.667 / 0.769), 1024 cascade (sidecar default; core
+template uses 1536), export = sidecar to_glb's sequence through core nodes:
+FillHoles 0.03 -> RemeshMesh udf res 1024 band 1 project 0 -> Decimate (500k
+TRELLIS.2 / 400k Pixal3D) -> Unwrap -> BakeTextureFromVoxel (2048 / 4096,
+reference = decoded mesh) -> ApplyTextureToMesh -> SaveGLB. NOT bit-identical to
+the sidecar (different sampler implementation, cumesh vs core remesh/unwrap/bake);
+orientation: the sidecar rotates Pixal3D Z-up -> Y-up after export, core decodes
+Pixal3D in its "y_up" model frame - check that both outputs face the same way.
+
+Verification (CPU, real portable comfy modules, no GPU): key-for-key matches above;
+`--full`: both MODELs built through the node (Pixal3D GGUF as GGUFModelPatcher, no
+quantized tensor outside a GGMLLayer), one Pixal3D GGUF sparse-structure DiT forward
+(finite, shape kept), both VAEs, DINOv3 + NAF, BiRefNet mask on a synthetic image
+(centre 1.0, corner 9e-6), MoGe v2. Static check of both API workflows against
+core's object_info (types, input names incl. DynamicCombo sub-inputs, slots): clean.
+98 nodes register (91 + 7). pytest 152 passed / 4 skipped / 2 failed - the 2 are
+2.19.2's test_flux_te_gguf needing transformers in the dev venv (pre-existing).
+NOT run: any GPU job in ComfyUI.
+
+Left out: TRELLIS.2 512 / 1536 pipelines' texture-512 file (both engines run the
+1024 cascade; core's Trellis2 has one texture model at the shape resolution), shape
+encoders (core has no encode path), the sidecar's multiview/refine/texture-mesh
+modes, the Comfy-Org-format merged files the owner also uploaded (core's own
+loaders already take those).
