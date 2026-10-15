@@ -32,6 +32,8 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
     package instead - see the 2026-08-25 dated entries below for why.
   - `nodes/{flux_klein,krea2,lmstudio,ltx23,ltx25,minimax_h3,minimax_music,qwen_image,
     qwen_tts,stems,zimage}.py` — the rest of the node families, one file each.
+  - `nodes/{triposg,unirig}.py` — the 3D families (image -> mesh, mesh -> rig); imported
+    last in `nodes/__init__.py` inside a try/except so a failure costs only them.
     `flux_klein.py` only holds the 5 genuinely Klein-specific nodes - 9
     architecturally-generic Flux-family reference-conditioning nodes moved to
     the standalone https://github.com/ChrisColeTech/ComfyUI-Flux-Reference-Tools
@@ -43,7 +45,9 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS`) with three subpackages:
   project it was ported from: `clipproj.py`, `depth_anything_v2.py` (the only
   preprocessor architecture kept here - see 2026-08-25 dated entries),
   `melband_arch.py`, `seedvc.py`, `seedvc_arch.py`, `seedvc_utils.py`,
-  `LICENSE-ClipProj`.
+  `LICENSE-ClipProj`; and two packages: `triposg/` (MIT, pure-PyTorch TripoSG) and
+  `unirig/` (GPL-3.0, ComfyUI-UniRig inference code + pure-torch sparse conv) - each
+  package's `__init__.py` docstring lists file-by-file provenance and every local edit.
 - `loader.py` — GGUF → fake-quantized state dict (`gguf_sd_loader`), text-encoder
   post-processing (`gguf_clip_loader`: key remaps, Gemma-3 norm `+1` un-bake,
   sentencepiece tokenizer rebuild from GGUF metadata — now cached next to the
@@ -4052,3 +4056,77 @@ Lesson recorded (third occurrence of this shape: repo_id dropdown 08-24,
 EditAnything node-vs-toggle 08-28, now this): when the user says "port X
 from pack Y", the default is pack Y''s SURFACE plus our verified internals
 - never an interface redesign, however well-reasoned, without asking.
+## 2026-10-15 (v2.19.0) - TripoSG (image -> mesh) + UniRig (mesh -> rig), from the owner's POCs
+
+Owner request: run TripoSG and UniRig inside ComfyUI from this pack, interoperating
+with core's 3D types (MESH / FILE_3D, ComfyUI 0.39). Sources are the owner's own
+verified ports, not upstream: `D:\Projects\poc\triposg-poc` (pipelines/triposg_v1)
+and `D:\Projects\poc\hymotion-unirig-poc` (pipelines/unirig_v1), both as vendored
+by giga-models (`src/sidecar/vendor/pipelines/*`, which adds RMBG's briarmbg.py and
+the newer num_beams/temperature/smooth_iters knobs). HY-Motion out of scope.
+
+Nodes (ids/types CCTech-prefixed - ComfyUI-UniRig and the TripoSG community packs
+register bare `UniRig*`/`TripoSG*` ids, see the 2026-08-26 krea2edit collision):
+- TripoSG (`nodes/triposg.py`, `vendor/triposg/`): ModelLoader, RMBGLoader,
+  PrepareImage, Sampler, DecodeMesh. The POC's `TripoSGPipeline.__call__` split at
+  its own seams (`vendor/triposg/pipeline.py`); models/, ops/, preprocessing.py are
+  byte-identical to the POC (one sidecar attention import removed). Output = core
+  MESH, no axis change (POC exported trimesh's +Y-up GLB as-is).
+- UniRig (`nodes/unirig.py`, `vendor/unirig/`): Skeleton/Skin model loaders, Load
+  Mesh (input/ or output/, relative paths only), Extract Skeleton, Apply Skinning,
+  Rig to GLB (FILE_3D_GLB). `vendor/unirig/rig.py` = the POC wrapper's rig() split
+  into skeleton / skin stages; GLB writer = POC `compose_v1.export_skinned_glb`
+  minus pygltflib (+ a NORMAL attribute).
+
+Dependency decisions (portable: py3.13, torch 2.14 cu130):
+- No diffusers/transformers (pure DiT/VAE/DINOv2; pure OPT decoder + beam sampler).
+- spconv replaced, not stubbed: `vendor/unirig/sparse_conv.py` implements
+  SubMConv3d (searchsorted hash + per-offset gather-matmul, weight layout
+  `[out,k0,k1,k2,in]` as in the checkpoint). Checked against real spconv-cu130 on
+  CUDA: max abs 1.1e-5 (k3) / 3.8e-6 (k5), and a flipped-kernel control differs by
+  ~50 - the convention is right. torch_scatter / torch_cluster / comfy_sparse_attn
+  -> the POC's own native_fallbacks (it measured them equivalent, 2026-08-09).
+- The vendored unirig package imports the REAL comfy.ops/utils/attention (it came
+  from a ComfyUI pack; the POC needed shims). unirig_ar/model_parse (transformers)
+  are not vendored; the skin model is built from unirig_skin directly.
+- New optional deps: scikit-image (installed), trimesh, fast-simplification (both
+  NOT installed in the portable; cp313 wheels exist: trimesh 5.1.1,
+  fast_simplification 0.2.0, same simplify() API). Without fast-simplification the
+  Extract Skeleton node decimates with core's QEM (`comfy_extras.mesh3d.postprocess.
+  qem_decimate`) - works, but not POC-identical, and TripoSG meshes are always
+  >50k faces, so install it for parity. trimesh is required for skinning.
+- Registration is guarded in nodes/__init__.py: simulated import failure of both
+  families -> logged, the other 80 nodes still register (91 with them).
+
+Fidelity checks (CPU, giga-models venv running the POC code next to ours):
+- TripoSG: POC TripoSGPipeline vs our split stages, src-robot.png, seed 42, 2 steps,
+  depth 6/7, fp32: prepared image identical, vertices AND faces bit-identical
+  (79275 / 158070). First run differed by one vertex: the POC's
+  `trimesh.Trimesh(v, f)` silently process=True-merges duplicate vertices;
+  `pipeline.merge_vertices` reproduces that (keep-order unique at 8 decimals,
+  unreferenced dropped) and a test pins it against trimesh.
+- UniRig skeleton: POC `direct.predict_skeleton(..., seed=42)` vs ours on
+  FinalBaseMesh.obj: joints/parents bit-identical (42 bones), and ours run-to-run
+  identical. NOTE the POC's own `predict_skeleton_from_mesh` does NOT forward seed to
+  the beam sampler (its `seed` parameter is consumed by surface sampling), so POC
+  rigs vary run to run (42 vs 43 bones seen). Ours seeds the beam generator and
+  PTv3's serialization randperm (forked RNG) from the node seed - deliberate.
+- UniRig skin: POC skin on CPU is impossible (spconv's CPU path rejects SubM with
+  bias; implicit-gemm needs CUDA), so skin parity rests on the conv-level spconv
+  check above; our CPU skin ran end to end (24461 x 42, rows sum to 1). Our GLB
+  vs the POC exporter fed identical arrays: POSITION, JOINTS_0, WEIGHTS_0, indices,
+  IBM and node tree identical.
+Scratch scripts: `%TEMP%\claude\...\scratchpad\{triposg_parity,unirig_parity,
+unirig_skel_parity,spconv_parity}.py`.
+
+Left out on purpose: TripoSG flash decoder (needs diso CUDA build; POC default off),
+TripoSG-scribble (different pipeline), texturing (POC/sidecar paints with a separate
+Hunyuan3D-Paint stage; neither core nor this pack ships one), UniRig smpl template
+(POC has no SMPL conversion), rig NPZ export (only HY-Motion compose consumes it),
+ComfyUI-UniRig's FBX/Blender nodes, animation.
+
+Verification: pytest 134 passed / 2 skipped in the dev venv (no Pillow there, so
+test_triposg skips; 14/14 new tests pass in an env with Pillow/scikit-image/trimesh);
+tools/smoke_triposg.py (incl. `--full`, real weights on CPU) and
+tools/smoke_unirig.py green against the real portable comfy modules. NOT run: any
+GPU job inside ComfyUI - coordinator's step.

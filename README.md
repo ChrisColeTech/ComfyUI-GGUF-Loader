@@ -57,7 +57,7 @@ See the instructions in the [tools](https://github.com/ChrisColeTech/ComfyUI-GGU
 
 ## Nodes
 
-The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; LTX-2.5 A/V under `🤖 CCTech/LTX-2.5`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`.
+The GGUF loaders live under `🤖 CCTech/GGUF`; Scenema Audio under `🤖 CCTech/Scenema`; MiniMax Music 3 under `🤖 CCTech/MiniMax Music`; LTX-2.3 A/V under `🤖 CCTech/LTX-2.3`; LTX-2.5 A/V under `🤖 CCTech/LTX-2.5`; local LLM/VLM prompting under `🤖 CCTech/LM Studio`; Qwen3-TTS under `🤖 CCTech/Qwen TTS`; TripoSG image-to-3D under `🤖 CCTech/TripoSG`; UniRig auto-rigging under `🤖 CCTech/UniRig`.
 
 | Node | Purpose |
 |---|---|
@@ -341,6 +341,48 @@ Under the hood the in-node loading reuses this pack's plumbing: models are searc
 
 `tools/smoke_qwen_tts.py` stubs `folder_paths` and `qwen_tts.Qwen3TTSModel` and validates path discovery, loader kwargs/caching, the generate node's seeding/AUDIO-dict/unload logic, the new nodes' in-node model resolution (local search, cache reuse/eviction, attention fallback), audio conversion/kwargs, and the save/load round-trip — no GPU or real weights required. The full chain (CustomVoice reference speech → prompt extraction → save/load → clone from the *saved* prompt → role bank → voice design) is verified end-to-end against real checkpoints on every port.
 
+### TripoSG (image → 3D mesh)
+
+A pure-PyTorch port of [VAST-AI-Research/TripoSG](https://github.com/VAST-AI-Research/TripoSG) (MIT) — no diffusers, no transformers, no hub downloads — taken from the owner's parity-checked POC, split at its own stage seams so each step can be inspected or swapped. The output is ComfyUI core's **MESH**, so `Save 3D Model` (SaveGLB), `Create 3D File (from Mesh)`, `Preview 3D` and every `3d/mesh` node (`Decimate Mesh` for a face budget, `Fill Holes`, `Unwrap Mesh`, …) take it directly.
+
+| Node | What it does (POC defaults) |
+|---|---|
+| **TripoSG Model Loader** | the split checkpoint: 1.5B rectified-flow DiT, SDF VAE (decoder), DINOv2 image encoder; `dtype` auto = float16 on CUDA |
+| **TripoSG RMBG Loader** | BriaRMBG-1.4, run in float32 |
+| **TripoSG Prepare Image** | the POC's foreground crop: use the image's alpha when it is meaningful (connect LoadImage's `mask`), else RMBG-1.4 → Otsu threshold → small-blob cleanup; composite on white, centred square crop, 10% padding. `remove_background` off treats the whole frame as the subject |
+| **TripoSG Sampler** | DINOv2 tokens → 50 rectified-flow steps, CFG 7.0 (unconditional = zero tokens), 2048 shape tokens, seeded |
+| **TripoSG Decode Mesh** | SDF VAE on a hierarchical octree (dense 2⁸, refined to 2⁹ near the surface, bounds ±1.005) → Lewiner marching cubes → a watertight, untextured MESH |
+
+Place the files from [ChrisColeTech/TripoSG](https://huggingface.co/ChrisColeTech/TripoSG) under `ComfyUI/models/triposg/` (both dropdowns scan that folder; extra_model_paths key `triposg`):
+
+| HF path | Folder |
+|---|---|
+| `split/TripoSG/` (transformer/, vae/, image_encoder_dinov2/, feature_extractor_dinov2/, scheduler/, model_index.json — 7.9 GB) | `models/triposg/TripoSG/` |
+| `split/RMBG-1.4/` (config.json, model.safetensors — 176 MB) | `models/triposg/RMBG-1.4/` (an `rmbg-1.4` folder inside the TripoSG folder is found too) |
+
+```
+huggingface-cli download ChrisColeTech/TripoSG --include "split/TripoSG/*" "split/RMBG-1.4/*" --local-dir hf_triposg
+```
+then move `hf_triposg/split/TripoSG` and `hf_triposg/split/RMBG-1.4` into `models/triposg/`. The `split/TripoSG-scribble` variant (text + scribble conditioning) is a different pipeline and is not listed. Needs `scikit-image` (marching cubes, in `requirements.txt`). ≈10 GB VRAM at float16; meshes are dense (hundreds of thousands of faces) — add core `Decimate Mesh` before saving if you need a budget. Textures are not part of TripoSG (the owner's sidecar paints with a separate Hunyuan3D-Paint stage, which neither ComfyUI core nor this pack ships); core's UV/texture nodes can bake one onto the mesh.
+
+`tools/smoke_triposg.py` runs against the real ComfyUI modules on CPU: node registration, the alpha/RMBG preprocessing paths, an analytic-sphere decode through core `SaveGLB` / `MeshToFile3D`, seeded CFG sampling on a tiny DiT, and — with the weights — strict key/shape checks of every component against the checkpoint headers (`--full` loads them for real). The split stages were checked bit-for-bit against the POC pipeline on CPU (same seed: identical vertices and faces).
+
+### UniRig (auto-rigging)
+
+Rigs any triangle mesh — TripoSG's output directly — into a skinned GLB: autoregressive skeleton prediction, then per-vertex skin weights. The model code is [PozzettiAndrea/ComfyUI-UniRig](https://github.com/PozzettiAndrea/ComfyUI-UniRig)'s inference package (GPL-3.0, from [VAST-AI-Research/UniRig](https://github.com/VAST-AI-Research/UniRig), MIT), run the way the owner's POC runs it: **no Blender, no spconv/cumm, no torch_scatter/torch_cluster, no flash-attn and no transformers** — the skeleton decoder is a pure-PyTorch OPT-350m + beam sampler, and the skinning network's sparse convolutions use a pure-PyTorch `SubMConv3d` (checked against real spconv: max abs error 1e-5). Ids and types are `CCTech`-prefixed, so ComfyUI-UniRig can stay installed alongside.
+
+| Node | What it does (POC defaults) |
+|---|---|
+| **UniRig Skeleton Model Loader** / **UniRig Skin Model Loader** | `skeleton.safetensors` / `skin.safetensors`; `precision` fp32 (POC) or bf16/fp16/auto |
+| **UniRig Load Mesh** | a GLB/glTF/OBJ/STL from ComfyUI's `input/` or `output/` folder → MESH (e.g. `3d/triposg_00001_.glb` from SaveGLB) |
+| **UniRig Extract Skeleton** | decimate above 50k faces, normalise to [-1, 1], 2048 seeded surface samples → Michelangelo encoder → 15-beam sampling (temperature 1.5, top-k 5, top-p 0.95, repetition penalty 3.0). `skeleton_template` mixamo = the 52-bone humanoid named `mixamorig:*` (Mixamo-animation compatible), vroid = same bones as `J_Bip_*`, articulationxl = a free-form skeleton for creatures and objects. Outputs the decimated MESH the rig binds to, the skeleton, and a bone listing |
+| **UniRig Apply Skinning** | voxel geodesic prior (grid 196) + PTv3/Michelangelo/bone attention → per-vertex weights, then UniRig's reskin edge diffusion (1 pass) and 0.03 threshold |
+| **UniRig Rig to GLB** | a skinned bind-pose GLB (`FILE_3D_GLB`): joint node tree, inverse bind matrices, top-4 weights per vertex — for `Save 3D Model`, `Save3DAdvanced`, `Preview 3D` |
+
+Place `skeleton.safetensors` (1.4 GB) and `skin.safetensors` (1.5 GB) from [ChrisColeTech/unirig](https://huggingface.co/ChrisColeTech/unirig) in `ComfyUI/models/unirig/` — the same folder ComfyUI-UniRig uses, so an existing download is reused. Needs `trimesh` (skinning voxelization), `addict` and `einops`; `fast-simplification` gives the POC's exact decimation, without it core ComfyUI's QEM decimator is used. The `seed` also seeds the beam sampler and PTv3's point shuffling, so a re-run with the same seed gives the same rig.
+
+`tools/smoke_unirig.py` (real ComfyUI modules, CPU) checks registration, MESH batch slicing, the sparse convolution against a dense `conv3d`, the GLB writer round trip through core `Get3DComponents`, and both real loaders; `--rig mesh.obj` runs the whole chain on CPU. Example graphs (API format) are in `example_workflows/`: image → TripoSG → SaveGLB, saved GLB → UniRig → rigged GLB, and the two chained.
+
 ### MiniMax Music 3
 
 The two-node convenience pipeline composes ComfyUI's native MiniMax Music 3 implementation; no model code is vendored. Download `Comfy-Org/MiniMax-Music-3` and place its split files as follows:
@@ -361,6 +403,6 @@ The loader returns standard comfy **MODEL / CLIP / VAE** objects. Native ConvRot
 
 Fork of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (Apache-2.0) — the loader, the quantization tooling and the custom ops are theirs; the backported PRs are their authors', listed in [PR_BACKPORT.md](PR_BACKPORT.md). Report bugs in this fork here, not upstream.
 
-`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT). SeedVC inference is adapted from [billwuhao/ComfyUI_Seed-VC](https://github.com/billwuhao/ComfyUI_Seed-VC) and [Plachtaa/seed-vc](https://github.com/Plachtaa/seed-vc) (Apache-2.0).
+`clipproj.py` is ported from [nicolab28/ComfyUI-ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) (MIT, [LICENSE-ClipProj](LICENSE-ClipProj)); the matrices are theirs too, on [Hugging Face](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3). GGUF comes from [llama.cpp](https://github.com/ggerganov/llama.cpp). The Scenema Audio nodes are ported from [ScenemaAI/ComfyUI-ScenemaAudio](https://github.com/ScenemaAI/ComfyUI-ScenemaAudio) (MIT). TripoSG (`vendor/triposg`) is a pure-PyTorch port of [VAST-AI-Research/TripoSG](https://github.com/VAST-AI-Research/TripoSG) (MIT), with the RMBG-1.4 architecture from [briaai/RMBG-1.4](https://huggingface.co/briaai/RMBG-1.4) (its weights carry Bria's own licence). `vendor/unirig` is [PozzettiAndrea/ComfyUI-UniRig](https://github.com/PozzettiAndrea/ComfyUI-UniRig)'s inference package and stays **GPL-3.0** ([its LICENSE](vendor/unirig/LICENSE)); UniRig itself is [VAST-AI-Research/UniRig](https://github.com/VAST-AI-Research/UniRig) (MIT). SeedVC inference is adapted from [billwuhao/ComfyUI_Seed-VC](https://github.com/billwuhao/ComfyUI_Seed-VC) and [Plachtaa/seed-vc](https://github.com/Plachtaa/seed-vc) (Apache-2.0).
 
 Model weights stay under their own licences — MiniMax-H3's is a custom one, worth reading before any use.

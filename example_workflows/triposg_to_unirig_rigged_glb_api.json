@@ -1,0 +1,73 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {"image": "triposg_input.png"},
+    "_meta": {"title": "Load Image (a character, front view)"}
+  },
+  "2": {
+    "class_type": "CCTechTripoSGRMBGLoader",
+    "inputs": {"model": "RMBG-1.4"}
+  },
+  "3": {
+    "class_type": "CCTechTripoSGModelLoader",
+    "inputs": {"model": "TripoSG", "dtype": "auto"}
+  },
+  "4": {
+    "class_type": "CCTechTripoSGPrepareImage",
+    "inputs": {
+      "image": ["1", 0], "mask": ["1", 1], "rmbg": ["2", 0],
+      "remove_background": true, "padding_ratio": 0.1, "background": "white"
+    }
+  },
+  "5": {
+    "class_type": "CCTechTripoSGSampler",
+    "inputs": {
+      "triposg_model": ["3", 0], "image": ["4", 0],
+      "seed": 42, "steps": 50, "guidance_scale": 7.0, "num_tokens": 2048
+    }
+  },
+  "6": {
+    "class_type": "CCTechTripoSGDecodeMesh",
+    "inputs": {
+      "triposg_model": ["3", 0], "shape_latent": ["5", 0],
+      "dense_octree_depth": 8, "hierarchical_octree_depth": 9, "bounds": 1.005
+    }
+  },
+  "7": {
+    "class_type": "SaveGLB",
+    "inputs": {"mesh": ["6", 0], "filename_prefix": "3d/triposg"},
+    "_meta": {"title": "Save 3D Model (shape)"}
+  },
+  "8": {
+    "class_type": "CCTechUniRigSkeletonModelLoader",
+    "inputs": {"checkpoint": "skeleton.safetensors", "precision": "fp32"}
+  },
+  "9": {
+    "class_type": "CCTechUniRigSkinModelLoader",
+    "inputs": {"checkpoint": "skin.safetensors", "precision": "fp32"}
+  },
+  "10": {
+    "class_type": "CCTechUniRigExtractSkeleton",
+    "inputs": {
+      "mesh": ["6", 0], "skeleton_model": ["8", 0],
+      "seed": 42, "skeleton_template": "mixamo", "max_faces": 50000,
+      "num_beams": 15, "temperature": 1.5, "num_samples": 2048
+    }
+  },
+  "11": {
+    "class_type": "CCTechUniRigApplySkinning",
+    "inputs": {
+      "skeleton": ["10", 1], "skinning_model": ["9", 0],
+      "voxel_grid_size": 196, "smooth_iters": 1
+    }
+  },
+  "12": {
+    "class_type": "CCTechUniRigRigToGLB",
+    "inputs": {"rig": ["11", 0]}
+  },
+  "13": {
+    "class_type": "SaveGLB",
+    "inputs": {"mesh": ["12", 0], "filename_prefix": "3d/unirig"},
+    "_meta": {"title": "Save 3D Model (rigged)"}
+  }
+}

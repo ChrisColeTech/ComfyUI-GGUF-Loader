@@ -1,0 +1,51 @@
+{
+  "1": {
+    "class_type": "CCTechUniRigLoadMesh",
+    "inputs": {"source_folder": "output", "file_path": "3d/triposg_00001_.glb"},
+    "_meta": {"title": "UniRig Load Mesh (e.g. a TripoSG result)"}
+  },
+  "2": {
+    "class_type": "CCTechUniRigSkeletonModelLoader",
+    "inputs": {"checkpoint": "skeleton.safetensors", "precision": "fp32"},
+    "_meta": {"title": "UniRig Skeleton Model Loader"}
+  },
+  "3": {
+    "class_type": "CCTechUniRigSkinModelLoader",
+    "inputs": {"checkpoint": "skin.safetensors", "precision": "fp32"},
+    "_meta": {"title": "UniRig Skin Model Loader"}
+  },
+  "4": {
+    "class_type": "CCTechUniRigExtractSkeleton",
+    "inputs": {
+      "mesh": ["1", 0],
+      "skeleton_model": ["2", 0],
+      "seed": 42,
+      "skeleton_template": "mixamo",
+      "max_faces": 50000,
+      "num_beams": 15,
+      "temperature": 1.5,
+      "num_samples": 2048
+    },
+    "_meta": {"title": "UniRig Extract Skeleton"}
+  },
+  "5": {
+    "class_type": "CCTechUniRigApplySkinning",
+    "inputs": {
+      "skeleton": ["4", 1],
+      "skinning_model": ["3", 0],
+      "voxel_grid_size": 196,
+      "smooth_iters": 1
+    },
+    "_meta": {"title": "UniRig Apply Skinning"}
+  },
+  "6": {
+    "class_type": "CCTechUniRigRigToGLB",
+    "inputs": {"rig": ["5", 0]},
+    "_meta": {"title": "UniRig Rig to GLB"}
+  },
+  "7": {
+    "class_type": "SaveGLB",
+    "inputs": {"mesh": ["6", 0], "filename_prefix": "3d/unirig"},
+    "_meta": {"title": "Save 3D Model (rigged)"}
+  }
+}

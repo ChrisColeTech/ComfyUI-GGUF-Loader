@@ -96,3 +96,18 @@ from .ltx_reference import (NODE_CLASS_MAPPINGS as _LTX_REF_CLASSES,
 
 NODE_CLASS_MAPPINGS.update(_LTX_REF_CLASSES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_LTX_REF_NAMES)
+
+# 3D families: guarded so a broken optional dependency (or a ComfyUI too old
+# for the core MESH / FILE_3D types) costs only these nodes, never the pack.
+import logging as _logging
+
+for _family in ("triposg", "unirig"):
+    try:
+        _module = __import__(f"{__name__}.{_family}", fromlist=["NODE_CLASS_MAPPINGS"])
+    except Exception:
+        _logging.getLogger(__name__).error(
+            "CCTech %s nodes disabled: importing nodes/%s.py failed. Every other node in "
+            "this pack still works. See the traceback below.", _family, _family, exc_info=True)
+        continue
+    NODE_CLASS_MAPPINGS.update(_module.NODE_CLASS_MAPPINGS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(_module.NODE_DISPLAY_NAME_MAPPINGS)
