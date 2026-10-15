@@ -4146,3 +4146,44 @@ both GLBs validate in Blender 4.2 (`triposg-poc/scripts/blender_validate.py`).
 `nodes.py`; after the move into the `nodes/` package it resolved to the
 non-existent `nodes.nodes`. Now `from .gguf import GGUFModelPatcher`, the same
 import the file already uses at line 63. No other `from .nodes import` remains.
+
+## 2026-10-15 (v2.19.2) - FLUX.1 CLIP-L GGUF no longer taken for an mmproj; tekken config for ComfyUI 0.39
+
+Both found by the template coordinator on ComfyUI 0.39.0 with the owner's HF weights.
+
+**CLIP-L GGUF mistaken for an mmproj (FLUX.1).** `ChrisColeTech/flux1-dev-turbo-GGUF`
+ships `split/text_encoders/clip-Q6_K.gguf`: a full HF CLIP model (591 tensors,
+`text_model.*` + `vision_model.*`, metadata only `general.*`) tagged
+`general.architecture = clip`. `is_vision_projector` and `gguf_clip_loader` decided
+"mmproj" from that tag alone, so `DualCLIPLoaderGGUF` (flux) merged CLIP-L into the
+T5 dict and KSampler died with `mat1 and mat2 shapes cannot be multiplied (77x768 and
+4096x3072)`. The rule is now `loader.is_mmproj_content(arch, tensor_names, general.type,
+clip.projector_type)`: arch must be `clip`; any `text_model.*` tensor means a real CLIP
+text encoder (never an mmproj, whatever the metadata says); otherwise llama.cpp mmproj
+tensor names (`v.*` tower, `mm.*` projector) or mmproj metadata (`general.type = mmproj`,
+`clip.projector_type`) decide. Both `is_vision_projector` (node merge) and
+`gguf_clip_loader` (vision-tower mapping) use it. Checked on the real headers: clip-Q6_K
+-> False; every mmproj on the portable (flux2, klein qwen3vl_8b, scenema Qwen2.5-VL +
+Gemma, zimage Qwen3-VL-4B) and both Ministral-3 lmstudio mmprojs -> True. The CLIP-L file
+now loads as its raw 591 HF keys (`text_model.encoder.layers.1.mlp.fc1.weight` routes it
+to `clip_l` in comfy's FluxClipModel.load_sd).
+
+**Tekken tokenizer on ComfyUI 0.39 (FLUX.2).** ComfyUI 0.39 (bbb4b04c, "Don't depend on
+transformers for mistral and llama tokenizers") replaced the transformers MistralConverter
+path with `comfy/text_encoders/bpe_tokenizer.py from_tekken_json`, which reads
+`config["default_num_special_tokens"]` and `config["default_vocab_size"]` and maps vocab
+rank r -> id r + default_num_special_tokens. The GGUF rebuild only wrote
+`num_vocab_tokens`/`default_vocab_size` -> `CLIPLoaderGGUF: 'default_num_special_tokens'`
+on `Ministral-3-14B-Instruct-2512-Q3_K_S.gguf`. `tekken_num_special_tokens` now sets it to
+the number of control tokens (token_type 3) in the GGUF token list - the same offset older
+ComfyUI computed as `len(special_tokens)`, so both versions agree; the tekken default 1000
+when the file has none, and a warning if the control tokens are not the leading id block.
+On the real Q3_K_S: 1000 control tokens at ids 0..999; "A cat holding a sign that says
+hello world" encodes to `[1065, 7990, 14234, 1261, 2287, 1455, 8223, 52528, 4304]`, each
+id the matching GGUF token row (`A`, `Ġcat`, ... `Ġworld`).
+
+Tests: `tests/test_flux_te_gguf.py` (10, synthetic headers; the last loads the installed
+ComfyUI's `bpe_tokenizer.py` by path and skips without one). pytest 149 passed, 1 skipped,
+2 failed pre-existing and unrelated (`test_triposg::test_merge_vertices_matches_trimesh_process`,
+`test_unirig::test_normalization_sampling_and_mesh_preparation`: trimesh vs NumPy 2 in the
+system Python - "Tester was removed in NumPy 1.25").

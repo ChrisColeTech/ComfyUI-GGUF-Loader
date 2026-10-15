@@ -81,11 +81,47 @@ TE_TYPE_REQUIREMENTS = {
 # rather than handed to comfy as a second text encoder.
 VISION_PROJECTOR_ARCHES = {"clip"}
 
+# The arch tag alone is NOT enough: a full HF CLIP-L text encoder converted to
+# GGUF (ChrisColeTech/flux1-dev-turbo-GGUF split/text_encoders/clip-Q6_K.gguf,
+# `text_model.*` + `vision_model.*` tensors) is tagged `clip` too. Treating it as
+# an mmproj merged CLIP-L into the T5 TE and FLUX.1 died in KSampler with
+# "mat1 and mat2 shapes cannot be multiplied (77x768 and 4096x3072)".
+# llama.cpp's clip.cpp names every mmproj tensor `v.*` (vision tower: v.blk,
+# v.patch_embd, v.position_embd, v.pre_ln, v.post_ln ...) or `mm.*` (projector:
+# mm.0, mm.2, mm.input_projection, mm.patch_merger ...).
+MMPROJ_TENSOR_PREFIXES = ("v.", "mm.")
+CLIP_TEXT_TENSOR_PREFIX = "text_model."
+
+def is_mmproj_content(arch, tensor_names, type_str=None, projector_type=None):
+    """Decide "mmproj vision projector" from what the GGUF actually holds.
+
+    arch must be `clip`; any `text_model.*` tensor means a real CLIP text
+    encoder (never an mmproj); otherwise llama.cpp mmproj tensor names
+    (`v.*` / `mm.*`) or mmproj metadata (`general.type = mmproj`,
+    `clip.projector_type`) decide.
+    """
+    if arch not in VISION_PROJECTOR_ARCHES:
+        return False
+    names = list(tensor_names)
+    if any(n.startswith(CLIP_TEXT_TENSOR_PREFIX) for n in names):
+        return False
+    if any(n.startswith(MMPROJ_TENSOR_PREFIXES) for n in names):
+        return True
+    return type_str == "mmproj" or bool(projector_type)
+
 def is_vision_projector(path):
     """True for mmproj GGUF files (vision tower, no text encoder)."""
     if not str(path).endswith(".gguf"):
         return False
-    return read_gguf_arch(path) in VISION_PROJECTOR_ARCHES
+    reader = gguf.GGUFReader(path)
+    try:
+        arch = get_field(reader, "general.architecture", str)
+        type_str = get_field(reader, "general.type", str)
+        projector_type = get_field(reader, "clip.projector_type", str)
+    except TypeError:
+        return False
+    return is_mmproj_content(
+        arch, (t.name for t in reader.tensors), type_str, projector_type)
 
 def validate_te_type(path, type_str):
     """Raise a clear error when a GGUF TE is loaded with the wrong CLIP type.
@@ -626,6 +662,28 @@ def gguf_tokenizer_loader(path, temb_shape):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
+# Mistral's tekken.json ships `default_num_special_tokens = 1000` (the control
+# block at ids 0..999 every tekken vocab reserves).
+TEKKEN_DEFAULT_NUM_SPECIAL_TOKENS = 1000
+
+def tekken_num_special_tokens(special_tokens):
+    """`config.default_num_special_tokens` for a tekken blob rebuilt from GGUF.
+
+    ComfyUI >= 0.39 (comfy/text_encoders/bpe_tokenizer.py `from_tekken_json`)
+    reads it and maps vocab rank r -> id r + this; older ComfyUI used
+    len(special_tokens) for the same offset. The GGUF token list holds the
+    control tokens (token_type 3) first, so their count is the offset and
+    matches both. No control tokens in the file -> the tekken default.
+    """
+    count = len(special_tokens)
+    if count == 0:
+        return TEKKEN_DEFAULT_NUM_SPECIAL_TOKENS
+    if sorted(t["rank"] for t in special_tokens) != list(range(count)):
+        logging.warning(
+            "tekken GGUF: control tokens are not the leading id block;"
+            " token ids past the first gap may be offset.")
+    return count
+
 def gguf_tekken_tokenizer_loader(path, temb_shape):
     # convert ggml (hf) tokenizer metadata to tekken/comfy data
     logging.info("Attempting to recreate tekken tokenizer from GGUF file metadata...")
@@ -665,6 +723,8 @@ def gguf_tekken_tokenizer_loader(path, temb_shape):
                 "token_bytes": base64.b64encode(tok).decode("ascii"),
                 "token_str": tok.decode("utf-8", errors="replace") # ?
             })
+
+    data["config"]["default_num_special_tokens"] = tekken_num_special_tokens(data["special_tokens"])
 
     logging.info(f"Created tekken tokenizer with vocab size of {len(data['vocab'])} (+{len(data['special_tokens'])})")
     del reader
@@ -843,7 +903,9 @@ def _add_hf_model_prefix(sd, arch):
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)
     arch = extra.get("arch_str", None)
-    if arch in VISION_PROJECTOR_ARCHES:
+    metadata = extra.get("metadata", {})
+    if is_mmproj_content(arch, sd.keys(), metadata.get("general.type"),
+                         metadata.get("clip.projector_type")):
         # mmproj picked directly: hand back the mapped vision tower so the
         # caller can merge it into the TE it belongs to.
         return map_mmproj_sd(sd)
