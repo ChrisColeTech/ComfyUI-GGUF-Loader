@@ -87,7 +87,7 @@ def _load_text_encoder(path):
         },
         embedding_directory=folder_paths.get_folder_paths("embeddings"),
     )
-    from .nodes import GGUFModelPatcher
+    from .gguf import GGUFModelPatcher
     clip.patcher = GGUFModelPatcher.clone(clip.patcher)
     return clip
 

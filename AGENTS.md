@@ -4130,3 +4130,19 @@ test_triposg skips; 14/14 new tests pass in an env with Pillow/scikit-image/trim
 tools/smoke_triposg.py (incl. `--full`, real weights on CPU) and
 tools/smoke_unirig.py green against the real portable comfy modules. NOT run: any
 GPU job inside ComfyUI - coordinator's step.
+
+Coordinator follow-up (2026-10-15, RTX 5090, ComfyUI 0.39.0 on :8190): the shipped
+`triposg_image_to_glb_api.json` turned a fox photo into a 1.26M-face watertight mesh
+in 29 s, and `unirig_glb_to_rigged_glb_api.json` rigged it in 48 s (53 joints,
+`mixamorig:*` plus one extra `bone_52`, JOINTS_0/WEIGHTS_0 on a 50k-face body);
+both GLBs validate in Blender 4.2 (`triposg-poc/scripts/blender_validate.py`).
+
+## 2026-10-15 (v2.19.1) - MiniMax Music 3 text-encoder load fixed
+
+`MiniMaxMusic3ModelsLoader` failed on every run with `No module named
+'...comfyui-gguf-loader.nodes.nodes'`. `nodes/minimax_music.py` still carried
+`from .nodes import GGUFModelPatcher` from when it lived at the pack root as
+`nodes_minimax_music.py` (cc4a37d4, 08-14), where `.nodes` meant the root
+`nodes.py`; after the move into the `nodes/` package it resolved to the
+non-existent `nodes.nodes`. Now `from .gguf import GGUFModelPatcher`, the same
+import the file already uses at line 63. No other `from .nodes import` remains.
