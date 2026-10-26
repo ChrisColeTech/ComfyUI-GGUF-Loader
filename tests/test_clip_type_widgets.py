@@ -34,7 +34,7 @@ UNION_TYPES = SINGLE_TYPES + ["hunyuan_video"]
 
 _COMFY_SUBMODULES = (
     "comfy.sd", "comfy.float", "comfy.utils", "comfy.sample",
-    "comfy.nested_tensor", "comfy.model_patcher",
+    "comfy.nested_tensor", "comfy.model_patcher", "comfy.quant_ops",
 )
 
 

@@ -19,9 +19,9 @@ def _stub_comfy():
     for it to decide whether it is running as a custom node, and stubbing it
     sends pytest's rootdir import of __init__ down the node-registration path.
     """
-    for mod in ("comfy", "comfy.ops", "comfy.lora", "comfy.model_management"):
+    for mod in ("comfy", "comfy.ops", "comfy.lora", "comfy.model_management", "comfy.quant_ops"):
         sys.modules.setdefault(mod, types.ModuleType(mod))
-    for attr in ("ops", "lora", "model_management"):
+    for attr in ("ops", "lora", "model_management", "quant_ops"):
         setattr(sys.modules["comfy"], attr, sys.modules[f"comfy.{attr}"])
     mm = sys.modules["comfy.model_management"]
     if not hasattr(mm, "device_supports_non_blocking"):
